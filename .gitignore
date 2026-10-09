@@ -1,0 +1,11 @@
+/build/
+/__release_packages__/
+/.vs/
+*.user
+__pycache__/
+*.py[cod]
+/core-scenarios-*/
+/.codex/
+/.env
+/.env.*
+AGENTS.md

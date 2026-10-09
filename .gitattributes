@@ -1,0 +1,14 @@
+* text=auto
+*.cpp text eol=lf
+*.h text eol=lf
+*.inc text eol=lf
+*.rc text eol=lf
+*.manifest text eol=lf
+*.js text eol=lf
+*.mjs text eol=lf
+*.py text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+*.md text eol=lf
+*.png binary
+*.ico binary

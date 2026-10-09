@@ -1,0 +1,28 @@
+import {readFileSync} from 'node:fs';
+import assert from 'node:assert/strict';
+const source=readFileSync(new URL('../src/web/transfers.js',import.meta.url));
+const {transferGroups,pingEffect,timedNotice}=await import(`data:text/javascript;base64,${source.toString('base64')}`);
+const base={folderId:'batch-one',folderName:'资料',folderCount:2,folderTotal:100,peer:'A1',receiving:false};
+const complete={...base,id:1,name:'资料/a',total:40,done:40,speed:999,state:3};
+const running={...base,id:2,name:'资料/b',total:60,done:20,speed:12,state:2};
+let [group]=transferGroups([complete,running]);
+assert.equal(group.items.length,2);assert.equal(group.total,100);assert.equal(group.done,60);assert.equal(group.percent,60);assert.equal(group.speed,12);assert.equal(group.completed,1);assert.equal(group.state,2);
+assert.equal(transferGroups([complete])[0].state,1,'partial arrival must not appear complete');
+assert.equal(transferGroups([complete,{...running,state:3,done:60}])[0].state,3);
+const afterDelete=transferGroups([{...complete,removed:true},{...running,state:3,done:60}])[0];
+assert.equal(afterDelete.items.length,1);assert.equal(afterDelete.percent,100);assert.equal(afterDelete.state,3,'deleting child history must not make completed folder pending');
+assert.equal(transferGroups([{...complete,removed:true}]).length,0);
+assert.equal(transferGroups([complete,{...running,state:5}])[0].state,5);
+assert.equal(transferGroups([complete,{...complete,folderId:'second'},{...complete,receiving:true},{...complete,peer:'A2'},{...complete,folderId:''}]).length,5,'same names do not combine distinct batches, directions or peers');
+assert.equal(transferGroups([{...complete,folderCount:1,folderTotal:0,total:0,done:0}])[0].percent,100,'completed empty file batch');
+let now=0,next=0;const timers=new Map();
+const clock={Date:{now:()=>now},setTimeout(fn,ms){timers.set(++next,{fn,at:now+ms});return next;},clearTimeout(id){timers.delete(id);}};
+function advance(ms){now+=ms;for(const [id,t] of [...timers])if(t.at<=now){timers.delete(id);t.fn();}}
+const classes=new Set();const element={classList:{add:x=>classes.add(x),remove:x=>classes.delete(x)},offsetWidth:1};
+const flash=pingEffect(element,clock);flash.play();assert(classes.has('active'));advance(1900);assert(!classes.has('active'),'timeout clears missing animationend');
+flash.play();advance(600);flash.play();advance(1300);assert(classes.has('active'),'old timer does not clear a new Ping');advance(600);assert(!classes.has('active'));
+flash.play();now+=2000;flash.resume();assert(!classes.has('active'),'resume clears expired flash');
+flash.play();element.onanimationend();assert(!classes.has('active'));
+let message;const notice=timedNotice(value=>message=value,clock);notice('Ping 已送达',3000);advance(3000);assert.equal(message,'');
+notice('Ping 已送达',3000);advance(100);notice('连接失败');advance(3000);assert.equal(message,'连接失败','old success timer must not erase a new error');
+console.log('PASS folder aggregation, identity isolation, incomplete arrival, speed, empty files, Ping expiry, repeat Ping and stale notice timers');
