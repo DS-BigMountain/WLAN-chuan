@@ -1,0 +1,32 @@
+#pragma code_page(65001)
+#include <windows.h>
+LANGUAGE LANG_CHINESE, SUBLANG_CHINESE_SIMPLIFIED
+1 RT_MANIFEST "app.manifest"
+101 ICON "assets/chuan.ico"
+201 RCDATA "web/index.html"
+202 RCDATA "web/style.css"
+203 RCDATA "web/app.js"
+204 RCDATA "web/sha256.js"
+205 RCDATA "web/files.js"
+206 RCDATA "web/transfers.js"
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 1,0,0,0
+ PRODUCTVERSION 1,0,0,0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+BEGIN
+ BLOCK "StringFileInfo"
+ BEGIN
+  BLOCK "080404b0"
+  BEGIN
+   VALUE "FileDescription", "传 · 局域网文件传输\0"
+   VALUE "FileVersion", "1.0.0\0"
+   VALUE "ProductName", "传\0"
+   VALUE "ProductVersion", "1.0.0\0"
+   VALUE "OriginalFilename", "Chuan.exe\0"
+  END
+ END
+ BLOCK "VarFileInfo" BEGIN VALUE "Translation", 0x804, 1200 END
+END
