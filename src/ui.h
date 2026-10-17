@@ -19,6 +19,42 @@ struct Canvas {
     void Color(float gray) {
         brush->SetColor(D2D1::ColorF(gray, gray, gray));
     }
+    void BoxColor(float x, float y, float w, float h, float radius, D2D1_COLOR_F fill,
+                  D2D1_COLOR_F border = D2D1::ColorF(0, 0.f)) {
+        auto rectangle = D2D1::RoundedRect(D2D1::RectF(x, y, x + w, y + h), radius, radius);
+        brush->SetColor(fill);
+        target->FillRoundedRectangle(rectangle, brush);
+        if (border.a > 0) {
+            brush->SetColor(border);
+            target->DrawRoundedRectangle(rectangle, brush, 1);
+        }
+    }
+    void DashedBoxColor(float x, float y, float w, float h, float radius, D2D1_COLOR_F fill,
+                        D2D1_COLOR_F border) {
+        BoxColor(x, y, w, h, radius, fill);
+        ID2D1Factory *factory = nullptr;
+        ID2D1StrokeStyle *stroke = nullptr;
+        target->GetFactory(&factory);
+        auto properties = D2D1::StrokeStyleProperties();
+        properties.dashStyle = D2D1_DASH_STYLE_DASH;
+        if (factory && SUCCEEDED(factory->CreateStrokeStyle(properties, nullptr, 0, &stroke))) {
+            brush->SetColor(border);
+            target->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(x, y, x + w, y + h), radius, radius),
+                                         brush, 1, stroke);
+            stroke->Release();
+        }
+        if (factory) factory->Release();
+    }
+    void TextColor(const std::wstring &s, float x, float y, float w, float h, IDWriteTextFormat *font,
+                   D2D1_COLOR_F color, DWRITE_TEXT_ALIGNMENT align = DWRITE_TEXT_ALIGNMENT_LEADING) {
+        if (!brush || !font) return;
+        font->SetTextAlignment(align);
+        font->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        font->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        brush->SetColor(color);
+        target->DrawTextW(s.c_str(), static_cast<UINT32>(s.size()), font, D2D1::RectF(x, y, x + w, y + h),
+                          brush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    }
     void Box(float x, float y, float w, float h, float radius, float fill, float border = -1) {
         auto r = D2D1::RoundedRect(D2D1::RectF(x, y, x + w, y + h), radius, radius);
         Color(fill);

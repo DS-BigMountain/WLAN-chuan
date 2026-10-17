@@ -8,4 +8,7 @@ __pycache__/
 /.codex/
 /.env
 /.env.*
+/mobile/build/
+/mobile/.signing/
+/mobile/local.properties
 AGENTS.md

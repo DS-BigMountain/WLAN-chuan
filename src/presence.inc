@@ -7,18 +7,54 @@ std::wstring Engine::AutoNameLocked(const std::string &key) {
 void Engine::ExpireLocked() {
     const auto now = Now();
     for (auto &[key, session] : browsers_) {
-        std::erase_if(session.tabs, [&](auto &tab) { return now - tab.second >= 6000; });
+        std::erase_if(session.tabs, [&](auto &tab) { return now - tab.second >= BrowserPresenceGrace; });
         if (session.tabs.empty())
             std::erase_if(peers_, [&](auto &p) { return p.id == session.id; });
     }
-    std::erase_if(peers_, [&](auto &p) { return now - p.seen >= 6000; });
+    std::erase_if(peers_, [&](auto &p) { return !PeerSeenRecently(p,now); });
+    const auto pause=[&](const auto &job,bool paused,const wchar_t *message){
+        if(paused&&!job->browserPaused){job->resumeActivity=job->view.activity;job->view.activity=message;job->browserPaused=true;}
+        else if(!paused&&job->browserPaused){job->view.activity=job->resumeActivity;job->resumeActivity.clear();job->browserPaused=false;}
+    };
+    for (auto &job : jobs_) if (job->announced && job->view.state==State::Queued) {
+        if(!job->nativeOwner.empty()){
+            uint64_t touched=job->view.started;for(const auto &[key,batch]:batchApprovals_)if(key.ends_with(":"+job->nativeOwner+":"+job->batchId))touched=std::max(touched,batch.touched);
+            if(now-touched>45000){job->announced=false;job->view.state=State::Failed;job->view.error=L"发送端已离线或停止，未收到 ZIP 文件";job->finishedAt=now;job->cv.notify_all();}
+            continue;
+        }
+        const auto sender=browsers_.find(job->webClient);
+        if (sender==browsers_.end() || !sender->second.openTabs.contains(job->webTab)) {
+            job->announced=false;job->view.state=State::Failed;job->view.error=L"发送页面已关闭，未收到此文件";job->finishedAt=now;job->cv.notify_all();
+        }else{
+            pause(job,sender->second.tabs.empty(),L"等待发送页面恢复");
+        }
+    }
     for (auto &job : jobs_) {
+        if (!job->asyncOfferKey.empty() && !job->nativeOwner.empty() && job->view.state < State::Completed) {
+            const auto batch=batchApprovals_.find(job->asyncOfferKey);
+            const auto id=Wide(Unhex(job->nativeOwner));
+            const bool live=std::any_of(peers_.begin(),peers_.end(),[&](const auto &peer){return peer.id==id;}) ||
+                std::any_of(jobs_.begin(),jobs_.end(),[&](const auto &item){return !item->view.requestOnly&&item->nativeOwner==job->nativeOwner&&item->batchId==job->batchId&&item->view.state==State::Running;});
+            if (!live && batch!=batchApprovals_.end() && now-batch->second.touched>45000) {
+                job->cancel=true;CompleteOfferLocked(job,std::string(job->view.offerItems.size(),'0'));job->view.error=L"发送端已离线，接收请求已取消";
+            }
+        }
+        if (!job->asyncOfferKey.empty() && !job->webClient.empty() && job->view.state < State::Completed) {
+            const auto sender = browsers_.find(job->webClient);
+            if (sender == browsers_.end() || !sender->second.openTabs.contains(job->webTab)) {
+                job->cancel = true; job->view.awaitingApproval = false; job->view.state = State::Cancelled;
+                job->view.error = L"发送页面已关闭，接收请求已取消"; job->finishedAt = now; job->cv.notify_all();
+                std::lock_guard socketsLock(socketsMutex_);
+                for (const auto &[socket, owner] : sockets_) if (owner.lock() == job) shutdown(socket, SD_BOTH);
+            }
+        }
         if (job->recipient.empty() || job->view.state != State::Waiting) continue;
         auto session = browsers_.find(job->recipient);
-        if (session != browsers_.end() && !session->second.tabs.empty()) continue;
+        if (session != browsers_.end() && !session->second.openTabs.empty()) {pause(job,session->second.tabs.empty(),L"等待接收页面恢复");continue;}
         job->cancel = true;
+        job->view.awaitingApproval = false;
         job->view.state = State::Cancelled;
-        job->view.error = L"浏览器设备已离线";
+        job->view.error = L"接收页面已关闭";
         job->finishedAt = now;
         job->cv.notify_all();
     }
@@ -44,7 +80,8 @@ bool Engine::RequestPeer(const Peer &peer, const std::string &path, const std::s
     std::string request = std::string(method) + path + " HTTP/1.1\r\nHost: " + address + ":" +
         std::to_string(peer.port) + "\r\nConnection: close\r\nContent-Length: " + std::to_string(mesh ? extra.size() : 0) + "\r\nX-Chuan-Id: " +
         Hex(Utf8(config.id)) + "\r\nX-Chuan-Sender: " + Hex(Utf8(config.name)) +
-        "\r\nX-Chuan-Port: " + std::to_string(boundPort_) + "\r\n" + (mesh ? "\r\n" + extra : extra + "\r\n");
+        "\r\nX-Chuan-Server: " + Utf8(peer.owner.empty() ? peer.id : peer.owner) +
+        "\r\nX-Chuan-Platform: windows\r\nX-Chuan-Port: " + std::to_string(boundPort_) + "\r\n" + (mesh ? "\r\n" + extra : extra + "\r\n");
     std::string first; std::map<std::string, std::string> headers; uint64_t length = 0;
     bool ok = SendAll(s, request) && ReadHeader(s, first, headers) && first.starts_with("HTTP/1.1 200 ") &&
         Number(Get(headers, "content-length"), length) && length <= 1024 * 1024;
@@ -78,7 +115,7 @@ std::string Engine::Mesh(const std::string &ledger) {
     for (auto &[keyValue, session] : browsers_) {
         if (session.tabs.empty()) continue;
         const auto name = session.name.empty() ? AutoNameLocked(Utf8(session.id)) : session.name;
-        out << "B " << Hex(Utf8(session.id)) << ' ' << Hex(Utf8(name)) << ' ' << session.ip << '\n';
+        out << "B " << Hex(Utf8(session.id)) << ' ' << Hex(Utf8(name)) << ' ' << session.ip << ' ' << (session.platform.empty()?"web":session.platform) << '\n';
     }
     return out.str();
 }
@@ -104,6 +141,7 @@ void Engine::SyncMesh(const Peer &peer) {
             nextAlias_ = std::max(nextAlias_, number + 1);
         } else if (type == "B" && fields >> name >> ip && IsLocal(ip)) {
             Peer browser{Wide(Unhex(id)), Wide(Unhex(name)), ip, peer.port, Now(), false, true};
+            std::string platform;fields>>platform;browser.platform=platform=="mobile-web"||platform=="desktop-web"?platform:"web";
             if (!browser.id.starts_with(L"web:") || browser.name.size() > 64) continue;
             browser.gateway = peer.ip; browser.owner = peer.id;
             browserIds.insert(browser.id);

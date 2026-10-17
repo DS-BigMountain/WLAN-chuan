@@ -7,7 +7,7 @@ export function relativePath(value) {
 }
 export function selectedFiles(files,directory=false) {
   return Array.from(files,file=>{
-    if(directory&&!file.webkitRelativePath)throw new Error('当前系统文件选择器未返回文件夹层级。请使用支持目录选择的浏览器，或将文件夹压缩后通过“选择文件”发送。');
+    if(directory&&(!file.webkitRelativePath||!file.webkitRelativePath.includes('/')))throw new Error('浏览器未提供文件夹目录，无法发送。请使用客户端选择文件夹，或先打包为 ZIP 后发送。');
     return {file,path:relativePath(file.webkitRelativePath||file.name)};
   });
 }

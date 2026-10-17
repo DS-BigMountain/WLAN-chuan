@@ -1,0 +1,12 @@
+import http from 'node:http';
+import {readFile,mkdir} from 'node:fs/promises';
+import {pathToFileURL} from 'node:url';
+import path from 'node:path';
+import assert from 'node:assert/strict';
+const root=path.resolve(process.argv[2]||'build/grouped-approvals/responsive');await mkdir(root,{recursive:true});
+const state={token:'token',clientName:'Android Protocol Host · 浏览器-7313',clientIp:'127.0.0.1',hostId:'host',serverInstance:'instance',name:'Android Protocol Host',version:'1.1',autoReceive:false,peers:[],jobs:[],inbox:[],requests:[{id:'1',batch:'batch',sender:'Android Protocol Host · 浏览器-7313',items:[{name:'很长文件名'.repeat(30)+'.txt',folder:false,count:'1',total:'123'}]}]};
+const server=http.createServer(async(req,res)=>{try{if(req.url==='/api/info'){res.setHeader('Content-Type','application/json');res.end(JSON.stringify({protocol:1,id:'host',instance:'instance'}));return;}if(req.url.startsWith('/web/api/')){req.resume();res.setHeader('Content-Type','application/json');res.end(req.url==='/web/api/state'?JSON.stringify(state):'');return;}const file=req.url==='/'?'index.html':req.url.replace('/web/','');const body=await readFile(path.join('src/web',file));res.setHeader('Content-Type',file.endsWith('.js')?'text/javascript':file.endsWith('.css')?'text/css':'text/html');res.end(body);}catch{res.writeHead(404);res.end();}});await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));let browser;
+try{const {chromium}=await import(pathToFileURL(path.resolve('build/web-qa/node_modules/playwright-core/index.mjs')));browser=await chromium.launch({channel:'chrome',headless:true});const page=await browser.newPage();await page.goto('http://127.0.0.1:'+server.address().port);await page.locator('.approval-file').waitFor();
+ for(const width of [320,360,390,760,1280,1920]){await page.setViewportSize({width,height:900});const metrics=await page.evaluate(()=>({width:innerWidth,scroll:document.documentElement.scrollWidth,overflow:[...document.querySelectorAll('body *')].map(node=>({node:node.tagName+'.'+node.className,x:node.getBoundingClientRect().x,width:node.getBoundingClientRect().width,display:getComputedStyle(node).display,min:getComputedStyle(node).minWidth})).filter(item=>item.width&&item.x+item.width>innerWidth+1)}));assert(metrics.scroll<=width,JSON.stringify(metrics));await page.screenshot({path:path.join(root,'approval-'+width+'.png'),fullPage:true});}
+ console.log('PASS long sender and file names at 320–1920px');
+}finally{await browser?.close();await new Promise(resolve=>server.close(resolve));}

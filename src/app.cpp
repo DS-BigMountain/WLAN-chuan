@@ -1,6 +1,7 @@
 #include "core.h"
 #include "ui.h"
 #include "transfer_view.h"
+#include "approval_view.h"
 #include <algorithm>
 #include <cmath>
 #include <commctrl.h>
@@ -21,8 +22,13 @@ using namespace chuan;
 namespace {
 constexpr int Devices = 100, Drop = 101, Settings = 102, Refresh = 103, ConnectPeer = 104, CopyUrl = 105,
               OpenUrl = 106, Tasks = 107, Cancel = 108, Clear = 109, Accept = 110, Reject = 111,
-              OpenFolder = 112, WebService = 113, Delete = 114, PingPeer = 115, NotePeer = 116, Partial = 117;
-constexpr COLORREF Ink = RGB(45, 45, 45), Muted = RGB(115, 115, 115), Line = RGB(228, 228, 228);
+              OpenFolder = 112, WebService = 113, Delete = 114, PingPeer = 115, NotePeer = 116, Partial = 117, SelectFiles = 118, SelectFolder = 119, ToggleAuto = 120,
+              AllTasks = 121, SentTasks = 122, ReceivedTasks = 123, PendingRequests = 124, SelectAllRequests = 125;
+constexpr COLORREF Ink = RGB(23, 27, 36), Muted = RGB(107, 116, 133), Line = RGB(220, 226, 234);
+const D2D1_COLOR_F Accent = D2D1::ColorF(0x2164F3), AccentLight = D2D1::ColorF(0xDFE9FC),
+    Success = D2D1::ColorF(0x08A344), PendingSurface = D2D1::ColorF(0xFFF8E9),
+    TextInk = D2D1::ColorF(0x171B24), TextMuted = D2D1::ColorF(0x6B7485),
+    SoftBorder = D2D1::ColorF(0xDCE2EA), SideSurface = D2D1::ColorF(0xF1F4F7);
 struct App {
     Engine &engine;
     HWND window = nullptr, devices = nullptr, tasks = nullptr, drop = nullptr, request = nullptr,
@@ -30,25 +36,37 @@ struct App {
     HWND settingsButton = nullptr, refreshButton = nullptr, connectButton = nullptr, clearButton = nullptr,
          folderButton = nullptr, webButton = nullptr, deleteButton = nullptr;
     HWND pingButton = nullptr, noteButton = nullptr, flash = nullptr;
+    HWND requestList = nullptr, selectAllRequests = nullptr;
+    HDWP layoutBatch = nullptr;
+    ApprovalView approvals;
     uint64_t displayedPing = 0;
     uint64_t pingStarted = 0;
     bool dropEnabled = false;
     HFONT font = nullptr, smallFont = nullptr, titleFont = nullptr;
-    HBRUSH white = CreateSolidBrush(RGB(255, 255, 255)), gray = CreateSolidBrush(RGB(243, 243, 243)),
+    HBRUSH white = CreateSolidBrush(RGB(255, 255, 255)), gray = CreateSolidBrush(RGB(241, 244, 247)), pendingBrush = CreateSolidBrush(RGB(255, 248, 233)),
            surface = CreateSolidBrush(RGB(249, 249, 249)), pingBrush = CreateSolidBrush(RGB(210, 210, 210));
+    HBRUSH footerBrush = CreateSolidBrush(RGB(249, 250, 252));
     ID2D1Factory *factory = nullptr;
     ID2D1HwndRenderTarget *target = nullptr;
     ID2D1DCRenderTarget *controlTarget = nullptr;
     IDWriteFactory *write = nullptr;
     IDWriteTextFormat *normal = nullptr, *captionFormat = nullptr, *heading = nullptr, *section = nullptr;
+    IDWriteTextFormat *strongFormat = nullptr, *brandFormat = nullptr, *heroFormat = nullptr;
     Snapshot snapshot;
     std::wstring peerId, taskKey;
     uint64_t selectedTask = 0, pending = 0;
+    HWND filesButton = nullptr, sendFolderButton = nullptr, autoButton = nullptr;
+    HWND webAddress = nullptr, webCopyButton = nullptr, webOpenButton = nullptr;
+    HWND allButton = nullptr, sentButton = nullptr, receivedButton = nullptr;
+    int taskFilter = 0;
+    int sidebarWidth = 276, mainLeft = 300, dropTop = 154, dropHeight = 224;
+    int requestTop = 394, requestHeight = 84, taskRowHeight = 80, peerRowHeight = 72;
     bool pendingPartial = false;
     float scale = 1;
     int width = 980, height = 700, jobTop = 345;
     std::vector<Peer> shownPeers;
     std::vector<TransferRow> shownJobs;
+    std::vector<Transfer> pendingJobs;
     std::set<std::string> expandedFolders;
     std::wstring localNotice, displayedPeer;
     uint64_t paintCount = 0, controlPaintCount = 0;
@@ -65,6 +83,9 @@ struct App {
             captionFormat->Release();
         if (heading)
             heading->Release();
+        if (strongFormat) strongFormat->Release();
+        if (brandFormat) brandFormat->Release();
+        if (heroFormat) heroFormat->Release();
         if (write)
             write->Release();
         if (factory)
@@ -74,8 +95,10 @@ struct App {
         DeleteObject(titleFont);
         DeleteObject(white);
         DeleteObject(gray);
+        DeleteObject(pendingBrush);
         DeleteObject(surface);
         DeleteObject(pingBrush);
+        DeleteObject(footerBrush);
     }
     int Px(float dip) const {
         return static_cast<int>(dip * scale + .5f);
@@ -92,9 +115,9 @@ struct App {
             DeleteObject(smallFont);
         if (titleFont)
             DeleteObject(titleFont);
-        font = MakeFont(14);
-        smallFont = MakeFont(12);
-        titleFont = MakeFont(20, FW_SEMIBOLD);
+        font = MakeFont(16);
+        smallFont = MakeFont(14);
+        titleFont = MakeFont(24, FW_BOLD);
         EnumChildWindows(
             window,
             [](HWND h, LPARAM p) {
@@ -104,6 +127,10 @@ struct App {
             reinterpret_cast<LPARAM>(this));
     }
     static LRESULT CALLBACK ButtonProc(HWND h, UINT msg, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR) {
+        if (msg == WM_SETCURSOR && GetDlgCtrlID(h) == OpenFolder) {
+            SetCursor(LoadCursorW(nullptr, IDC_HAND));
+            return TRUE;
+        }
         if (msg == WM_MOUSEMOVE && !GetPropW(h, L"ChuanHover")) {
             SetPropW(h, L"ChuanHover", reinterpret_cast<HANDLE>(1));
             TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, h, 0};
@@ -138,7 +165,7 @@ struct App {
         auto *app = reinterpret_cast<App *>(data);
         if (msg == WM_KEYDOWN && (w == VK_RETURN || w == VK_SPACE || w == VK_LEFT || w == VK_RIGHT || w == VK_DELETE)) {
             if (w == VK_RETURN || w == VK_SPACE || w == VK_LEFT || w == VK_RIGHT) {
-                if (!app->ToggleTask(w) && w == VK_RETURN) app->OpenTaskFile();
+                if (!app->ToggleTask(w) && w == VK_RETURN) app->OpenOrRetryTask();
             }
             else
                 app->DeleteTask();
@@ -151,25 +178,57 @@ struct App {
                 app->selectedTask = app->shownJobs[LOWORD(row)].id;
                 RECT bounds{}; GetClientRect(h, &bounds);
                 int x = GET_X_LPARAM(l);
+                if (app->shownJobs[LOWORD(row)].childRow) { app->ToggleTask();return result; }
                 if (x >= bounds.right - app->Px(58)) {
                     auto &job = app->shownJobs[LOWORD(row)];
                     if (job.state < State::Completed) app->CancelTask();
                     else app->DeleteTask();
-                } else if (x >= bounds.right - app->Px(154)) app->OpenTaskFile();
+                } else if (x >= bounds.right - app->Px(154)) app->OpenOrRetryTask();
                 else app->ToggleTask();
             }
         }
         return result;
     }
+    void RefreshPending() {
+        approvals.Update(pendingJobs);
+        const auto selected=SendMessageW(requestList,LB_GETCURSEL,0,0),top=SendMessageW(requestList,LB_GETTOPINDEX,0,0);
+        SendMessageW(requestList,WM_SETREDRAW,FALSE,0);SendMessageW(requestList,LB_RESETCONTENT,0,0);
+        for(const auto &row:approvals.rows)SendMessageW(requestList,LB_ADDSTRING,0,reinterpret_cast<LPARAM>(row.name.c_str()));
+        SendMessageW(requestList,LB_SETCURSEL,std::min<LRESULT>(selected,static_cast<LRESULT>(approvals.rows.size())-1),0);
+        SendMessageW(requestList,LB_SETTOPINDEX,top,0);SendMessageW(requestList,WM_SETREDRAW,TRUE,0);
+        SetTextIfChanged(request,L"接收申请 ("+std::to_wstring(approvals.leaves.size())+L")");
+        EnableIfChanged(accept,approvals.Selected()>0);EnableIfChanged(reject,approvals.Selected()>0);
+        InvalidateRect(requestList,nullptr,FALSE);InvalidateRect(selectAllRequests,nullptr,FALSE);
+    }
+    void ToggleRequest(size_t index,bool checkbox,WPARAM key=0) {
+        if(index>=approvals.rows.size())return;const auto row=approvals.rows[index];
+        if(row.sender&&!checkbox&&key!=VK_SPACE) {
+            if(key==VK_LEFT)approvals.collapsed.insert(row.peer);
+            else if(key==VK_RIGHT)approvals.collapsed.erase(row.peer);
+            else if(!approvals.collapsed.erase(row.peer))approvals.collapsed.insert(row.peer);
+        } else approvals.Toggle(row);
+        RefreshPending();Layout();
+    }
+    static LRESULT CALLBACK RequestProc(HWND h,UINT msg,WPARAM w,LPARAM l,UINT_PTR,DWORD_PTR data) {
+        auto *app=reinterpret_cast<App *>(data);
+        if(msg==WM_KEYDOWN&&(w==VK_SPACE||w==VK_RETURN||w==VK_LEFT||w==VK_RIGHT)) {
+            const auto index=SendMessageW(h,LB_GETCURSEL,0,0);if(index>=0)app->ToggleRequest(static_cast<size_t>(index),w==VK_SPACE,w);return 0;
+        }
+        const auto result=DefSubclassProc(h,msg,w,l);
+        if(msg==WM_LBUTTONUP) { const auto row=SendMessageW(h,LB_ITEMFROMPOINT,0,l);RECT bounds{};GetClientRect(h,&bounds);
+            if(!HIWORD(row))app->ToggleRequest(LOWORD(row),GET_X_LPARAM(l)>=bounds.right-app->Px(45));
+        }
+        return result;
+    }
     HWND Button(const wchar_t *text, int id) {
-        HWND h = CreateWindowExW(0, L"BUTTON", text, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 0, 0,
+        HWND h = CreateWindowExW(0, L"BUTTON", text, WS_CHILD | WS_CLIPSIBLINGS | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 0, 0,
                                  0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
                                  GetModuleHandleW(nullptr), nullptr);
         SetWindowSubclass(h, ButtonProc, 1, reinterpret_cast<DWORD_PTR>(this));
         return h;
     }
     HWND Label(const wchar_t *text) {
-        return CreateWindowExW(0, L"STATIC", text, WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 0, 0, 0, window,
+        return CreateWindowExW(0, L"STATIC", text, WS_CHILD | WS_CLIPSIBLINGS | WS_VISIBLE | SS_LEFT, 0, 0, 0, 0, window,
                                nullptr, GetModuleHandleW(nullptr), nullptr);
     }
     void Initialize() {
@@ -179,33 +238,61 @@ struct App {
                             reinterpret_cast<IUnknown **>(&write));
         if (write) {
             write->CreateTextFormat(L"Microsoft YaHei UI", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
-                                    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 14, L"zh-CN",
+                                    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 16, L"zh-CN",
                                     &normal);
             write->CreateTextFormat(L"Microsoft YaHei UI", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
-                                    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 12, L"zh-CN",
+                                    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 14, L"zh-CN",
                                     &captionFormat);
-            write->CreateTextFormat(L"Microsoft YaHei UI", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD,
-                                    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 24, L"zh-CN",
+            write->CreateTextFormat(L"Microsoft YaHei UI", nullptr, DWRITE_FONT_WEIGHT_BOLD,
+                                    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 32, L"zh-CN",
                                     &heading);
             write->CreateTextFormat(L"Microsoft YaHei UI", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD,
-                                    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 16, L"zh-CN",
+                                    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 20, L"zh-CN",
                                     &section);
+            write->CreateTextFormat(L"Microsoft YaHei UI", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                                    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 16, L"zh-CN", &strongFormat);
+            write->CreateTextFormat(L"Microsoft YaHei UI", nullptr, DWRITE_FONT_WEIGHT_BOLD,
+                                    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 40, L"zh-CN", &brandFormat);
+            write->CreateTextFormat(L"Microsoft YaHei UI", nullptr, DWRITE_FONT_WEIGHT_BOLD,
+                                    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 24, L"zh-CN", &heroFormat);
+            for (auto *format : {normal, captionFormat, heading, section, strongFormat, brandFormat, heroFormat}) {
+                IDWriteInlineObject *ellipsis = nullptr;
+                if (format && SUCCEEDED(write->CreateEllipsisTrimmingSign(format, &ellipsis))) {
+                    DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0};
+                    format->SetTrimming(&trimming, ellipsis);
+                    ellipsis->Release();
+                }
+            }
         }
         devices = CreateWindowExW(0, L"LISTBOX", L"附近设备",
-                                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY |
+                                  WS_CHILD | WS_CLIPSIBLINGS | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY |
                                       LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | LBS_NOINTEGRALHEIGHT,
                                   0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(Devices)),
                                   GetModuleHandleW(nullptr), nullptr);
         tasks = CreateWindowExW(0, L"LISTBOX", L"传输状态",
-                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY |
-                                    LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | LBS_NOINTEGRALHEIGHT,
+                                WS_CHILD | WS_CLIPSIBLINGS | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY |
+                                    LBS_OWNERDRAWVARIABLE | LBS_HASSTRINGS | LBS_NOINTEGRALHEIGHT,
                                 0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(Tasks)),
                                 GetModuleHandleW(nullptr), nullptr);
+        requestList = CreateWindowExW(0, L"LISTBOX", L"待确认的接收申请",
+                                WS_CHILD | WS_CLIPSIBLINGS | WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY |
+                                    LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | LBS_NOINTEGRALHEIGHT,
+                                0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(PendingRequests)),
+                                GetModuleHandleW(nullptr), nullptr);
         drop = Button(L"将文件拖入此区域发送", Drop);
+        filesButton = Button(L"选择文件", SelectFiles);
+        sendFolderButton = Button(L"选择文件夹", SelectFolder);
+        autoButton = Button(L"自动接收", ToggleAuto);
+        allButton = Button(L"全部", AllTasks);
+        sentButton = Button(L"发送", SentTasks);
+        receivedButton = Button(L"接收", ReceivedTasks);
         settingsButton = Button(L"设置", Settings);
         refreshButton = Button(L"刷新", Refresh);
         connectButton = Button(L"手动连接", ConnectPeer);
-        webButton = Button(L"Web服务", WebService);
+        webButton = Button(L"Web 服务", WebService);
+        webAddress = Label(L"");
+        webCopyButton = Button(L"复制", CopyUrl);
+        webOpenButton = Button(L"打开", OpenUrl);
         clearButton = Button(L"清除已结束", Clear);
         cancel = Button(L"取消传输", Cancel);
         deleteButton = Button(L"删除", Delete);
@@ -215,6 +302,8 @@ struct App {
         accept = Button(L"接收", Accept);
         reject = Button(L"拒绝", Reject);
         partial = Button(L"接受部分", Partial);
+        selectAllRequests = Button(L"全选", SelectAllRequests);
+        SetWindowSubclass(requestList, RequestProc, 3, reinterpret_cast<DWORD_PTR>(this));
         folderButton = Button(L"接收目录", OpenFolder);
         request = Label(L"");
         status = Label(L"");
@@ -226,48 +315,95 @@ struct App {
         Update();
     }
     void Move(HWND h, int x, int y, int w, int v) {
-        MoveWindow(h, Px(static_cast<float>(x)), Px(static_cast<float>(y)),
-                   Px(static_cast<float>(std::max(0, w))), Px(static_cast<float>(std::max(0, v))), TRUE);
+        const auto flags=SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOCOPYBITS|SWP_NOREDRAW;
+        if(layoutBatch)layoutBatch=DeferWindowPos(layoutBatch,h,nullptr,Px(float(x)),Px(float(y)),Px(float(std::max(0,w))),Px(float(std::max(0,v))),flags);
+        else SetWindowPos(h,nullptr,Px(float(x)),Px(float(y)),Px(float(std::max(0,w))),Px(float(std::max(0,v))),flags);
     }
     void Layout() {
+        layoutBatch=BeginDeferWindowPos(32);
         RECT r{};
         GetClientRect(window, &r);
         width = static_cast<int>((r.right - r.left) / scale);
         height = static_cast<int>((r.bottom - r.top) / scale);
-        int left = 280, right = width - 32;
-        Move(devices, 16, 137, 216, std::max(60, height - 397));
-        SendMessageW(devices, LB_SETITEMHEIGHT, 0, Px(shownPeers.empty() ? 116.f : 84.f));
-        Move(refreshButton, 194, 94, 34, 34);
-        Move(pingButton, 16, height - 240, 98, 36);
-        Move(noteButton, 122, height - 240, 102, 36);
-        Move(connectButton, 16, height - 190, 208, 40);
-        Move(folderButton, 16, height - 143, 208, 40);
-        Move(settingsButton, right - 88, 29, 88, 38);
-        Move(drop, left, 112, right - left, 180);
-        jobTop = pending ? 434 : 352;
-        Move(request, left + 12, 304, right - left - 24, 34);
-        Move(reject, right - 288, 345, 84, 34);
-        Move(partial, right - 196, 345, 92, 34);
-        Move(accept, right - 96, 345, 96, 34);
+        sidebarWidth = width >= 1160 ? 276 : 240;
+        mainLeft = sidebarWidth + 24;
+        const int left = mainLeft, right = width - 24, center = (left + right) / 2;
+        const bool compact = height < 720;
+        peerRowHeight = compact ? 64 : 72;
+        Move(devices, 12, 164, sidebarWidth - 24, std::max(peerRowHeight, (height - (compact ? 236 : 278) - 164) / peerRowHeight * peerRowHeight));
+        SendMessageW(devices, LB_SETITEMHEIGHT, 0, Px(shownPeers.empty() ? 60.f : static_cast<float>(peerRowHeight)));
+        Move(refreshButton, sidebarWidth - 78, 121, 36, 36);
+        Move(pingButton, 20, height - 208, (sidebarWidth - 48) / 2, 42);
+        Move(noteButton, sidebarWidth / 2 + 4, height - 208, (sidebarWidth - 48) / 2, 42);
+        Move(connectButton, 20, height - 154, sidebarWidth - 40, 36);
+        Move(settingsButton, right - 92, 22, 92, 38);
+        Move(autoButton, right - 258, 22, 152, 38);
+        dropHeight = compact ? 132 : height < 780 ? 184 : 224;
+        if (pending) dropHeight = std::min(dropHeight, compact ? 88 : 160);
+        const int requestRowHeight = compact ? 44 : 52;
+        const int maxRequestRows = std::max(1,(height-94-(width>=1160?80:100)-(dropTop+dropHeight+16)-(compact?48:52)-(compact?50:64))/requestRowHeight);
+        const int requestRows = static_cast<int>(std::clamp<size_t>(approvals.rows.size(), 1, std::min(5,maxRequestRows)));
+        requestHeight = (compact ? 48 : 52) + requestRowHeight * requestRows;
+        requestTop = dropTop + dropHeight + 16;
+        Move(drop, left, dropTop, right - left, dropHeight);
+        Move(filesButton, center - 144, dropTop + dropHeight - (pending ? 54 : 65), 136, pending ? 40 : 44);
+        Move(sendFolderButton, center + 8, dropTop + dropHeight - (pending ? 54 : 65), 136, pending ? 40 : 44);
+        jobTop = pending ? requestTop + requestHeight + (compact ? 50 : 64) : dropTop + dropHeight + 64;
+        Move(request, left + 16, requestTop + 12, std::max(100, right - left - 350), 26);
+        Move(reject, right - 212, requestTop + (compact ? 4 : 6), 84, compact ? 32 : 36);
+        Move(selectAllRequests,right-300,requestTop+(compact?4:6),80,compact?32:36);
+        Move(accept, right - 112, requestTop + (compact ? 4 : 6), 100, compact ? 32 : 36);
+        Move(requestList, left + 12, requestTop + (compact ? 40 : 44), right - left - 24, requestRows * requestRowHeight);
+        SendMessageW(requestList, LB_SETITEMHEIGHT, 0, Px(static_cast<float>(requestRowHeight)));
         ShowWindow(request, pending ? SW_SHOW : SW_HIDE);
+        ShowWindow(requestList, pending ? SW_SHOW : SW_HIDE);
         ShowWindow(accept, pending ? SW_SHOW : SW_HIDE);
         ShowWindow(reject, pending ? SW_SHOW : SW_HIDE);
-        ShowWindow(partial, pending && pendingPartial ? SW_SHOW : SW_HIDE);
+        ShowWindow(partial,SW_HIDE);
+        ShowWindow(selectAllRequests,pending?SW_SHOW:SW_HIDE);
         ShowWindow(deleteButton, SW_HIDE);
-        Move(clearButton, right - 120, jobTop - 43, 120, 32);
+        const int filterWidth = width >= 1160 ? 96 : 60;
+        Move(allButton, left + 112, jobTop - 43, filterWidth, 34);
+        Move(sentButton, left + 120 + filterWidth, jobTop - 43, filterWidth, 34);
+        Move(receivedButton, left + 128 + filterWidth * 2, jobTop - 43, filterWidth, 34);
+        Move(clearButton, right - 134, jobTop - 43, 134, 34);
         ShowWindow(cancel, SW_HIDE);
-        Move(tasks, left, jobTop, right - left, std::max(68, height - jobTop - 106));
-        SendMessageW(tasks, LB_SETITEMHEIGHT, 0, Px(shownJobs.empty() ? 132.f : 60.f));
-        Move(webButton, right - 116, height - 84, 116, 36);
-        Move(status, 22, height - 29, width - 44, 20);
+        taskRowHeight = width >= 1160 ? 80 : 100;
+        Move(tasks, left, jobTop, right - left, std::max(taskRowHeight, (height - jobTop - 94) / taskRowHeight * taskRowHeight));
+        TaskHeights();
+        const bool showWebAddress = width >= 1160;
+        Move(folderButton, left + 8, height - 85, right - left - (showWebAddress ? 480 : 144), 40);
+        Move(webButton, right - (showWebAddress ? 460 : 124), height - 85, 124, 40);
+        Move(webAddress, right - 328, height - 78, 200, 26);
+        Move(webCopyButton, right - 120, height - 83, 54, 36);
+        Move(webOpenButton, right - 60, height - 83, 54, 36);
+        ShowWindow(webAddress, showWebAddress ? SW_SHOW : SW_HIDE);
+        ShowWindow(webCopyButton, showWebAddress ? SW_SHOW : SW_HIDE);
+        ShowWindow(webOpenButton, showWebAddress ? SW_SHOW : SW_HIDE);
+        SendMessageW(webAddress, WM_SETFONT, reinterpret_cast<WPARAM>(smallFont), FALSE);
+        SendMessageW(request, WM_SETFONT, reinterpret_cast<WPARAM>(smallFont), FALSE);
+        Move(status, 20, height - 29, width - 40, 22);
         SendMessageW(status, WM_SETFONT, reinterpret_cast<WPARAM>(smallFont), FALSE);
-        if (target)
-            target->Resize(D2D1::SizeU(static_cast<UINT32>(r.right), static_cast<UINT32>(r.bottom)));
-        InvalidateRect(window, nullptr, FALSE);
+        if(layoutBatch)EndDeferWindowPos(layoutBatch);layoutBatch=nullptr;
+        for(HWND button:{filesButton,sendFolderButton})SetWindowPos(button,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_NOREDRAW);
+        if (target) target->Resize(D2D1::SizeU(static_cast<UINT32>(r.right), static_cast<UINT32>(r.bottom)));
+        RedrawWindow(window,nullptr,nullptr,RDW_INVALIDATE|RDW_ALLCHILDREN);
     }
-    void Update() {
+    void Update(const Snapshot *sample=nullptr) {
         auto oldName = snapshot.config.name;
-        snapshot = engine.GetSnapshot();
+        const bool oldAutoReceive = snapshot.config.autoReceive;
+        snapshot = sample?*sample:engine.GetSnapshot();
+        const auto summaryRows = TransferRows(snapshot.transfers, {});
+        const auto receivedCount = std::count_if(summaryRows.begin(), summaryRows.end(), [](const auto &job) { return job.receiving; });
+        SetTextIfChanged(allButton, width >= 1160 ? L"全部 (" + std::to_wstring(summaryRows.size()) + L")" : L"全部");
+        SetTextIfChanged(sentButton, width >= 1160 ? L"发送 (" + std::to_wstring(summaryRows.size() - receivedCount) + L")" : L"发送");
+        SetTextIfChanged(receivedButton, width >= 1160 ? L"接收 (" + std::to_wstring(receivedCount) + L")" : L"接收");
+        SetTextIfChanged(webAddress, snapshot.config.shareSoftware ? L"http://" + Wide(snapshot.addresses.empty() ? "127.0.0.1" : snapshot.addresses.front()) + L":" +
+                         std::to_wstring(snapshot.boundPort ? snapshot.boundPort : snapshot.config.port) + L"/" : L"Web 服务未启用");
+        SetTextIfChanged(folderButton, L"接收目录：" + snapshot.config.receiveDir.wstring() + L" · 查看 / 修改");
+        EnableIfChanged(webCopyButton, snapshot.config.shareSoftware);
+        EnableIfChanged(webOpenButton, snapshot.config.shareSoftware);
+        if (oldAutoReceive != snapshot.config.autoReceive) InvalidateRect(autoButton, nullptr, FALSE);
         if (snapshot.ping != displayedPing) {
             displayedPing = snapshot.ping;
             if (!flash) flash = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
@@ -285,14 +421,14 @@ struct App {
             for (size_t i = 0; i < shownPeers.size(); ++i)
                 if (shownPeers[i].id != snapshot.peers[i].id ||
                     shownPeers[i].name != snapshot.peers[i].name ||
-                    shownPeers[i].ip != snapshot.peers[i].ip || shownPeers[i].port != snapshot.peers[i].port)
+                    shownPeers[i].ip != snapshot.peers[i].ip || shownPeers[i].port != snapshot.peers[i].port || shownPeers[i].platform != snapshot.peers[i].platform)
                     changed = true;
         if (changed) {
             shownPeers = snapshot.peers;
             SendMessageW(devices, WM_SETREDRAW, FALSE, 0);
             SendMessageW(devices, LB_RESETCONTENT, 0, 0);
             for (auto &p : shownPeers) {
-                std::wstring label = p.name + L" · " + Wide(p.ip) + L":" + std::to_wstring(p.port);
+                std::wstring label = p.name + L" · " + PeerLabel(p) + L" · " + Wide(p.ip) + L":" + std::to_wstring(p.port);
                 SendMessageW(devices, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
             }
             if (shownPeers.empty())
@@ -307,6 +443,8 @@ struct App {
             peerId.clear();
         bool canSend = selected >= 0;
         EnableIfChanged(drop, canSend);
+        EnableIfChanged(filesButton, canSend);
+        EnableIfChanged(sendFolderButton, canSend);
         EnableIfChanged(pingButton, canSend);
         EnableIfChanged(noteButton, canSend);
         if (dropEnabled != canSend) {
@@ -316,11 +454,16 @@ struct App {
         if (SendMessageW(devices, LB_GETCURSEL, 0, 0) != selected)
             SendMessageW(devices, LB_SETCURSEL, selected, 0);
         auto oldJobs = shownJobs;
-        shownJobs = TransferRows(snapshot.transfers, expandedFolders);
+        auto visibleTransfers = snapshot.transfers;
+        if (taskFilter) std::erase_if(visibleTransfers, [&](const auto &job) { return job.receiving != (taskFilter == 2); });
+        std::stable_sort(visibleTransfers.begin(), visibleTransfers.end(), [](const auto &a, const auto &b) {
+            return (a.state < State::Completed) > (b.state < State::Completed);
+        });
+        shownJobs = TransferRows(visibleTransfers, expandedFolders);
         bool content = oldJobs.size() != shownJobs.size();
         if (!content)
             for (size_t i = 0; i < oldJobs.size(); ++i)
-                if (oldJobs[i].id != shownJobs[i].id || oldJobs[i].state != shownJobs[i].state || oldJobs[i].completedFiles != shownJobs[i].completedFiles)
+                if (oldJobs[i].id != shownJobs[i].id || oldJobs[i].treePath != shownJobs[i].treePath || oldJobs[i].state != shownJobs[i].state || oldJobs[i].completedFiles != shownJobs[i].completedFiles || oldJobs[i].failedFiles != shownJobs[i].failedFiles)
                     content = true;
         int top = static_cast<int>(SendMessageW(tasks, LB_GETTOPINDEX, 0, 0));
         int sel = -1;
@@ -328,13 +471,14 @@ struct App {
             SendMessageW(tasks, WM_SETREDRAW, FALSE, 0);
             SendMessageW(tasks, LB_RESETCONTENT, 0, 0);
             for (auto &j : shownJobs) {
-                std::wstring label = (j.folderRow ? L"文件夹 " : L"") + j.name + L" · " + StateText(j.state, j.receiving) + L" · " + j.peer;
+                std::wstring label = (j.folderRow ? L"文件夹 " : L"") + j.name + L" · " + TransferText(j) + L" · " + j.peer;
                 SendMessageW(tasks, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
             }
             if (shownJobs.empty())
                 SendMessageW(tasks, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"暂无传输任务"));
             SendMessageW(tasks, WM_SETREDRAW, TRUE, 0);
             SendMessageW(tasks, LB_SETTOPINDEX, top, 0);
+            TaskHeights();
         }
         for (size_t i = 0; i < shownJobs.size(); ++i)
             if (shownJobs[i].id == selectedTask)
@@ -345,26 +489,18 @@ struct App {
         }
         if (SendMessageW(tasks, LB_GETCURSEL, 0, 0) != sel)
             SendMessageW(tasks, LB_SETCURSEL, sel, 0);
-        uint64_t oldPending = pending;
-        pending = 0;
-        for (auto &j : snapshot.transfers)
-            if (j.receiving && j.state == State::Waiting && j.awaitingApproval) {
-                pending = j.id; pendingPartial = j.offerItems.size() > 1;
-                std::wstring label = j.folderName.empty() ? L"接收确认：" + j.peer + L" · " + j.name + L" · " + FormatBytes(j.total) :
-                    L"接收文件夹：" + j.folderName + L" · " + std::to_wstring(j.folderCount) + L" 个文件 · " + FormatBytes(j.folderTotal);
-                SetTextIfChanged(request, label);
-                SetTextIfChanged(accept, j.folderName.empty() ? L"全部接受" : L"接受文件夹");
-                SetTextIfChanged(reject, j.folderName.empty() ? L"拒绝" : L"拒绝整批");
-                break;
-            }
-        if (oldPending != pending)
-            Layout();
+        const auto oldPending=pending;auto oldRequests=std::move(pendingJobs);pendingJobs.clear();
+        for(const auto &job:snapshot.transfers)if(job.receiving&&job.state==State::Waiting&&job.awaitingApproval)pendingJobs.push_back(job);
+        pending=pendingJobs.empty()?0:pendingJobs.front().id;
+        bool requestsChanged=oldRequests.size()!=pendingJobs.size();
+        if(!requestsChanged)for(size_t i=0;i<pendingJobs.size();++i)if(pendingJobs[i].id!=oldRequests[i].id||pendingJobs[i].peer!=oldRequests[i].peer||pendingJobs[i].offerSelection!=oldRequests[i].offerSelection||pendingJobs[i].offerItems.size()!=oldRequests[i].offerItems.size())requestsChanged=true;
+        if(requestsChanged){RefreshPending();Layout();}else if(oldPending!=pending)Layout();
         bool active =
             sel >= 0 && (shownJobs[sel].state == State::Queued || shownJobs[sel].state == State::Waiting ||
                          shownJobs[sel].state == State::Running);
         EnableIfChanged(cancel, active);
         EnableIfChanged(deleteButton, sel >= 0 && !active);
-        EnableIfChanged(clearButton, std::any_of(shownJobs.begin(), shownJobs.end(), [](const auto &j) {
+        EnableIfChanged(clearButton, std::any_of(snapshot.transfers.begin(), snapshot.transfers.end(), [](const auto &j) {
                             return j.state == State::Completed || j.state == State::Failed ||
                                    j.state == State::Cancelled || j.state == State::Rejected;
                         }));
@@ -372,6 +508,7 @@ struct App {
                                  ? L"未检测到局域网地址"
                                  : L"本机：" + snapshot.config.name + L" · " + Wide(snapshot.addresses[0]);
         state += snapshot.config.autoReceive ? L"   自动接收：开" : L"   自动接收：关";
+        state += L"   版本 " + std::wstring(Version);
         if (!localNotice.empty())
             state += L"   " + localNotice;
         else if (!snapshot.notice.empty())
@@ -380,17 +517,18 @@ struct App {
         std::wstring destination = L"请先选择在线设备";
         for (auto &p : shownPeers)
             if (p.id == peerId)
-                destination = L"目标设备：" + p.name;
+                destination = L"发送至 " + p.name;
         if (destination != displayedPeer) {
             displayedPeer = destination;
             InvalidateRect(drop, nullptr, FALSE);
+            InvalidateRect(window, nullptr, FALSE);
         }
         if (changed) {
-            SendMessageW(devices, LB_SETITEMHEIGHT, 0, Px(shownPeers.empty() ? 116.f : 84.f));
+            SendMessageW(devices, LB_SETITEMHEIGHT, 0, Px(shownPeers.empty() ? 60.f : static_cast<float>(peerRowHeight)));
             InvalidateRect(devices, nullptr, FALSE);
         }
         if (content) {
-            SendMessageW(tasks, LB_SETITEMHEIGHT, 0, Px(shownJobs.empty() ? 132.f : 60.f));
+            TaskHeights();
             InvalidateRect(tasks, nullptr, FALSE);
         } else {
             for (size_t i = 0; i < shownJobs.size(); ++i) {
@@ -404,7 +542,7 @@ struct App {
                 }
             }
         }
-        if (changed || content || oldName != snapshot.config.name)
+        if (changed || content || requestsChanged || oldName != snapshot.config.name)
             InvalidateRect(window, nullptr, FALSE);
     }
     void DiscardTarget() {
@@ -424,52 +562,53 @@ struct App {
         const BYTE alpha = static_cast<BYTE>(170.0 * (1.0 - std::cos(phase * 6.283185307179586)) / 2.0);
         SetLayeredWindowAttributes(flash, 0, alpha, LWA_ALPHA);
     }
+    void DrawBackground(ui::Canvas &c) {
+        const float left = static_cast<float>(mainLeft), right = static_cast<float>(width - 24);
+        c.BoxColor(0, 0, static_cast<float>(sidebarWidth), static_cast<float>(height - 38), 0, SideSurface);
+        c.Line(static_cast<float>(sidebarWidth), 0, static_cast<float>(sidebarWidth), static_cast<float>(height - 38), .89f, 1);
+        c.Line(0, static_cast<float>(height - 38), static_cast<float>(width), static_cast<float>(height - 38), .90f, 1);
+        c.Box(28, 30, 44, 44, 11, .19f); c.Icon(0, 36, 38, 1, 1.16f);
+        c.TextColor(L"传", 86, 23, 110, 57, brandFormat, TextInk);
+        c.TextColor(L"局域网文件传输", 28, 79, 222, 28, normal, TextMuted);
+        c.TextColor(L"附近设备", 24, 122, 150, 33, section, TextInk);
+        c.TextColor(std::to_wstring(shownPeers.size()), static_cast<float>(sidebarWidth - 36), 125, 24, 26, captionFormat, TextMuted);
+        const float toolsLine = static_cast<float>(height - (height < 720 ? 224 : 262));
+        c.Line(20, toolsLine, static_cast<float>(sidebarWidth - 20), toolsLine, .86f, 1);
+        if (height >= 720) c.TextColor(L"设备工具", 24, static_cast<float>(height - 250), 150, 28, normal, TextMuted);
+        c.Line(20, static_cast<float>(height - 160), static_cast<float>(sidebarWidth - 20), static_cast<float>(height - 160), .86f, 1);
+        c.Line(20, static_cast<float>(height - 111), static_cast<float>(sidebarWidth - 20), static_cast<float>(height - 111), .86f, 1);
+        c.Icon(1, 26, static_cast<float>(height - 93), .3f, 1.3f);
+        c.TextColor(snapshot.config.name, 70, static_cast<float>(height - 96), static_cast<float>(sidebarWidth - 86), 28, strongFormat, TextInk);
+        c.TextColor(snapshot.addresses.empty() ? L"未检测到局域网地址" : Wide(snapshot.addresses.front()),
+                    70, static_cast<float>(height - 70), static_cast<float>(sidebarWidth - 86), 22, captionFormat, TextMuted);
+        c.TextColor(L"文件传输", left, 18, 250, 46, heading, TextInk);
+        c.BoxColor(left, 76, right - left, 62, 7, SideSurface);
+        c.Icon(1, left + 18, 91, .30f, 1.3f);
+        std::wstring name = L"请先选择在线设备", address;
+        for (const auto &peer : shownPeers) if (peer.id == peerId) { name = peer.name; address = Wide(peer.ip); }
+        c.TextColor(L"目标设备： " + name, left + 64, 80, right - left - 84, 31, strongFormat, TextInk);
+        c.TextColor(address, left + 156, 109, right - left - 180, 22, captionFormat, TextMuted);
+        if (pending) {
+            c.BoxColor(left, static_cast<float>(requestTop), right - left, static_cast<float>(requestHeight), 7, PendingSurface, D2D1::ColorF(0xF4CE77));
+        }
+        c.TextColor(L"本次传输", left, static_cast<float>(jobTop - 44), 110, 34, section, TextInk);
+        c.BoxColor(left, static_cast<float>(height - 89), right - left, 47, 7, D2D1::ColorF(0xF9FAFC), SoftBorder);
+    }
     void Paint() {
         ++paintCount;
-        PAINTSTRUCT ps{};
-        BeginPaint(window, &ps);
-        if (!factory) {
-            FillRect(ps.hdc, &ps.rcPaint, white);
-            EndPaint(window, &ps);
-            return;
-        }
+        PAINTSTRUCT ps{}; BeginPaint(window, &ps);
+        if (!factory) { FillRect(ps.hdc, &ps.rcPaint, white); EndPaint(window, &ps); return; }
         if (!target) {
-            RECT r{};
-            GetClientRect(window, &r);
-            factory->CreateHwndRenderTarget(
-                D2D1::RenderTargetProperties(),
+            RECT r{}; GetClientRect(window, &r);
+            factory->CreateHwndRenderTarget(D2D1::RenderTargetProperties(),
                 D2D1::HwndRenderTargetProperties(window, D2D1::SizeU(r.right, r.bottom)), &target);
-            if (target)
-                target->SetDpi(96 * scale, 96 * scale);
+            if (target) target->SetDpi(96 * scale, 96 * scale);
         }
         if (target) {
-            target->BeginDraw();
-            target->Clear(D2D1::ColorF(.975f, .975f, .975f));
+            target->BeginDraw(); target->Clear(D2D1::ColorF(1.f, 1.f, 1.f));
             ui::Canvas c(target);
-            if (c.brush) {
-                c.Box(0, 0, 248, static_cast<float>(height - 38), 0, .953f);
-                c.Line(248, 0, 248, static_cast<float>(height - 38), .90f, 1);
-                c.Line(0, static_cast<float>(height - 38), static_cast<float>(width),
-                       static_cast<float>(height - 38), .90f, 1);
-                c.Box(24, 28, 36, 36, 10, .19f);
-                c.Icon(0, 30, 34, 1);
-                c.Text(L"传", 74, 24, 110, 34, heading, .18f);
-                c.Text(L"局域网文件传输", 74, 59, 146, 21, captionFormat, .45f);
-                c.Text(L"附近设备", 24, 96, 108, 31, section, .21f);
-                c.Line(24, static_cast<float>(height - 204), 224, static_cast<float>(height - 204), .88f, 1);
-                c.Icon(1, 28, static_cast<float>(height - 81), .42f);
-                c.Text(L"本机", 64, static_cast<float>(height - 88), 150, 20, captionFormat, .5f);
-                c.Text(snapshot.config.name, 64, static_cast<float>(height - 68), 162, 21, captionFormat,
-                       .23f);
-                c.Text(L"文件传输", 280, 27, 230, 40, heading, .17f);
-                c.Text(L"设备互联 · 文件直达", 280, 71, 310, 24, captionFormat, .47f);
-                c.Line(280, 97, static_cast<float>(width - 32), 97, .9f, 1);
-                c.Text(L"传输状态", 280, static_cast<float>(jobTop - 42), 110, 32, section, .21f);
-                c.Text(std::to_wstring(std::count_if(shownJobs.begin(), shownJobs.end(), [](auto &j) { return !j.childRow; })), 391, static_cast<float>(jobTop - 42), 38, 32,
-                       captionFormat, .5f);
-            }
-            if (target->EndDraw() == D2DERR_RECREATE_TARGET)
-                DiscardTarget();
+            if (c.brush) DrawBackground(c);
+            if (target->EndDraw() == D2DERR_RECREATE_TARGET) DiscardTarget();
         }
         EndPaint(window, &ps);
     }
@@ -478,9 +617,9 @@ struct App {
             return;
         ++controlPaintCount;
         bool side =
-            d.CtlID == Devices || d.CtlID == Refresh || d.CtlID == ConnectPeer || d.CtlID == OpenFolder || d.CtlID == PingPeer || d.CtlID == NotePeer;
+            d.CtlID == Devices || d.CtlID == Refresh || d.CtlID == ConnectPeer || d.CtlID == PingPeer || d.CtlID == NotePeer;
         bool modal = GetParent(d.hwndItem) != window;
-        float background = modal || d.CtlID == CopyUrl || d.CtlID == OpenUrl ? 1.f : side ? .953f : .975f;
+        float background = modal || d.CtlID == CopyUrl || d.CtlID == OpenUrl ? 1.f : side ? .963f : 1.f;
         Buffered(d.hDC, d.rcItem, background,
                  [&](ui::Canvas &c, float w, float h) { DrawControl(c, d, w, h, background); });
     }
@@ -528,122 +667,199 @@ struct App {
         DeleteObject(bitmap);
         DeleteDC(memory);
     }
-    void DrawControl(ui::Canvas &c, const DRAWITEMSTRUCT &d, float w, float h, float background) {
+    void DrawControl(ui::Canvas &c, const DRAWITEMSTRUCT &d, float w, float h, float) {
         bool selected = (d.itemState & ODS_SELECTED) != 0;
         bool disabled = (d.itemState & ODS_DISABLED) != 0;
         bool hover = GetPropW(d.hwndItem, L"ChuanHover") != nullptr;
         bool keyboardFocus = (d.itemState & ODS_FOCUS) && !(d.itemState & ODS_NOFOCUSRECT);
+        if(d.CtlID==SelectAllRequests) {
+            c.BoxColor(0,0,w,h,0,PendingSurface);const bool checked=approvals.All();
+            c.BoxColor(4,(h-16)/2,16,16,3,checked?Accent:D2D1::ColorF(0xFFFFFF),keyboardFocus?Accent:SoftBorder);
+            if(checked)c.TextColor(L"✓",4,(h-20)/2,16,20,captionFormat,D2D1::ColorF(0xFFFFFF),DWRITE_TEXT_ALIGNMENT_CENTER);
+            else if(approvals.Selected())c.BoxColor(8,(h-4)/2,8,4,1,Accent);
+            c.TextColor(L"全选",28,0,w-28,h,captionFormat,TextInk);return;
+        }
+        if(d.CtlID==PendingRequests) {
+            c.BoxColor(0,0,w,h,0,PendingSurface);
+            if(d.itemID<approvals.rows.size()) {
+                const auto &row=approvals.rows[d.itemID];const bool checked=approvals.Checked(row);
+                c.BoxColor(1,1,w-2,h-2,4,row.sender?D2D1::ColorF(0xF0F3F9):D2D1::ColorF(0xFFFFFF),keyboardFocus?Accent:SoftBorder);
+                if(row.sender) {
+                    c.TextColor(approvals.collapsed.contains(row.peer)?L"›":L"⌄",7,0,22,h,strongFormat,TextMuted,DWRITE_TEXT_ALIGNMENT_CENTER);
+                    c.Icon(1,34,(h-21)/2,.42f,.85f);c.TextColor(row.peer,64,0,w-224,h,strongFormat,TextInk);
+                    c.TextColor(std::to_wstring(row.count)+L" 项",w-142,0,86,h,captionFormat,TextMuted,DWRITE_TEXT_ALIGNMENT_TRAILING);
+                } else {
+                    c.Icon(row.folder?3:2,36,(h-20)/2,.43f,.85f);c.TextColor(row.name,66,0,w-260,h,captionFormat,TextInk);
+                    c.TextColor(FormatBytes(row.total),w-180,0,124,h,captionFormat,TextMuted,DWRITE_TEXT_ALIGNMENT_TRAILING);
+                }
+                c.BoxColor(w-35,(h-17)/2,17,17,3,checked?Accent:D2D1::ColorF(0xFFFFFF),SoftBorder);
+                if(checked)c.TextColor(L"✓",w-35,(h-22)/2,17,22,captionFormat,D2D1::ColorF(0xFFFFFF),DWRITE_TEXT_ALIGNMENT_CENTER);
+            }return;
+        }
         if (d.CtlID == Devices) {
+            c.BoxColor(0, 0, w, h, 0, SideSurface);
             if (shownPeers.empty()) {
-                c.Icon(1, 12, 14, .53f);
-                c.Text(L"未发现在线设备", 12, 47, w - 24, 25, normal, .4f);
-                c.Text(L"可刷新或手动连接", 12, 74, w - 24, 20, captionFormat, .52f);
+                c.BoxColor(1, 3, w - 2, h - 6, 6, D2D1::ColorF(0xF8FAFC), SoftBorder);
+                c.Icon(1, 15, (h - 18) / 2, .45f, .75f);
+                c.TextColor(L"未发现在线设备", 47, 7, w - 59, 23, captionFormat, TextMuted);
+                c.TextColor(L"可刷新或手动连接", 47, 30, w - 59, 23, captionFormat, TextMuted);
             } else if (d.itemID < shownPeers.size()) {
                 auto &p = shownPeers[d.itemID];
-                c.Box(1, 3, w - 2, h - 9, 12, selected ? 1 : background,
-                      keyboardFocus ? .45f
-                      : selected    ? .82f
-                                    : -1);
-                c.Box(13, 15, 34, 34, 8, .94f);
-                c.Icon(p.browser ? 12 : 1, 18, 19, .34f);
-                c.Text(p.name, 59, 10, w - 72, 24, normal, .18f);
+                c.BoxColor(1, 3, w - 2, h - 6, 7, selected ? AccentLight : SideSurface,
+                           keyboardFocus ? Accent : D2D1::ColorF(0, 0.f));
+                if (selected) c.BoxColor(1, 12, 3, h - 24, 1.5f, Accent);
+                c.Icon(p.browser ? 12 : 1, 18, 21, .29f, 1.3f);
+                const float badgeWidth=p.platform=="windows"?96.f:p.platform=="android"?86.f:76.f,badgeX=w-27-badgeWidth;
+                c.TextColor(p.name, 64, 11, std::max(22.f,badgeX-70), 27, strongFormat, TextInk);
+                c.BoxColor(badgeX,14,badgeWidth,23,4,D2D1::ColorF(0xE6EEF9),D2D1::ColorF(0xCCDBEE));
+                c.TextColor(PeerLabel(p),badgeX+3,14,badgeWidth-6,23,captionFormat,D2D1::ColorF(0x345474),DWRITE_TEXT_ALIGNMENT_CENTER);
                 auto note = engine.GetNote(p.ip);
-                c.Text(Wide(p.ip) + (note.empty() ? L"" : L" · " + note), 59, 33, w - 72, 21, captionFormat, .48f);
-                c.Circle(63, 65, 2.5f, .4f, true);
-                c.Text(p.browser ? L"在线 · 浏览器" : L"在线 · Windows", 72, 54, w - 85, 23, captionFormat,
-                       .48f);
+                c.TextColor(Wide(p.ip) + (note.empty() ? L"" : L" · " + note), 64, 37, w - 89, 23, captionFormat, TextMuted);
+                c.BoxColor(w - 24, h / 2 - 5, 10, 10, 5, Success);
             }
             return;
         }
         if (d.CtlID == Tasks) {
             if (shownJobs.empty()) {
-                c.Box(1, 1, w - 2, h - 2, 12, 1, .90f);
-                c.Icon(2, w / 2 - 12, 24, .62f);
-                c.Text(L"暂无传输任务", 12, 59, w - 24, 28, normal, .46f, DWRITE_TEXT_ALIGNMENT_CENTER);
+                c.BoxColor(1, 1, w - 2, h - 2, 7, D2D1::ColorF(0xFFFFFF), SoftBorder);
+                c.Icon(2, w / 2 - 12, 20, .55f);
+                c.TextColor(L"暂无传输任务", 12, 56, w - 24, 30, normal, TextMuted, DWRITE_TEXT_ALIGNMENT_CENTER);
             } else if (d.itemID < shownJobs.size()) {
                 auto &j = shownJobs[d.itemID];
+                const bool wide = width >= 1160;
+                const bool active = j.state < State::Completed;
+                const bool completed = j.state == State::Completed;
+                if (j.childRow) {
+                    const float indent=22.f+std::min(8u,j.depth)*18.f;
+                    c.BoxColor(1,0,w-2,h,0,D2D1::ColorF(0xF8FAFD));
+                    c.Line(indent-9,0,indent-9,h,.86f,1);
+                    c.Line(indent-9,h/2,indent-1,h/2,.86f,1);
+                    const bool open=j.directoryRow&&expandedFolders.contains(j.group+"|"+Utf8(j.treePath));
+                    if(j.directoryRow)c.TextColor(open?L"⌄":L"›",indent,0,16,h,normal,TextMuted);
+                    c.Icon(j.directoryRow?3:2,indent+19,j.directoryRow?11.f:13.f,.4f,.8f);
+                    const float nameX=indent+47,statusX=std::max(nameX+100,w-220),sizeX=std::max(nameX+40,statusX-110);
+                    c.TextColor(j.name,nameX,j.directoryRow?3.f:6.f,std::max(40.f,sizeX-nameX-10),25,captionFormat,TextInk);
+                    c.TextColor(FormatBytes(j.total),sizeX,j.directoryRow?3.f:6.f,96,25,captionFormat,TextMuted,DWRITE_TEXT_ALIGNMENT_TRAILING);
+                    const auto stateLabel=j.directoryRow?std::to_wstring(j.completedFiles)+L"/"+std::to_wstring(j.folderCount)+L" 个文件":TransferText(j);
+                    c.TextColor(stateLabel,statusX,j.directoryRow?3.f:6.f,w-statusX-14,25,captionFormat,j.state==State::Completed?Success:j.state==State::Failed?D2D1::ColorF(0xB4523B):TextMuted,DWRITE_TEXT_ALIGNMENT_TRAILING);
+                    if(!j.directoryRow){
+                        const double percent=j.total?100.0*j.done/j.total:j.state==State::Completed?100:0;
+                        if(j.state==State::Running){const float track=std::min(160.f,std::max(40.f,w-nameX-275));c.BoxColor(nameX,42,track,5,2.5f,D2D1::ColorF(0xDEE3EC));if(percent>0)c.BoxColor(nameX,42,track*static_cast<float>(std::min(100.0,percent))/100,5,2.5f,Accent);c.TextColor((j.done&&percent<.1?L"<0.1":std::to_wstring(static_cast<unsigned>(percent)))+std::wstring(L"% · ")+FormatBytes(static_cast<uint64_t>(j.speed))+L"/s",nameX+track+12,31,w-nameX-track-26,25,captionFormat,TextMuted);}
+                        else c.TextColor(j.error.empty()?FormatBytes(j.done)+L" / "+FormatBytes(j.total):j.error,nameX,31,w-nameX-14,25,captionFormat,j.state==State::Failed?D2D1::ColorF(0xB4523B):TextMuted);
+                    }
+                    return;
+                }
                 const float rowLeft = j.childRow ? 24.f : 1.f;
-                c.Box(rowLeft, 1, w - rowLeft - 1, h - 4, 8, selected ? .97f : 1.f, keyboardFocus ? .5f : .9f);
-                if (j.childRow) c.Line(18, 0, 18, h, .88f, 1);
-                const float actionX = w - 154;
-                const float indent = j.childRow ? 42.f : 0.f;
-
-                c.Icon(j.folderRow ? 3 : 2, 12 + indent, 15, .49f, .9f);
-                const float textX = 44 + indent;
-                auto title = j.name + (j.folderRow ? L"  ·  " + std::to_wstring(j.completedFiles) + L"/" + std::to_wstring(j.folderCount) + L" 个文件" : L"");
-                c.Text(title, textX, 5, actionX - textX - 12, 23, normal, .19f);
-                std::wstring detail = (j.receiving ? L"接收 · " : L"发送 · ") + j.peer + L" · " + FormatBytes(j.total) + L" · " + StateText(j.state, j.receiving);
-                if (j.folderRow) detail = (j.receiving ? L"接收 · " : L"发送 · ") + j.peer + L" · " + (j.state == State::Waiting ? L"等待接收或后续文件" : StateText(j.state, j.receiving)) + L" · " + FormatBytes(j.done) + L"/" + FormatBytes(j.total);
-                if (j.state < State::Completed) {
-                    detail += L" · " + std::to_wstring(j.total ? static_cast<unsigned>(100.0 * j.done / j.total) : j.completedFiles == j.folderCount && j.folderRow ? 100 : 0) + L"%";
-                    if (!j.folderRow && !j.childRow) detail += L" · " + FormatBytes(static_cast<uint64_t>(j.state == State::Running ? j.speed : 0)) + L"/s";
+                c.BoxColor(rowLeft, 1, w - rowLeft - 1, h - 2, 4,
+                           selected ? D2D1::ColorF(0xFAFCFF) : D2D1::ColorF(0xFFFFFF), keyboardFocus ? Accent : SoftBorder);
+                if (j.childRow) c.Line(18, 0, 18, h, .86f, 1);
+                const float actionX = w - 154, indent = j.childRow ? 24.f : 0.f;
+                const float titleX = wide ? 210.f + indent : 46.f + indent;
+                const float statusX = wide ? std::max(376.f, w * .47f) : titleX;
+                const float statusWidth = std::max(36.f, actionX - statusX - 18);
+                if (wide) {
+                    c.BoxColor(14 + indent, 23, 34, 34, 17, j.receiving ? D2D1::ColorF(0xE3F7EA) : D2D1::ColorF(0xE4EDFF));
+                    c.Icon(j.receiving ? 0 : 7, 19 + indent, 28, j.receiving ? .34f : .31f);
+                    c.TextColor(j.receiving ? L"接收" : L"发送", 61 + indent, 13, 126, 25, strongFormat, TextInk);
+                    c.TextColor((j.receiving ? L"来自 " : L"至 ") + j.peer, 61 + indent, 40, 104, 24, captionFormat, TextMuted);
                 }
-                if (!j.error.empty()) detail = j.error;
-                const bool grouped = j.folderRow || j.childRow;
-                c.Text(detail, textX, 28, actionX - textX - (grouped ? 94 : 12), 22, captionFormat, .48f);
-                if (grouped) c.Text(FormatBytes(static_cast<uint64_t>(j.state == State::Running ? j.speed : 0)) + L"/s", actionX - 90, 28, 78, 22, captionFormat, .48f, DWRITE_TEXT_ALIGNMENT_TRAILING);
-                if (j.state < State::Completed) {
+                c.Icon(j.folderRow ? 3 : 2, wide ? 172.f + indent : 14.f + indent, wide ? 24.f : 16.f, .36f, wide ? 1.25f : 1.f);
+                const float titleWidth = wide ? statusX - titleX - 15 : actionX - titleX - 14;
+                c.TextColor(j.name + (j.folderRow ? expandedFolders.contains(j.group)?L"  ⌄":L"  ›" : L""), titleX, wide ? 12.f : 7.f, titleWidth, 27, strongFormat, j.folderRow ? Accent : TextInk);
+                std::wstring metadata = j.folderRow ? std::to_wstring(j.completedFiles)+L"/"+std::to_wstring(j.folderCount)+L" 个文件 · "+FormatBytes(j.done)+L"/"+FormatBytes(j.total) : FormatBytes(j.total);
+                if (j.failedFiles) metadata += L" · "+std::to_wstring(j.failedFiles)+L" 个失败";
+                if (j.cancelledFiles) metadata += L" · "+std::to_wstring(j.cancelledFiles)+L" 个未完成";
+                if (j.folderRow && active) metadata += L" · "+FormatBytes(static_cast<uint64_t>(j.speed))+L"/s";
+                if (!wide) metadata = (j.receiving ? L"接收 · " : L"发送 · ") + j.peer + L" · " + metadata;
+                c.TextColor(metadata, titleX, wide ? 40.f : 34.f, j.folderRow&&wide?actionX-titleX-12:titleWidth, 25, captionFormat, TextMuted);
+                if (active) {
                     const float fraction = j.total ? static_cast<float>(std::min(1.0, static_cast<double>(j.done) / j.total)) : 0;
-                    c.Box(12, 52, std::max(1.f, actionX - 24), 2, 1, .9f);
-                    if (fraction > 0) c.Box(12, 52, (actionX - 24) * fraction, 2, 1, .4f);
+                    if (wide) {
+                        const float trackWidth = std::max(8.f, statusWidth - 48);
+                        c.BoxColor(statusX, 25, trackWidth, 10, 5, D2D1::ColorF(0xDEE3EC));
+                        if (fraction > 0) c.BoxColor(statusX, 25, trackWidth * fraction, 10, 5, Accent);
+                        c.TextColor(j.done && fraction*100<.1f ? L"<0.1%" : std::to_wstring(static_cast<unsigned>(fraction * 100)) + L"%", statusX + trackWidth + 6, 15, 48, 28, captionFormat, TextInk);
+                        if(!j.folderRow)c.TextColor(!j.activity.empty() ? j.activity : j.state == State::Running ? FormatBytes(static_cast<uint64_t>(j.speed)) + L"/s" : TransferText(j),
+                                    statusX, 42, statusWidth, 22, captionFormat, TextMuted);
+                    } else {
+                        const float trackWidth = std::max(8.f, actionX - titleX - 10);
+                        c.BoxColor(titleX, h - 12, trackWidth, 5, 2.5f, D2D1::ColorF(0xDEE3EC));
+                        if (fraction > 0) c.BoxColor(titleX, h - 12, trackWidth * fraction, 5, 2.5f, Accent);
+                    }
+                } else if (wide) {
+                    const auto label=j.folderRow?(j.state==State::Failed?L"部分失败":TransferText(j)):j.error.empty()?completed?(j.receiving?L"接收完成":L"发送完成"):TransferText(j):j.error;
+                    c.TextColor(label,statusX,j.folderRow?11.f:22.f,statusWidth,j.folderRow?27.f:34.f,normal,completed?Success:TextMuted);
                 }
-                c.Box(actionX, 15, 90, 28, 5, .98f, .85f);
-                c.Text(L"打开文件夹", actionX + 4, 17, 82, 24, captionFormat, j.savedPath.empty() ? .7f : .3f, DWRITE_TEXT_ALIGNMENT_CENTER);
-                c.Box(w - 58, 15, 50, 28, 5, .98f, .85f);
-                c.Text(j.state < State::Completed ? L"取消" : L"删除", w - 56, 17, 46, 24, captionFormat, .3f, DWRITE_TEXT_ALIGNMENT_CENTER);
+                if (!wide) c.TextColor(j.error.empty() ? TransferText(j) : j.error, titleX, 59,
+                                      titleWidth, 22, captionFormat, completed ? Success : TextMuted);
+                c.BoxColor(actionX, (h - 38) / 2, 92, 38, 5, D2D1::ColorF(0xF9FAFC), SoftBorder);
+                const bool retry = j.canRetry && !j.receiving && j.state >= State::Cancelled;
+                c.TextColor(retry ? L"重试" : L"打开文件夹", actionX + 3, (h - 38) / 2, 86, 38, captionFormat,
+                            !retry && j.savedPath.empty() ? D2D1::ColorF(0xA3AAB5) : Accent, DWRITE_TEXT_ALIGNMENT_CENTER);
+                c.BoxColor(w - 58, (h - 38) / 2, 50, 38, 5, D2D1::ColorF(0xF9FAFC), SoftBorder);
+                c.TextColor(active ? L"取消" : L"删除", w - 56, (h - 38) / 2, 46, 38, captionFormat, Accent, DWRITE_TEXT_ALIGNMENT_CENTER);
             }
             return;
         }
-        if (d.CtlID == Drop) {
-            c.Box(1, 1, w - 2, h - 2, 16,
-                  selected   ? .94f
-                  : hover    ? .985f
-                  : disabled ? .96f
-                             : 1.f,
-                  keyboardFocus ? .4f
-                  : hover       ? .68f
-                                : .82f);
-            c.Box(w / 2 - 23, 19, 46, 46, 12, .94f);
-            c.Icon(7, w / 2 - 12, 30, disabled ? .67f : .32f);
-            c.Text(L"拖入文件或文件夹", 20, 77, w - 40, 30, section, disabled ? .6f : .21f,
-                   DWRITE_TEXT_ALIGNMENT_CENTER);
-            c.Text(displayedPeer, 20, 111, w - 40, 25, normal, disabled ? .65f : .43f,
-                   DWRITE_TEXT_ALIGNMENT_CENTER);
-            c.Text(disabled ? L"" : L"点击选择文件或文件夹", 20, 146, w - 40, 23, captionFormat, .53f,
-                   DWRITE_TEXT_ALIGNMENT_CENTER);
+        if (d.CtlID == ToggleAuto) {
+            c.TextColor(L"自动接收", 0, 0, 86, h, normal, TextInk);
+            c.BoxColor(98, h / 2 - 11, 44, 22, 11, snapshot.config.autoReceive ? Accent : D2D1::ColorF(0xA6A9AF));
+            c.Circle(snapshot.config.autoReceive ? 131.f : 109.f, h / 2, 8.f, 1.f, true);
             return;
         }
-        wchar_t text[100]{};
-        GetWindowTextW(d.hwndItem, text, 100);
-        bool solid = d.CtlID == Accept || (GetParent(d.hwndItem) != window && d.CtlID == 9);
-        bool outlined = d.CtlID == Settings || d.CtlID == WebService || d.CtlID == CopyUrl ||
-                        GetParent(d.hwndItem) != window;
-        float fill = solid      ? (selected ? .12f
-                                   : hover  ? .25f
-                                            : .19f)
-                     : selected ? .89f
-                     : hover    ? .92f
-                     : outlined ? 1.f
-                                : background;
-        c.Box(1, 1, w - 2, h - 2, 8, fill, keyboardFocus ? .45f : outlined && !solid ? .86f : -1);
-        float ink = disabled ? .68f : solid ? 1.f : .26f;
-        int icon = d.CtlID == WebService    ? 8
-                   : d.CtlID == PingPeer    ? 9
-                   : d.CtlID == NotePeer    ? 10
-                   : d.CtlID == Settings    ? 4
-                   : d.CtlID == Refresh     ? 6
-                   : d.CtlID == ConnectPeer ? 5
-                   : d.CtlID == OpenFolder  ? 3
-                                            : -1;
-        if (icon >= 0) {
-            bool side = d.CtlID == ConnectPeer || d.CtlID == OpenFolder;
-            float x = d.CtlID == Refresh ? (w - 24) / 2 : side ? 12.f : 13.f;
-            c.Icon(icon, x, (h - 24) / 2, ink);
-            if (d.CtlID != Refresh)
-                c.Text(text, side ? 48.f : 42.f, 0, w - (side ? 55.f : 49.f), h, normal, ink);
-        } else
-            c.Text(text, 0, 0, w, h, captionFormat, ink, DWRITE_TEXT_ALIGNMENT_CENTER);
+        if (d.CtlID == AllTasks || d.CtlID == SentTasks || d.CtlID == ReceivedTasks) {
+            const bool active = taskFilter == static_cast<int>(d.CtlID) - AllTasks;
+            c.BoxColor(1, 1, w - 2, h - 2, 5, active ? Accent : D2D1::ColorF(0xF1F4F8));
+            wchar_t label[64]{}; GetWindowTextW(d.hwndItem, label, 64);
+            c.TextColor(label, 0, 0, w, h, captionFormat, active ? D2D1::ColorF(0xFFFFFF) : TextMuted, DWRITE_TEXT_ALIGNMENT_CENTER);
+            return;
+        }
+        if (d.CtlID == Drop) {
+            const bool compact = h < 200, shortWindow = h < 180;
+            c.DashedBoxColor(1, 1, w - 2, h - 2, 7,
+                             disabled ? D2D1::ColorF(0xFAFBFD) : hover ? D2D1::ColorF(0xF6F9FF) : D2D1::ColorF(0xFDFEFF),
+                             keyboardFocus ? Accent : D2D1::ColorF(0xC5D0E1));
+            if (!shortWindow) c.Icon(7, w / 2 - (compact ? 17.f : 22.f), compact ? 14.f : 23.f, disabled ? .65f : .34f, compact ? 1.4f : 1.8f);
+            c.TextColor(L"拖入文件或文件夹", 20, h < 120 ? 0.f : shortWindow ? 4.f : compact ? 51.f : 82.f, w - 40, h < 120 ? 28.f : 36.f,
+                        compact ? section : heroFormat, disabled ? TextMuted : TextInk, DWRITE_TEXT_ALIGNMENT_CENTER);
+            if (h >= 120) c.TextColor(displayedPeer, 20, shortWindow ? 40.f : compact ? 86.f : 120.f, w - 40, 27, normal, TextMuted, DWRITE_TEXT_ALIGNMENT_CENTER);
+            return;
+        }
+        if (d.CtlID == OpenFolder && GetParent(d.hwndItem) == window) {
+            c.BoxColor(0, 0, w, h, 0, D2D1::ColorF(0xF9FAFC));
+            c.BoxColor(1, 1, w - 2, h - 2, 5, selected ? AccentLight : hover ? D2D1::ColorF(0xEAF0FA) : D2D1::ColorF(0xF9FAFC),
+                       keyboardFocus ? Accent : D2D1::ColorF(0, 0.f));
+            c.Icon(3, 8, (h - 24) / 2, .35f);
+            c.TextColor(L"接收目录：" + snapshot.config.receiveDir.wstring(), 38, 0, w - 132, h, captionFormat, TextMuted);
+            c.TextColor(L"查看 / 修改", w - 88, 0, 82, h, captionFormat, Accent, DWRITE_TEXT_ALIGNMENT_CENTER);
+            return;
+        }
+        wchar_t text[100]{}; GetWindowTextW(d.hwndItem, text, 100);
+        const bool modal = GetParent(d.hwndItem) != window;
+        const bool side = d.CtlID == Refresh || d.CtlID == PingPeer || d.CtlID == NotePeer || d.CtlID == ConnectPeer;
+        if (side && !modal) c.BoxColor(0, 0, w, h, 0, SideSurface);
+        const bool solid = d.CtlID == Accept || d.CtlID == SelectFiles || (modal && d.CtlID == 9);
+        const bool quiet = d.CtlID == Refresh || d.CtlID == ConnectPeer || d.CtlID == Clear;
+        D2D1_COLOR_F fill = disabled && solid ? D2D1::ColorF(0xE5EBF6) : solid ? (selected ? D2D1::ColorF(0x144CC8) : hover ? D2D1::ColorF(0x1556E0) : Accent)
+                           : hover ? D2D1::ColorF(0xEAF0FA) : quiet ? side ? SideSurface : D2D1::ColorF(0xFFFFFF) : D2D1::ColorF(0xF9FAFC);
+        c.BoxColor(1, 1, w - 2, h - 2, 5, fill, keyboardFocus ? Accent : quiet ? D2D1::ColorF(0, 0.f) : d.CtlID == SelectFolder ? Accent : SoftBorder);
+        const auto color = disabled ? D2D1::ColorF(0x9AA3B3) : solid ? D2D1::ColorF(0xFFFFFF) : d.CtlID == SelectFolder ? Accent : TextInk;
+        const float iconGray = disabled ? .64f : solid ? 1.f : .31f;
+        if (d.CtlID==SelectFiles || d.CtlID==SelectFolder) {
+            c.Icon(d.CtlID==SelectFiles?2:3,11,(h-22)/2,iconGray,.9f);
+            c.TextColor(text,35,0,w-40,h,normal,color,DWRITE_TEXT_ALIGNMENT_CENTER);return;
+        }
+        const int glyph = d.CtlID == WebService ? 8 : d.CtlID == PingPeer ? 9 : d.CtlID == NotePeer ? 10 : d.CtlID == Settings ? 4
+                        : d.CtlID == Refresh ? 6 : d.CtlID == ConnectPeer ? 5 : d.CtlID == Clear ? 11 : -1;
+        if (glyph >= 0) {
+            const bool navigation = d.CtlID == ConnectPeer;
+            const float x = d.CtlID == Refresh ? (w - 24) / 2 : navigation ? 8.f : 11.f;
+            c.Icon(glyph, x, (h - 24) / 2, iconGray);
+            const float labelX = navigation ? 46.f : d.CtlID == NotePeer ? 38.f : 42.f;
+            if (d.CtlID != Refresh) c.TextColor(text, labelX, 0, w - labelX - 4, h, normal, color);
+        } else c.TextColor(text, 0, 0, w, h, normal, color, DWRITE_TEXT_ALIGNMENT_CENTER);
     }
+
     void SendPaths(const std::vector<fs::path> &files) {
         auto it = std::find_if(shownPeers.begin(), shownPeers.end(), [&](auto &p) { return p.id == peerId; });
         if (it == shownPeers.end()) {
@@ -655,16 +871,18 @@ struct App {
         localNotice = L"";
         Update();
     }
-    void ChooseFiles() {
+    void ChooseFiles(UINT selection = 0) {
         if (!dropEnabled)
             return;
+        if (!selection) {
         HMENU menu = CreatePopupMenu();
         AppendMenuW(menu, MF_STRING, 1, L"选择文件…");
         AppendMenuW(menu, MF_STRING, 2, L"选择文件夹…");
         RECT bounds{}; GetWindowRect(drop, &bounds);
-        UINT selection = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_CENTERALIGN,
+        selection = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_CENTERALIGN,
             (bounds.left + bounds.right) / 2, bounds.top + Px(140), 0, window, nullptr);
         DestroyMenu(menu);
+        }
         if (!selection) return;
         IFileOpenDialog *picker = nullptr;
         if (FAILED(
@@ -753,15 +971,40 @@ struct App {
     void SettingsDialog();
     void ConnectDialog();
     void WebDialog();
+    void ReceiveDirectoryDialog();
     void NoteDialog();
     void PartialDialog();
-    bool ToggleTask(WPARAM = VK_SPACE) { return false; }
+    int TaskHeight(size_t index) const {
+        return Px(index<shownJobs.size() ? shownJobs[index].childRow ? shownJobs[index].directoryRow ? 42.f : 66.f : static_cast<float>(taskRowHeight) : height<720?100.f:124.f);
+    }
+    void TaskHeights(){for(size_t i=0;i<std::max<size_t>(1,shownJobs.size());++i)SendMessageW(tasks,LB_SETITEMHEIGHT,i,TaskHeight(i));}
+    bool ToggleTask(WPARAM key = VK_SPACE) {
+        const auto found=std::find_if(shownJobs.begin(),shownJobs.end(),[&](const auto &row){return row.id==selectedTask;});
+        if (found==shownJobs.end() || (!found->folderRow&&!found->directoryRow)) return false;
+        const auto keyValue=found->group+(found->directoryRow?"|"+Utf8(found->treePath):"");
+        const bool open=expandedFolders.contains(keyValue);
+        if(key==VK_LEFT&&!open||key==VK_RIGHT&&open)return true;
+        if(open)expandedFolders.erase(keyValue);else expandedFolders.insert(keyValue);
+        Update();return true;
+    }
     void CancelTask() {
         auto found = std::find_if(shownJobs.begin(), shownJobs.end(), [&](auto &j) { return j.id == selectedTask; });
         if (found == shownJobs.end()) return;
-        if (found->folderRow) { for (auto id : found->members) engine.Cancel(id); }
+        if (found->folderRow && !found->members.empty()) engine.Cancel(found->members.front());
         else engine.Cancel(selectedTask);
         Update();
+    }
+    void OpenOrRetryTask() {
+        auto found = std::find_if(shownJobs.begin(), shownJobs.end(), [&](auto &j) { return j.id == selectedTask; });
+        if (found != shownJobs.end() && found->canRetry && !found->receiving && found->state >= State::Cancelled) {
+            std::wstring error;
+            auto id = found->id;
+            if (found->folderRow) for (const auto &job : snapshot.transfers)
+                if (job.state >= State::Cancelled && std::find(found->members.begin(), found->members.end(), job.id) != found->members.end()) { id = job.id; break; }
+            localNotice = engine.RetryTransfer(id, error) ? L"已重新发起发送，等待接收方确认" : error;
+            Update(); return;
+        }
+        OpenTaskFile();
     }
     void OpenTaskFile() {
         auto found =
@@ -812,7 +1055,26 @@ struct App {
             return;
         switch (id) {
         case Drop:
-            ChooseFiles();
+            ChooseFiles(1);
+            break;
+        case SelectFiles:
+            ChooseFiles(1);
+            break;
+        case SelectFolder:
+            ChooseFiles(2);
+            break;
+        case ToggleAuto: {
+            auto config = snapshot.config; config.autoReceive = !config.autoReceive;
+            std::wstring error;
+            if (!engine.UpdateConfig(config, error)) localNotice = error;
+            else localNotice = config.autoReceive ? L"自动接收已开启" : L"自动接收已关闭";
+            Update();
+            break;
+        }
+        case AllTasks: case SentTasks: case ReceivedTasks:
+            taskFilter = id - AllTasks;
+            InvalidateRect(allButton, nullptr, FALSE); InvalidateRect(sentButton, nullptr, FALSE); InvalidateRect(receivedButton, nullptr, FALSE);
+            Update();
             break;
         case Settings:
             SettingsDialog();
@@ -834,9 +1096,17 @@ struct App {
         case WebService:
             WebDialog();
             break;
+        case CopyUrl:
+            if (snapshot.config.shareSoftware) CopyAddress(webAddress);
+            break;
+        case OpenUrl:
+            if (snapshot.config.shareSoftware) {
+                wchar_t address[256]{}; GetWindowTextW(webAddress, address, 256);
+                ShellExecuteW(window, L"open", address, nullptr, nullptr, SW_SHOWNORMAL);
+            }
+            break;
         case OpenFolder:
-            ShellExecuteW(window, L"open", snapshot.config.receiveDir.c_str(), nullptr, nullptr,
-                          SW_SHOWNORMAL);
+            ReceiveDirectoryDialog();
             break;
         case Cancel:
             CancelTask();
@@ -848,15 +1118,15 @@ struct App {
         case Delete:
             DeleteTask();
             break;
-        case Partial:
-            PartialDialog();
+        case SelectAllRequests:
+            approvals.ToggleAll();RefreshPending();
             break;
         case Accept:
-            engine.Decide(pending, true);
+            for(const auto &[requestId,mask]:approvals.Decisions(pendingJobs,true))engine.DecideItems(requestId,mask);
             Update();
             break;
         case Reject:
-            engine.Decide(pending, false);
+            for(const auto &[requestId,mask]:approvals.Decisions(pendingJobs,false))engine.DecideItems(requestId,mask);
             Update();
             break;
         default:
@@ -869,7 +1139,7 @@ struct Modal {
     App &app;
     HWND window = nullptr, name = nullptr, path = nullptr, autoReceive = nullptr, share = nullptr,
          port = nullptr, help = nullptr, maxFiles = nullptr, maxBytes = nullptr, itemList = nullptr;
-    bool settings = false, done = false, web = false, note = false, approval = false;
+    bool settings = false, done = false, web = false, note = false, approval = false, directory = false;
     uint64_t approvalId = 0;
     std::vector<OfferItem> approvalItems;
     std::string noteIp;
@@ -888,7 +1158,7 @@ struct Modal {
             0, cls, text, WS_CHILD | WS_VISIBLE | style, app.Px(static_cast<float>(x)),
             app.Px(static_cast<float>(y)), app.Px(static_cast<float>(w)), app.Px(static_cast<float>(h)),
             window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), GetModuleHandleW(nullptr), nullptr);
-        SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(app.font), TRUE);
+        SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(wcscmp(cls, L"STATIC") == 0 ? app.smallFont : app.font), TRUE);
         SetWindowTheme(c, L"Explorer", nullptr);
         if (wcscmp(cls, L"BUTTON") == 0 && (style & BS_TYPEMASK) != BS_AUTOCHECKBOX) {
             SetWindowLongPtrW(c, GWL_STYLE, (GetWindowLongPtrW(c, GWL_STYLE) & ~BS_TYPEMASK) | BS_OWNERDRAW);
@@ -905,11 +1175,11 @@ struct Modal {
             for (auto &r : editFrames)
                 c.Box(r.left, r.top, r.right - r.left, r.bottom - r.top, 7, 1, .84f);
             c.Line(24,
-                   web        ? 184.f
+                   web || directory ? 184.f
                    : settings ? 444.f : approval ? 420.f
                               : 152.f,
                    w - 24,
-                   web        ? 184.f
+                   web || directory ? 184.f
                    : settings ? 444.f : approval ? 420.f
                               : 152.f,
                    .9f, 1);
@@ -926,7 +1196,7 @@ struct Modal {
     void Create() {
         auto &cfg = app.snapshot.config;
         if (approval) {
-            Control(L"STATIC", L"选择要接收的项目；文件夹始终作为一个整体。", 0, 24, 20, 560, 28, 0);
+            Control(L"STATIC", L"选择要接收的项目", 0, 24, 20, 560, 28, 0);
             itemList = Control(WC_LISTVIEWW, L"", WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS, 24, 60, 560, 340, 20);
             ListView_SetExtendedListViewStyle(itemList, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
             LVCOLUMNW column{}; column.mask = LVCF_TEXT | LVCF_WIDTH;
@@ -952,6 +1222,15 @@ struct Modal {
             help = Control(L"STATIC", L"仅本客户端可见；结束本轮会话后清空。", 0, 24, 102, 420, 44, 0);
             Control(L"BUTTON", L"取消", WS_TABSTOP | BS_PUSHBUTTON, 268, 165, 81, 33, 8);
             Control(L"BUTTON", L"保存", WS_TABSTOP | BS_DEFPUSHBUTTON, 360, 165, 84, 33, 9);
+        } else if (directory) {
+            Control(L"STATIC", L"接收目录", 0, 24, 20, 542, 24, 0);
+            path = Control(L"EDIT", cfg.receiveDir.c_str(), WS_TABSTOP | ES_AUTOHSCROLL, 24, 53, 438, 34, 1);
+            Control(L"BUTTON", L"选择目录", WS_TABSTOP, 474, 53, 92, 34, 3);
+            help = Control(L"STATIC", L"可查看目录中的文件，或修改路径后保存。", SS_LEFT, 24, 106, 542, 58, 0);
+            Control(L"BUTTON", L"查看目录", WS_TABSTOP, 24, 200, 106, 34, 12);
+            Control(L"BUTTON", L"取消", WS_TABSTOP, 378, 200, 88, 34, 8);
+            Control(L"BUTTON", L"保存", WS_TABSTOP, 478, 200, 88, 34, 9);
+            name = path;
         } else if (web) {
             Control(L"STATIC", L"服务地址", 0, 24, 20, 200, 24, 0);
             name = Control(L"COMBOBOX", L"", WS_TABSTOP | CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_VSCROLL, 24,
@@ -965,7 +1244,7 @@ struct Modal {
                 SendMessageW(name, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(address.c_str()));
             }
             SendMessageW(name, CB_SETCURSEL, 0, 0);
-            Control(L"STATIC", L"提供局域网内连接设备软件下载和在线web服务。", SS_LEFT, 24, 103, 542, 36, 0);
+            Control(L"STATIC", L"提供局域网文件传输、Web 服务与 Windows、Android 客户端下载。", SS_LEFT, 24, 103, 542, 36, 0);
             help = Control(L"STATIC", cfg.shareSoftware ? L"服务已开启" : L"服务已关闭，可在设置中开启",
                            SS_LEFT, 24, 145, 542, 24, 0);
             Control(L"BUTTON", L"关闭", WS_TABSTOP | BS_PUSHBUTTON, 24, 200, 76, 34, 8);
@@ -1014,6 +1293,12 @@ struct Modal {
         DWORD flags;
         picker->GetOptions(&flags);
         picker->SetOptions(flags | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+        picker->SetTitle(L"选择接收目录");
+        IShellItem *current = nullptr;
+        if (SUCCEEDED(SHCreateItemFromParsingName(Value(path).c_str(), nullptr, IID_PPV_ARGS(&current)))) {
+            picker->SetFolder(current);
+            current->Release();
+        }
         if (SUCCEEDED(picker->Show(window))) {
             IShellItem *item = nullptr;
             PWSTR value = nullptr;
@@ -1026,6 +1311,16 @@ struct Modal {
             }
         }
         picker->Release();
+    }
+    void OpenDirectory() {
+        auto selected = fs::path(Value(path));
+        std::error_code error;
+        if (!selected.is_absolute() || !fs::is_directory(selected, error)) {
+            SetWindowTextW(help, L"目录不存在或不可访问，请选择已有目录，或先保存新路径。");
+            return;
+        }
+        if (reinterpret_cast<INT_PTR>(ShellExecuteW(window, L"open", selected.c_str(), nullptr, nullptr, SW_SHOWNORMAL)) <= 32)
+            SetWindowTextW(help, L"无法打开目录，请检查目录是否可访问。");
     }
     void OpenWeb() {
         if (app.snapshot.config.shareSoftware) {
@@ -1048,7 +1343,16 @@ struct Modal {
             return;
         }
         std::wstring error;
-        if (settings) {
+        if (directory) {
+            Config cfg = app.engine.GetSnapshot().config;
+            cfg.receiveDir = Value(path);
+            if (!app.engine.UpdateConfig(cfg, error)) {
+                SetWindowTextW(help, error.c_str());
+                return;
+            }
+            app.localNotice = L"接收目录已保存";
+            done = true;
+        } else if (settings) {
             Config cfg = app.snapshot.config;
             cfg.name = Value(name);
             cfg.receiveDir = Value(path);
@@ -1104,6 +1408,8 @@ struct Modal {
             self->Paint();
             return 0;
         case WM_COMMAND:
+            if (self->directory && LOWORD(w) == 12 && HIWORD(w) == BN_CLICKED)
+                self->OpenDirectory();
             if (self->web && HIWORD(w) == BN_CLICKED) {
                 if (LOWORD(w) == 10)
                     self->app.CopyAddress(self->name);
@@ -1141,14 +1447,15 @@ struct Modal {
         cls.hCursor = LoadCursorW(nullptr, IDC_ARROW);
         cls.hbrBackground = app.white;
         RegisterClassW(&cls);
-        int h = web ? 254 : settings ? 522 : approval ? 496 : 232;
-        RECT r{0, 0, app.Px(approval ? 608.f : web ? 590.f : 470.f), app.Px(static_cast<float>(h))};
+        int h = web || directory ? 254 : settings ? 522 : approval ? 496 : 232;
+        RECT r{0, 0, app.Px(approval ? 608.f : web || directory ? 590.f : 470.f), app.Px(static_cast<float>(h))};
         AdjustWindowRectExForDpi(&r, WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN, FALSE, WS_EX_DLGMODALFRAME,
                                  GetDpiForWindow(app.window));
         RECT owner{};
         GetWindowRect(app.window, &owner);
         window = CreateWindowExW(WS_EX_DLGMODALFRAME, L"ChuanModal",
-                                 web        ? L"Web服务"
+                                 directory  ? L"接收目录"
+                                 : web      ? L"Web 服务"
                                  : settings ? L"设置"
                                  : approval ? L"接受部分文件" : note ? L"IP 临时备注" : L"手动连接",
                                  WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN,
@@ -1169,7 +1476,10 @@ struct Modal {
                 break;
             }
             if (message.message == WM_KEYDOWN && message.wParam == VK_RETURN) {
-                Save();
+                const auto focusedId = GetDlgCtrlID(GetFocus());
+                if (directory && (focusedId == 3 || focusedId == 8 || focusedId == 12))
+                    SendMessageW(window, WM_COMMAND, MAKEWPARAM(focusedId, BN_CLICKED), reinterpret_cast<LPARAM>(GetFocus()));
+                else Save();
                 continue;
             }
             if (!IsDialogMessageW(window, &message)) {
@@ -1193,6 +1503,9 @@ void App::NoteDialog() {
 }
 void App::WebDialog() {
     Modal(*this, false, true).Run();
+}
+void App::ReceiveDirectoryDialog() {
+    Modal dialog(*this, false); dialog.directory = true; dialog.Run();
 }
 void App::SettingsDialog() {
     Modal(*this, true).Run();
@@ -1254,10 +1567,12 @@ LRESULT CALLBACK WindowProc(HWND h, UINT message, WPARAM w, LPARAM l) {
         app->DrawItem(*reinterpret_cast<DRAWITEMSTRUCT *>(l));
         return TRUE;
     case WM_MEASUREITEM:
-        reinterpret_cast<MEASUREITEMSTRUCT *>(l)->itemHeight = app->Px(80);
+        { auto *measure=reinterpret_cast<MEASUREITEMSTRUCT *>(l);measure->itemHeight=measure->CtlID==Tasks?app->TaskHeight(measure->itemID):app->Px(80); }
         return TRUE;
     case WM_CTLCOLORSTATIC: {
         if (reinterpret_cast<HWND>(l) == app->flash) { SetBkColor(reinterpret_cast<HDC>(w), RGB(210,210,210)); return reinterpret_cast<LRESULT>(app->pingBrush); }
+        if (reinterpret_cast<HWND>(l) == app->request) { SetTextColor(reinterpret_cast<HDC>(w), Muted); SetBkColor(reinterpret_cast<HDC>(w), RGB(255,248,233)); return reinterpret_cast<LRESULT>(app->pendingBrush); }
+        if (reinterpret_cast<HWND>(l) == app->webAddress) { SetTextColor(reinterpret_cast<HDC>(w), Muted); SetBkColor(reinterpret_cast<HDC>(w), RGB(249,250,252)); return reinterpret_cast<LRESULT>(app->footerBrush); }
         SetTextColor(reinterpret_cast<HDC>(w), Muted);
         SetBkColor(reinterpret_cast<HDC>(w),
                    reinterpret_cast<HWND>(l) == app->status ? RGB(249, 249, 249) : RGB(255, 255, 255));
@@ -1265,6 +1580,7 @@ LRESULT CALLBACK WindowProc(HWND h, UINT message, WPARAM w, LPARAM l) {
                                                                                   : app->white);
     }
     case WM_CTLCOLORLISTBOX: {
+        if (reinterpret_cast<HWND>(l) == app->requestList) return reinterpret_cast<LRESULT>(app->pendingBrush);
         return reinterpret_cast<LRESULT>(reinterpret_cast<HWND>(l) == app->devices ? app->gray
                                                                                    : app->surface);
     }
@@ -1410,7 +1726,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int show) {
         CoUninitialize();
         return code;
     }
-    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_STANDARD_CLASSES | ICC_LISTVIEW_CLASSES};
+    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_STANDARD_CLASSES | ICC_LISTVIEW_CLASSES | ICC_TREEVIEW_CLASSES};
     InitCommonControlsEx(&controls);
     App app(engine);
     WNDCLASSEXW cls{sizeof(cls)};
@@ -1427,7 +1743,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int show) {
     cls.hbrBackground = app.white;
     RegisterClassExW(&cls);
     UINT dpi = GetDpiForSystem();
-    RECT r{0, 0, MulDiv(1040, dpi, 96), MulDiv(700, dpi, 96)};
+    RECT workArea{}; SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
+    const int availableWidth = MulDiv(workArea.right - workArea.left, 96, dpi), availableHeight = MulDiv(workArea.bottom - workArea.top, 96, dpi);
+    RECT r{0, 0, MulDiv(std::clamp(availableWidth - 40, 920, 1280), dpi, 96), MulDiv(std::clamp(availableHeight - 80, 660, 800), dpi, 96)};
     AdjustWindowRectExForDpi(&r, WS_OVERLAPPEDWINDOW, FALSE, 0, dpi);
     HWND window = CreateWindowExW(0, cls.lpszClassName, L"传 · 局域网文件传输",
                                   WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
