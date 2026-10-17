@@ -131,6 +131,12 @@ int wmain(int argc, wchar_t **argv) {
         code = 14;
     cfg.shareSoftware = true;
     engine.UpdateConfig(cfg, error);
+    app.Update();
+    const bool autoBefore = app.snapshot.config.autoReceive;
+    app.Command(ToggleAuto, BN_CLICKED);
+    if (app.snapshot.config.autoReceive == autoBefore || LoadConfig(cfg.dataDir).autoReceive != app.snapshot.config.autoReceive) code = 26;
+    app.Command(ToggleAuto, BN_CLICKED);
+    if (app.snapshot.config.autoReceive != autoBefore) code = 27;
     if (!PingWindow(cfg.port, engine.GetSnapshot().config.id)) code = 15;
     app.Update();
     if (!app.flash || !IsWindowVisible(app.flash) || GetParent(app.flash) != window) code = 16;
@@ -158,12 +164,18 @@ int wmain(int argc, wchar_t **argv) {
     if (app.shownJobs.size()!=1 || !app.shownJobs[0].folderRow) code=22;
     else {
         app.selectedTask=app.shownJobs[0].id; app.ToggleTask(VK_RIGHT);
-        if (app.shownJobs.size()!=1 || SendMessageW(app.tasks,LB_GETCOUNT,0,0)!=1) code=23;
+        if (app.shownJobs.size()!=3 || SendMessageW(app.tasks,LB_GETCOUNT,0,0)!=3) code=23;
         app.Update();
-        if (app.shownJobs.size()!=1) code=24;
+        if (app.shownJobs.size()!=3) code=24;
         app.ToggleTask(VK_LEFT);
         if (app.shownJobs.size()!=1) code=25;
     }
+    app.Command(SentTasks, BN_CLICKED);
+    if (app.taskFilter != 1 || app.shownJobs.empty() || app.shownJobs[0].receiving) code = 28;
+    app.Command(ReceivedTasks, BN_CLICKED);
+    if (app.taskFilter != 2 || !app.shownJobs.empty()) code = 29;
+    app.Command(AllTasks, BN_CLICKED);
+    if (app.taskFilter != 0 || app.shownJobs.empty()) code = 30;
     if (argc == 1 || (argc == 3 && (std::wstring(argv[2]) == L"--preview" || std::wstring(argv[2]) == L"--preview-mask"))) {
         std::cout << "PREVIEW port " << cfg.port << std::endl;
         app.ToggleTask(VK_RIGHT);

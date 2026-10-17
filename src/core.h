@@ -17,7 +17,9 @@
 #include <ws2tcpip.h>
 
 namespace chuan {
-inline constexpr wchar_t Version[] = L"1.0.0";
+namespace diagnostic { class Log; }
+namespace archive { struct Artifact; }
+inline constexpr wchar_t Version[] = L"2.0";
 inline constexpr unsigned short DefaultPort = 45871;
 inline constexpr unsigned short DefaultDiscoveryPort = 45872;
 namespace fs = std::filesystem;
@@ -29,6 +31,7 @@ std::wstring FormatBytes(uint64_t value);
 std::wstring SanitizeRelative(const std::wstring &value);
 bool ValidPort(const std::wstring &value, unsigned short &result);
 fs::path ExePath();
+fs::path AndroidPackagePath();
 
 struct Config {
     std::wstring name;
@@ -36,6 +39,7 @@ struct Config {
     fs::path receiveDir;
     fs::path dataDir;
     fs::path fallbackDataDir; // Used only when the default user storage is unavailable.
+    bool automaticStorageFallback = false;
     unsigned short port = DefaultPort;
     unsigned short discoveryPort = DefaultDiscoveryPort;
     bool autoReceive = true;
@@ -55,7 +59,11 @@ struct Peer {
     std::string gateway;
     std::wstring owner;
     bool reachable = true;
+    std::string platform;
 };
+inline std::wstring PeerLabel(const Peer &peer){if(peer.browser)return peer.platform=="mobile-web"?L"手机 Web":peer.platform=="desktop-web"?L"电脑 Web":L"Web";return peer.platform=="windows"?L"Win 客户端":peer.platform=="android"?L"Android 端":L"客户端";}
+inline constexpr uint64_t BrowserPresenceGrace = 5ull * 60 * 1000;
+inline bool PeerSeenRecently(const Peer &peer,uint64_t now){return now-peer.seen<(peer.browser&&peer.owner.empty()?BrowserPresenceGrace:6000);}
 enum class State { Queued, Waiting, Running, Completed, Cancelled, Failed, Rejected };
 std::wstring StateText(State state, bool receiving);
 struct OfferItem {
@@ -65,13 +73,15 @@ struct OfferItem {
 };
 struct Transfer {
     uint64_t id = 0, total = 0, done = 0;
-    std::wstring name, peer, error;
+    std::wstring name, peer, error, activity;
     fs::path savedPath;
     bool receiving = false;
     bool awaitingApproval = false;
     bool removed = false;
     bool requestOnly = false;
+    bool canRetry = false;
     std::vector<OfferItem> offerItems;
+    std::string offerSelection;
     std::wstring folderName;
     std::string folderId;
     uint64_t folderCount = 0, folderTotal = 0;
@@ -79,6 +89,7 @@ struct Transfer {
     double speed = 0;
     uint64_t started = 0;
 };
+inline std::wstring TransferText(const Transfer &job){return job.state<State::Completed&&!job.activity.empty()?job.activity:StateText(job.state,job.receiving);}
 struct Snapshot {
     Config config;
     unsigned short boundPort = 0;
@@ -111,6 +122,7 @@ class Engine {
     void Refresh();
     bool AddPeer(const std::string &address, std::wstring &error);
     void SendFiles(const Peer &peer, const std::vector<fs::path> &files);
+    bool RetryTransfer(uint64_t id, std::wstring &error);
     void Cancel(uint64_t id);
     void Decide(uint64_t id, bool accept);
     void DecideItems(uint64_t id, const std::string &selection);
@@ -129,15 +141,22 @@ class Engine {
         std::atomic<bool> cancel{false};
         int decision = 0;
         std::condition_variable cv;
-        std::string webClient, webUpload;
+        std::string webClient, webUpload, webTab;
+        bool browserPaused=false;
+        std::wstring resumeActivity;
+        std::string nativeOwner;
+        fs::path archiveSource;
+        std::shared_ptr<archive::Artifact> archiveFile;
         std::string folderId, folderKey;
-        std::string batchId, selection;
+        std::string batchId, selection, asyncOfferKey;
         size_t batchItem = 0;
         std::string recipient;
         BY_HANDLE_FILE_INFORMATION fileIdentity{};
         bool hasIdentity = false;
         bool staging = false;
         bool hidden = false;
+        bool diagnosticReported = false;
+        bool announced = false;
         uint64_t finishedAt = 0;
         std::wstring targetId;
         std::wstring senderName;
@@ -165,6 +184,7 @@ class Engine {
         unsigned priority;
     };
     Config config_;
+    std::unique_ptr<diagnostic::Log> diagnostic_;
     unsigned short boundPort_ = 0;
     std::wstring notice_;
     std::mutex mutex_, workersMutex_, socketsMutex_;
@@ -184,16 +204,28 @@ class Engine {
         std::vector<uint64_t> counts, bytes;
         std::set<std::pair<size_t, std::wstring>> paths;
         uint64_t touched = 0;
+        bool announced = false;
+        std::set<size_t> cancelledItems;
+        std::set<size_t> announcedItems;
     };
     std::map<std::string, BatchApproval> batchApprovals_;
     void ReceiveOffer(SOCKET socket, const std::map<std::string, std::string> &headers, const std::string &ip, bool browser);
+    void CompleteOfferLocked(const std::shared_ptr<Job> &job, const std::string &selection);
+    void ReceiveOfferStatus(SOCKET socket, const std::map<std::string, std::string> &headers, const std::string &ip, bool browser, bool cancel);
+    void ReceiveBatchFiles(SOCKET socket, const std::map<std::string, std::string> &headers, const std::string &ip, bool status, bool browser=true);
+    int BatchCommand(const Peer &peer,const std::string &path,const std::string &batch,const std::string &body,std::string &response,const std::shared_ptr<Job> &job);
     bool SendOffer(const Peer &peer, const std::string &batch, const std::vector<OfferItem> &items,
-                   std::string &selection, std::wstring &error, const std::shared_ptr<Job> &control = {});
+                   std::string &selection, std::wstring &error, const std::shared_ptr<Job> &control = {},
+                   SOCKET waitingSocket = INVALID_SOCKET,
+                   const std::function<void(const std::string &)> &progress = {},
+                   const std::function<std::string()> &cancelled = {});
     std::string webToken_;
     struct BrowserSession {
         std::wstring id, name;
+        std::string platform;
         std::string token, ip;
         std::map<std::string, uint64_t> tabs;
+        std::set<std::string> openTabs;
         uint64_t ping = 0, ack = 0, pingAt = 0;
         uint64_t maxFiles = 0, maxBytes = 0;
         std::map<std::string, std::wstring> notes;

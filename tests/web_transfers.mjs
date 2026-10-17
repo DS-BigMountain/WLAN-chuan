@@ -1,7 +1,7 @@
 import {readFileSync} from 'node:fs';
 import assert from 'node:assert/strict';
 const source=readFileSync(new URL('../src/web/transfers.js',import.meta.url));
-const {transferGroups,pingEffect,timedNotice}=await import(`data:text/javascript;base64,${source.toString('base64')}`);
+const {transferGroups,pingEffect,timedNotice,folderProgress,transferTree}=await import(`data:text/javascript;base64,${source.toString('base64')}`);
 const base={folderId:'batch-one',folderName:'资料',folderCount:2,folderTotal:100,peer:'A1',receiving:false};
 const complete={...base,id:1,name:'资料/a',total:40,done:40,speed:999,state:3};
 const running={...base,id:2,name:'资料/b',total:60,done:20,speed:12,state:2};
@@ -15,6 +15,14 @@ assert.equal(transferGroups([{...complete,removed:true}]).length,0);
 assert.equal(transferGroups([complete,{...running,state:5}])[0].state,5);
 assert.equal(transferGroups([complete,{...complete,folderId:'second'},{...complete,receiving:true},{...complete,peer:'A2'},{...complete,folderId:''}]).length,5,'same names do not combine distinct batches, directions or peers');
 assert.equal(transferGroups([{...complete,folderCount:1,folderTotal:0,total:0,done:0}])[0].percent,100,'completed empty file batch');
+const pending={...running,state:1,done:0,speed:0,awaitingApproval:true};
+assert.equal(transferGroups([pending,{...pending,id:3}])[0].stateText,'等待对方确认','folder aggregation preserves pending consent');
+assert(transferGroups([pending])[0].awaitingApproval);
+assert(!transferGroups([pending,{...running,id:3}])[0].awaitingApproval,'an active transfer is not pending consent');
+assert(!transferGroups([{...pending,awaitingApproval:false,stage:'staging'}])[0].awaitingApproval,'staged relay payload is not a fresh consent request');
+const ht=[{...complete,folderName:'HT',name:'HT/资料/a.txt',folderCount:1490,folderTotal:19685133076,total:2048,done:2048},{...running,folderName:'HT',name:'HT/资料/b.txt',folderCount:1490,folderTotal:19685133076,state:5,total:100,done:0,error:'读取失败'},{...pending,folderName:'HT',name:'HT/其他/c.bin',folderCount:1490,folderTotal:19685133076,state:4,total:19685130928,done:0}];
+const partial=transferGroups(ht)[0];assert.equal(partial.state,5);assert.equal(partial.completed,1);assert.equal(partial.failed,1);assert.equal(partial.done,2048);assert(folderProgress(partial,n=>String(n)).includes('<0.1%'));assert(partial.error.includes('b.txt'));
+const tree=transferTree(ht,'HT');assert.equal(tree.name,'HT');assert.equal(tree.children.length,2);assert.equal(tree.total,19685133076);assert.equal(tree.children.find(node=>node.name==='资料').children.find(node=>node.name==='b.txt').item.error,'读取失败');
 let now=0,next=0;const timers=new Map();
 const clock={Date:{now:()=>now},setTimeout(fn,ms){timers.set(++next,{fn,at:now+ms});return next;},clearTimeout(id){timers.delete(id);}};
 function advance(ms){now+=ms;for(const [id,t] of [...timers])if(t.at<=now){timers.delete(id);t.fn();}}
