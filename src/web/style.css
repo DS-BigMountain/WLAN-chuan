@@ -174,3 +174,7 @@ body{min-height:100vh;min-height:100dvh;display:flex;flex-direction:column}
   .file-actions{flex-wrap:wrap}.file-actions button{flex:1 1 130px}
   footer{justify-content:space-between;gap:8px}footer #version{display:inline}
 }
+
+.jobs .lifecycle-active{border-left:4px solid #3169c6;background:#f4f8ff}.jobs .lifecycle-ended{border-left:4px solid #c7cdd7;background:#f5f6f8}.lifecycle-active .job-status{font-weight:700;color:#204e97}.lifecycle-ended .job-status{background:#e7ebf0;border-radius:4px;padding:2px 6px}.lifecycle-ended .job-progress{display:none}
+
+.current-operation{margin-top:8px;font-size:13px;line-height:1.6;color:#334155;overflow-wrap:anywhere}.current-operation[hidden]{display:none}

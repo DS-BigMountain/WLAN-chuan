@@ -1,10 +1,10 @@
 # 传 · Android 应用
 
-Android 应用提供与 Windows 客户端一致的局域网文件传输协议，可独立承担发送端、接收端和 Web 服务主机。当前版本为 **2.0**，最低运行环境为 Android 8.0，界面依赖已更新的系统 WebView。
+Android 应用提供与 Windows 客户端一致的局域网文件传输协议，可独立承担发送端、接收端和 Web 服务主机。当前版本为 **2.1**，最低运行环境为 Android 8.0，界面依赖已更新的系统 WebView。
 
 ## 功能与运行方式
 
-应用支持 IPv4 局域网发现、手动连接、文件与非空文件夹互传、批次整体或部分审批、自动接收、数量及大小限制、传输进度与速率、取消和删除、Ping、IP 临时备注，以及接收文件的打开和分享。系统分享菜单中的“传”可接收其他应用提交的文件。
+应用支持 IPv4 局域网发现、手动连接、文件与文件夹互传、批次整体或部分审批、自动接收、数量及大小限制、传输进度与速率、取消和删除、Ping、IP 临时备注，以及接收文件的打开和分享。系统分享菜单中的“传”可接收其他应用提交的文件。
 
 主界面上方选择目标设备并发送文件，接收申请在当前页按发送人分组展开，新到项目默认勾选。“全选”切换所有发送人的待处理项目，“接收”和“拒绝”仅处理勾选项；未勾选项目保留至后续处理。“本次传输”列表统一展示任务，使用全部、发送、接收筛选；点击文件夹任务名称可在原记录下展开逐项状态。
 
@@ -34,19 +34,19 @@ Web 页面与 Windows 端共用根目录 `src/web/` 中的资源。浏览器身�
 .\mobile\build.ps1 -AndroidSdk "C:\Android\Sdk"
 ```
 
-默认读取 `build/v2.0/Release/Chuan.exe`，以便 Android 服务向浏览器提供 Windows 客户端下载。也可使用 `-DesktopExe` 指定绝对路径；该参数的相对路径以 `mobile/` 为基准。
+默认读取 `build/v2.1/Release/Chuan.exe`，以便 Android 服务向浏览器提供 Windows 客户端下载。也可使用 `-DesktopExe` 指定绝对路径；该参数的相对路径以 `mobile/` 为基准。
 
-APK 输出至 `mobile/build/outputs/Chuan-2.0-android.apk`。脚本验证 APK v2/v3 签名和 ZIP 对齐，构建中间文件位于系统临时目录。APK 不包含特定 CPU 架构的原生库。
+APK 输出至 `mobile/build/outputs/Chuan-2.1-android.apk`。脚本验证 APK v2/v3 签名和 ZIP 对齐，构建中间文件位于系统临时目录。APK 不包含特定 CPU 架构的原生库。
 
 发布签名密钥和密码保存在 `mobile/.signing/`，不进入 Git 或交付包。该目录应作为构建凭据保留，源码不包含密码。
 
 统一生成桌面端与手机端交付目录：
 
 ```powershell
-.\tools\package.ps1 -BuildDirectory ".\build\v2.0" -AndroidApk ".\mobile\build\outputs\Chuan-2.0-android.apk" -AndroidSdk "C:\Android\Sdk"
+.\tools\package.ps1 -BuildDirectory ".\build\v2.1" -AndroidApk ".\mobile\build\outputs\Chuan-2.1-android.apk" -AndroidSdk "C:\Android\Sdk"
 ```
 
-桌面程序通过同目录的 `Chuan-2.0-android.apk` 提供 Web 页面中的“Android 客户端”下载。Android 服务直接提供当前已安装的 APK。
+桌面程序通过同目录的 `Chuan-2.1-android.apk` 提供 Web 页面中的“Android 客户端”下载。Android 服务直接提供当前已安装的 APK。
 
 ## 源码结构
 
@@ -60,4 +60,4 @@ APK 输出至 `mobile/build/outputs/Chuan-2.0-android.apk`。脚本验证 APK v2
 | `tests/interop.mjs` | Java 核心、Windows 程序与 Chromium 的定向互操作验证 |
 | `tests/HostMain.java` | 无 Android 依赖的协议验证宿主 |
 
-局域网传输使用明文 TCP，适用于可信网络。服务端没有账号认证、公网中继或断点续传功能。
+局域网传输使用明文 TCP，适用于可信网络。服务端不提供账号认证或公网中继。原生接收端保留可续传数据，并在恢复前核验已接收前缀的 SHA-256。

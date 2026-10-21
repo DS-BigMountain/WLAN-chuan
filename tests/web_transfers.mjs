@@ -1,13 +1,16 @@
 import {readFileSync} from 'node:fs';
 import assert from 'node:assert/strict';
 const source=readFileSync(new URL('../src/web/transfers.js',import.meta.url));
-const {transferGroups,pingEffect,timedNotice,folderProgress,transferTree}=await import(`data:text/javascript;base64,${source.toString('base64')}`);
+const {transferGroups,pingEffect,timedNotice,folderProgress,transferTree,currentOperation}=await import(`data:text/javascript;base64,${source.toString('base64')}`);
 const base={folderId:'batch-one',folderName:'资料',folderCount:2,folderTotal:100,peer:'A1',receiving:false};
 const complete={...base,id:1,name:'资料/a',total:40,done:40,speed:999,state:3};
 const running={...base,id:2,name:'资料/b',total:60,done:20,speed:12,state:2};
+const [queued]=transferGroups([{...running,state:0,activity:'',receiving:true}]);assert.equal(queued.currentFile,'');assert.equal(queued.currentAction,'等待发送端开始下一项');
+const [checking]=transferGroups([{...running,state:0,name:'资料/waiting',receiving:true}, {...running,state:0,id:3,name:'资料/current',activity:'等待发送端核对同名文件',receiving:true}]);assert.equal(checking.currentFile,'current');assert.equal(checking.currentAction,'发送端正在核对同名文件');assert.equal(checking.currentTransferring,false);assert(currentOperation(checking,String).includes('current'));
 let [group]=transferGroups([complete,running]);
 assert.equal(group.items.length,2);assert.equal(group.total,100);assert.equal(group.done,60);assert.equal(group.percent,60);assert.equal(group.speed,12);assert.equal(group.completed,1);assert.equal(group.state,2);
 assert.equal(transferGroups([complete])[0].state,1,'partial arrival must not appear complete');
+const cancelledBeforeUpload=transferGroups([{...complete,folderStopped:true}])[0];assert.equal(cancelledBeforeUpload.state,4);assert.equal(cancelledBeforeUpload.completed,1);assert.equal(cancelledBeforeUpload.cancelled,1,'cancelled missing entries remain terminal without changing saved files');
 assert.equal(transferGroups([complete,{...running,state:3,done:60}])[0].state,3);
 const afterDelete=transferGroups([{...complete,removed:true},{...running,state:3,done:60}])[0];
 assert.equal(afterDelete.items.length,1);assert.equal(afterDelete.percent,100);assert.equal(afterDelete.state,3,'deleting child history must not make completed folder pending');

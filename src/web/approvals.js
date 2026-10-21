@@ -28,7 +28,7 @@ export function createApprovalPanel(host,{bytes,glyph,decide,available=()=>true,
       for(const {item,index} of items){
         const id=key(request,index);live.add(id);total++;group.liveCount++;let row=records.get(id);
         if(!row){const element=make('label','','approval-file'),copy=make('span','','approval-file-copy'),name=make('strong'),size=make('small'),check=document.createElement('input');check.type='checkbox';check.checked=true;check.onchange=selection;copy.append(name,size);element.append(glyph(item.folder?'folder':'file'),copy,check);row={element,name,size,check,sender};records.set(id,row);group.list.append(element);}
-        row.active=true;row.available=available(item);row.name.textContent=item.name;row.size.textContent=bytes(Number(item.total))+(item.folder?' · '+item.count+' 个文件':'');row.check.disabled=!online||busy.has(String(request.id));row.check.setAttribute('aria-label',item.name);row.element.title=item.name+(!row.available?'：当前页面无法接收文件夹目录':'');row.element.classList.toggle('unavailable',!row.available);
+        row.active=true;row.available=available(item);row.name.textContent=item.name;row.size.textContent=bytes(Number(item.total))+(item.folder?' · '+item.count+' 项':'');row.check.disabled=!online||busy.has(String(request.id));row.check.setAttribute('aria-label',item.name);row.element.title=item.name+(!row.available?'：当前页面无法接收文件夹目录':'');row.element.classList.toggle('unavailable',!row.available);if(!row.available)row.size.textContent+=' · 当前 Web 页面无法直接接收文件夹，请发送方使用“打包传输”发送 ZIP。';
       }
     }
     for(const [id,row] of records)if(!live.has(id)){row.element.remove();records.delete(id);}

@@ -19,7 +19,8 @@ void Engine::ExpireLocked() {
     for (auto &job : jobs_) if (job->announced && job->view.state==State::Queued) {
         if(!job->nativeOwner.empty()){
             uint64_t touched=job->view.started;for(const auto &[key,batch]:batchApprovals_)if(key.ends_with(":"+job->nativeOwner+":"+job->batchId))touched=std::max(touched,batch.touched);
-            if(now-touched>45000){job->announced=false;job->view.state=State::Failed;job->view.error=L"发送端已离线或停止，未收到 ZIP 文件";job->finishedAt=now;job->cv.notify_all();}
+            const bool active=std::any_of(jobs_.begin(),jobs_.end(),[&](const auto &item){return item!=job&&item->nativeOwner==job->nativeOwner&&item->batchId==job->batchId&&!item->announced&&item->view.state<State::Completed;});
+            if(now-touched>45000&&!active){job->announced=false;job->view.state=State::Failed;job->view.error=L"发送端已离线或停止，未收到剩余文件";job->finishedAt=now;job->cv.notify_all();}
             continue;
         }
         const auto sender=browsers_.find(job->webClient);
@@ -115,7 +116,7 @@ std::string Engine::Mesh(const std::string &ledger) {
     for (auto &[keyValue, session] : browsers_) {
         if (session.tabs.empty()) continue;
         const auto name = session.name.empty() ? AutoNameLocked(Utf8(session.id)) : session.name;
-        out << "B " << Hex(Utf8(session.id)) << ' ' << Hex(Utf8(name)) << ' ' << session.ip << ' ' << (session.platform.empty()?"web":session.platform) << '\n';
+        out << "B " << Hex(Utf8(session.id)) << ' ' << Hex(Utf8(name)) << ' ' << session.ip << ' ' << (session.platform.empty()?"web":session.platform) << ' ' << (session.directoryReceive?"D":"-") << '\n';
     }
     return out.str();
 }
@@ -141,7 +142,7 @@ void Engine::SyncMesh(const Peer &peer) {
             nextAlias_ = std::max(nextAlias_, number + 1);
         } else if (type == "B" && fields >> name >> ip && IsLocal(ip)) {
             Peer browser{Wide(Unhex(id)), Wide(Unhex(name)), ip, peer.port, Now(), false, true};
-            std::string platform;fields>>platform;browser.platform=platform=="mobile-web"||platform=="desktop-web"?platform:"web";
+            std::string platform;fields>>platform;browser.platform=platform=="mobile-web"||platform=="desktop-web"?platform:"web";std::string capability;fields>>capability;browser.directoryReceive=capability=="D";
             if (!browser.id.starts_with(L"web:") || browser.name.size() > 64) continue;
             browser.gateway = peer.ip; browser.owner = peer.id;
             browserIds.insert(browser.id);

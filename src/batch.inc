@@ -1,5 +1,41 @@
 // Consent is tracked independently per item. The ledger binds every accepted
 // payload to sender, route, original item index, path, count and bytes.
+void Engine::ReceivePhase(SOCKET socket,const std::map<std::string,std::string> &h,const std::string &ip,const std::string &upload,bool browser){
+    uint64_t length=0;if(!WebKey(upload)||!Number(Get(h,"content-length"),length)||!length||length>16||!Get(h,"transfer-encoding").empty()){Reply(socket,400,"Bad Request");return;}
+    std::string phase(static_cast<size_t>(length),'\0');if(!ReadExact(socket,phase.data(),phase.size()))return;
+    const std::map<std::string,std::wstring> labels={{"pack",L"发送端正在打包文件"},{"hash",L"等待发送端核对同名文件"}};
+    const auto label=labels.find(phase);if(label==labels.end()){Reply(socket,400,"Bad Request");return;}
+    std::lock_guard lock(mutex_);const auto owner=Get(h,browser?"x-chuan-client":"x-chuan-id");
+    const auto batch=batchApprovals_.find(std::string(browser?"web:":"native:")+ip+":"+owner+":"+Get(h,"x-chuan-batch"));
+    if(batch==batchApprovals_.end()){Reply(socket,404,"Not Found");return;}
+    for(const auto &job:jobs_)if(job->announced&&job->webUpload==upload&&job->batchId==Get(h,"x-chuan-batch")&&(browser?job->webClient:job->nativeOwner)==owner){
+        if(job->cancel||batch->second.cancelledItems.contains(job->batchItem)){Reply(socket,410,"Gone");return;}
+        job->view.activity=label->second;batch->second.touched=Now();Reply(socket,200,"OK");return;
+    }
+    Reply(socket,404,"Not Found");
+}
+void Engine::RetryUpload(SOCKET socket,const std::map<std::string,std::string> &h,const std::string &ip,const std::string &upload,bool browser){
+    std::lock_guard lock(mutex_);
+    const auto owner=Get(h,browser?"x-chuan-client":"x-chuan-id"),batchId=Get(h,"x-chuan-batch");
+    auto batch=batchApprovals_.find(std::string(browser?"web:":"native:")+ip+":"+owner+":"+batchId);
+    if(batch==batchApprovals_.end()){Reply(socket,404,"Not Found");return;}
+    for(auto &job:jobs_)if(job->batchId==batchId&&job->webUpload==upload&&(browser?job->webClient:job->nativeOwner)==owner&&job->view.receiving){
+        auto &approval=batch->second;const auto index=job->batchItem;
+        if(job->cancel||approval.cancelledItems.contains(index)||job->view.state==State::Rejected){Reply(socket,410,"Gone");return;}
+        if(job->paused){approval.touched=Now();Reply(socket,200,"OK","7");return;}
+        if(job->view.state==State::Completed){Reply(socket,200,"OK","3");return;}
+        if(!job->recipient.empty()&&job->hasIdentity&&job->view.state!=State::Failed){approval.touched=Now();Reply(socket,200,"OK","8");return;}
+        if(job->view.state==State::Failed){
+            if(approval.paths.erase({index,job->view.name})){--approval.counts[index];approval.bytes[index]-=job->view.total;}
+            const auto folder=folderApprovals_.find(job->folderKey);
+            if(folder!=folderApprovals_.end()&&folder->second.paths.erase(job->view.name))folder->second.reserved-=job->view.total;
+            job->view.state=State::Queued;job->view.error.clear();job->view.done=0;job->view.speed=0;job->announced=true;job->hidden=false;job->hiddenClients.clear();approval.touched=Now();
+        }
+        Reply(socket,job->view.state==State::Queued?200:409,job->view.state==State::Queued?"OK":"Conflict","0");return;
+    }
+    // No payload has arrived yet. The original authorization remains in force.
+    Reply(socket,200,"OK","0");
+}
 void Engine::ReceiveBatchFiles(SOCKET socket, const std::map<std::string, std::string> &headers, const std::string &ip, bool status, bool browserRequest) {
     const auto owner = Get(headers, browserRequest?"x-chuan-client":"x-chuan-id"), batchId = Get(headers, "x-chuan-batch");
     uint64_t length = 0;
@@ -8,7 +44,7 @@ void Engine::ReceiveBatchFiles(SOCKET socket, const std::map<std::string, std::s
     }
     std::string body(static_cast<size_t>(length), '\0');
     if (!ReadExact(socket, body.data(), body.size())) return;
-    struct Entry { uint64_t item = 0, size = 0, state = 0; std::string upload, folder; std::wstring name, error; bool archive=false; };
+    struct Entry { uint64_t item = 0, size = 0, state = 0; std::string upload, folder; std::wstring name, error; bool archive=false,directory=false; };
     std::vector<Entry> entries; std::istringstream input(body); std::string line;
     while (std::getline(input, line)) {
         std::vector<std::string> fields; std::istringstream row(line); std::string field;
@@ -22,7 +58,8 @@ void Engine::ReceiveBatchFiles(SOCKET socket, const std::map<std::string, std::s
             if ((fields.size() != 5 && fields.size()!=6) || !Number(fields[0], entry.item) || !WebKey(fields[1]) || !Number(fields[4], entry.size)) { Reply(socket, 400, "Bad Request"); return; }
             entry.upload = fields[1]; entry.folder = fields[2]; entry.name = SanitizeRelative(Wide(Unhex(fields[3])));
             entry.archive=fields.size()==6&&fields[5]=="A";
-            if(fields.size()==6&&(!entry.archive||!entry.name.ends_with(L".zip"))){Reply(socket,400,"Bad Request");return;}
+            entry.directory=fields.size()==6&&fields[5]=="D";
+            if(fields.size()==6&&!(entry.archive&&entry.name.ends_with(L".zip"))&&!(entry.directory&&entry.size==0)){Reply(socket,400,"Bad Request");return;}
             if (entry.name.empty()) { Reply(socket, 400, "Bad Request"); return; }
         }
         entries.push_back(std::move(entry));
@@ -52,10 +89,10 @@ void Engine::ReceiveBatchFiles(SOCKET socket, const std::map<std::string, std::s
     for (const auto &entry : entries) {
         if (entry.item >= batch.items.size() || batch.selection[entry.item] != '1' || batch.announcedItems.contains(entry.item)) { Reply(socket, 400, "Bad Request"); return; }
         const auto &item = batch.items[entry.item];
-        if(entry.archive&&item.folder){Reply(socket,400,"Bad Request");return;}
+        if((entry.archive&&item.folder)||(entry.directory&&!item.folder)){Reply(socket,400,"Bad Request");return;}
         if (item.folder) { auto [folder, inserted] = folders.try_emplace(entry.item, entry.folder); if (!inserted && folder->second != entry.folder) { Reply(socket, 400, "Bad Request"); return; } }
         if (!paths.insert(entry.name).second || !uploads.insert(entry.upload).second || entry.size > item.total - sizes[entry.item] ||
-            (item.folder ? !WebKey(entry.folder) || !entry.name.starts_with(item.name + L"\\") : !entry.folder.empty() || entry.name != item.name)) { Reply(socket, 400, "Bad Request"); return; }
+            (item.folder ? !WebKey(entry.folder) || !(entry.name.starts_with(item.name + L"\\")||(entry.directory&&entry.name==item.name)) : !entry.folder.empty() || entry.name != item.name)) { Reply(socket, 400, "Bad Request"); return; }
         ++counts[entry.item]; sizes[entry.item] += entry.size;
     }
     for (size_t i = 0; i < batch.items.size(); ++i) if (counts[i] && (counts[i] != batch.items[i].count || sizes[i] != batch.items[i].total)) { Reply(socket, 400, "Bad Request"); return; }
@@ -69,7 +106,7 @@ void Engine::ReceiveBatchFiles(SOCKET socket, const std::map<std::string, std::s
         job->view.total = entry.size; job->view.receiving = true; job->view.state = State::Queued; job->view.started = Now();
         if(browserRequest){job->webClient=owner;job->webTab=Get(headers,"x-chuan-tab");}else job->nativeOwner=owner;
         job->webUpload = entry.upload; job->batchId = batchId; job->batchItem = static_cast<size_t>(entry.item);
-        if(entry.archive)job->view.activity=L"等待发送端打包 ZIP";
+        job->view.directory=entry.directory;
         job->senderName = sender; job->targetId = config_.id; job->announced = true;
         if (item.folder) { job->folderId = entry.folder; job->view.folderId = entry.folder; job->view.folderName = item.name; job->view.folderCount = item.count; job->view.folderTotal = item.total; }
         jobs_.push_back(std::move(job));
@@ -103,7 +140,7 @@ void Engine::ReceiveOfferStatus(SOCKET socket, const std::map<std::string, std::
             for (size_t i=0;i<mask.size();++i) if(mask[i]=='0') {
                 batchApprovals_.at(key).cancelledItems.insert(i);
                 for(const auto &item:jobs_) if(!item->view.requestOnly && item->batchId==job->batchId && item->batchItem==i &&
-                    (browser?item->webClient:item->nativeOwner)==owner && item->view.state<State::Completed) cancelled.push_back(item->view.id);
+                    (browser?item->webClient:item->nativeOwner)==owner) {item->view.folderStopped=true;if(item->view.state<State::Completed)cancelled.push_back(item->view.id);}
             }
         }
         batchApprovals_.at(key).touched=Now();

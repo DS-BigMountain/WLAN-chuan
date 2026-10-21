@@ -16,7 +16,7 @@ export function folderBatches(items,makeId) {
   for(const item of items) {
     if(paths.has(item.path))throw new Error('同一批次存在重复路径，请分别发送同名文件夹。');
     paths.add(item.path);
-    if(!item.path.includes('/'))continue;
+    if(!item.directory&&!item.path.includes('/'))continue;
     const root=item.path.split('/')[0];
     if(!groups.has(root))groups.set(root,{id:makeId(),name:root,count:0,total:0,totalExact:'0'});
     const group=groups.get(root);group.count++;group.totalExact=String(BigInt(group.totalExact)+BigInt(item.file.size));group.total=Number(group.totalExact);
@@ -38,6 +38,7 @@ export async function droppedFiles(transfer) {
       const file=await new Promise((resolve,reject)=>entry.file(resolve,reject));
       result.push({file,path});
     } else if(entry.isDirectory) {
+      result.push({file:new File([],entry.name),path,directory:true});
       const reader=entry.createReader();
       for(;;) {
         const batch=await new Promise((resolve,reject)=>reader.readEntries(resolve,reject));
@@ -51,7 +52,9 @@ export async function droppedFiles(transfer) {
 }
 
 export function batchPlan(files,makeId,maxFiles='0',maxBytes='0') {
-  const entries=folderBatches(files,makeId), items=[], folders=new Map();
+  const expanded=[...files],present=new Set(files.map(item=>item.path));
+  for(const item of files){const parts=item.path.split('/');for(let i=1;i<parts.length;i++){const path=parts.slice(0,i).join('/');if(!present.has(path)){present.add(path);expanded.unshift({file:new File([],parts[i-1]),path,directory:true});}}}
+  const entries=folderBatches(expanded,makeId), items=[], folders=new Map();
   let total=0n;
   for(const entry of entries) {
     total+=BigInt(entry.file.size);

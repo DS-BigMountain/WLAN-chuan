@@ -1,0 +1,82 @@
+import {readFile,writeFile,mkdir} from 'node:fs/promises';
+import {fileURLToPath,pathToFileURL} from 'node:url';
+import path from 'node:path';
+import assert from 'node:assert/strict';
+const root=path.dirname(fileURLToPath(import.meta.url)),project=path.resolve(root,'../../..');
+const {chromium}=await import(pathToFileURL(path.join(project,'build/web-qa/node_modules/playwright-core/index.mjs')));
+const browser=await chromium.launch({channel:'chrome',headless:true,timeout:20000});
+const errors=[];let checks=0;
+function check(value,message){assert(value,message);checks++;}
+async function pageFor(file,viewport){
+  const page=await browser.newPage({viewport,deviceScaleFactor:2});
+  page.on('pageerror',error=>errors.push(error.message));
+  await page.goto(pathToFileURL(path.join(root,file)).href);
+  await page.waitForFunction(()=>!!window.chuanPrototype);
+  await page.evaluate(()=>document.fonts.ready);
+  return page;
+}
+try{
+  const current=await readFile(path.join(project,'src/web/index.html'),'utf8');
+  const originalSprite=current.match(/<svg class="symbols"[\s\S]*?<\/svg>/)?.[0];
+  for(const file of ['web-desktop.html','web-mobile.html']){
+    const html=await readFile(path.join(root,file),'utf8');check(html.includes(originalSprite),'original icon definitions preserved');
+  }
+  check((await readFile(path.join(root,'assets/chuan.svg'))).equals(await readFile(path.join(project,'src/assets/chuan.svg'))),'original brand icon preserved');
+  const desktop=await pageFor('web-desktop.html',{width:1560,height:1110});
+  check(await desktop.locator('#receive-folder').isDisabled(),'unsupported directory receive disabled');
+  check(await desktop.locator('#accept-selected').isDisabled(),'approval requires explicit selection');
+  await desktop.locator('#receive-file').check();
+  check(await desktop.locator('#accept-selected').isEnabled(),'single-file partial approval remains available');
+  await desktop.screenshot({path:path.join(root,'web-desktop.png'),fullPage:true});
+  await desktop.locator('#device-list .device').first().click();
+  check(await desktop.locator('#target-name').textContent()==='BIGMOUNTAIN','selected destination changes');
+  check((await desktop.evaluate(()=>window.chuanPrototype.getState())).jobs[0].targetId==='desktop','active transfer destination remains fixed');
+  await desktop.evaluate(()=>window.chuanPrototype.setOnline(false));
+  check(await desktop.locator('#choose-files').isDisabled(),'new sends disabled offline');
+  check(await desktop.locator('#accept-selected').isDisabled(),'accept disabled offline');
+  check(await desktop.locator('#reject-request').isDisabled(),'reject disabled offline');
+  check(await desktop.locator('#jobs button').last().isDisabled(),'download disabled offline');
+  await desktop.evaluate(()=>window.chuanPrototype.setOnline(true));
+  await desktop.locator('#accept-selected').click();
+  check(!(await desktop.evaluate(()=>window.chuanPrototype.getState())).requestPending,'accepted request is removed');
+  check((await desktop.evaluate(()=>window.chuanPrototype.getState())).jobs.some(job=>job.name==='会议纪要.pdf'&&job.status==='ready'),'accepted file becomes downloadable');
+  await desktop.locator('#jobs [data-job="3"] button').click();
+  check((await desktop.locator('#jobs [data-job="3"]').textContent()).includes('已交给浏览器'),'browser handoff shown instead of disk-save completion');
+  await desktop.setViewportSize({width:640,height:940});
+  check(await desktop.locator('.directory-help').isHidden(),'narrow desktop retains its browser folder capability');
+  check(await desktop.locator('#choose-folder').isEnabled(),'desktop folder sending stays available at a narrow width');
+  await desktop.locator('[data-tab="receive"]').click();
+  check(await desktop.locator('.send-section').isHidden(),'compact desktop browser switches views');
+  const mobile=await pageFor('web-mobile.html',{width:420,height:940});
+  check(await mobile.locator('#choose-folder').isDisabled(),'unsupported mobile folder chooser disabled');
+  check(await mobile.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),'mobile page has no horizontal overflow');
+  await mkdir(path.join(root,'assets'),{recursive:true});
+  await mobile.screenshot({path:path.join(root,'assets/mobile-send.png'),fullPage:true});
+  await mobile.locator('[data-tab="receive"]').click();
+  await mobile.locator('#receive-file').check();
+  check(await mobile.locator('#accept-selected').isEnabled(),'mobile single-file acceptance is available');
+  await mobile.screenshot({path:path.join(root,'assets/mobile-receive.png'),fullPage:true});
+  await mobile.locator('#accept-selected').click();
+  check((await mobile.evaluate(()=>window.chuanPrototype.getState())).tab==='status','mobile acceptance leads to status view');
+  await mobile.locator('[data-tab="send"]').click();
+  await mobile.locator('#switch-device').click();
+  check(await mobile.locator('#device-dialog').evaluate(dialog=>dialog.open),'device selection sheet opens');
+  await mobile.locator('#sheet-device-list .device').first().click();
+  check(await mobile.locator('#target-name').textContent()==='BIGMOUNTAIN','mobile destination updates');
+  check((await mobile.evaluate(()=>window.chuanPrototype.getState())).jobs[0].targetId==='desktop','mobile existing task preserves its destination');
+  await mobile.setViewportSize({width:360,height:940});
+  check(await mobile.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),'small phone has no horizontal overflow');
+  await mobile.setViewportSize({width:1280,height:940});
+  check(await mobile.locator('.mobile-tabs').isVisible(),'mobile prototype remains usable in a wide preview');
+  check(await mobile.locator('.sidebar').isHidden(),'mobile preview retains its own information structure');
+  const board='<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>Web 手机浏览器方案</title><style>*{box-sizing:border-box}body{margin:0;background:#e9edf3;font-family:"Segoe UI","Microsoft YaHei UI",sans-serif;color:#303744;padding:30px 30px 34px}.header{display:flex;justify-content:space-between;align-items:center;margin-bottom:25px}h1{font-size:23px;margin:0;font-weight:600}.header span{font-size:13px;color:#677180}.states{display:grid;grid-template-columns:1fr 1fr;gap:28px}.state h2{font-size:15px;margin:0 0 10px;font-weight:600}.state img{display:block;width:100%;border-radius:12px;border:1px solid #d9dfe9;box-shadow:0 6px 22px #1c2b4a08}.footer{font-size:12px;line-height:1.6;color:#657080;margin-top:20px}</style><div class="header"><h1>手机浏览器 · 操作逻辑</h1><span>第 1 版视觉结构 · 原有图标</span></div><div class="states"><div class="state"><h2>发送：明确目标，分阶段显示进度</h2><img src="assets/mobile-send.png"></div><div class="state"><h2>接收：选择单文件，再进入下载状态</h2><img src="assets/mobile-receive.png"></div></div><div class="footer">选择目标 → 提交批次 → 接收方确认 → 上传至主机 → 送达目标设备<br>接收请求 → 能力检查 → 选择项目 → 接受所选 → 在状态中下载</div></html>';
+  await writeFile(path.join(root,'mobile-board.html'),board);
+  const composite=await pageFor('web-mobile.html',{width:968,height:1100});
+  await composite.goto(pathToFileURL(path.join(root,'mobile-board.html')).href);
+  await composite.locator('img').evaluateAll(images=>Promise.all(images.map(image=>image.decode())));
+  await composite.screenshot({path:path.join(root,'web-mobile.png'),fullPage:true});
+  check(errors.length===0,'prototype JavaScript has no runtime errors');
+  const qa=path.join(project,'build/ui-design',path.basename(root));await mkdir(qa,{recursive:true});
+  await writeFile(path.join(qa,'render-report.json'),JSON.stringify({checks,errors,iconDefinitionsPreserved:true,brandPreserved:true,views:['web-desktop.png','web-mobile.png']},null,2));
+  console.log(JSON.stringify({checks,errors,root,images:['web-desktop.png','web-mobile.png']}));
+}finally{await browser.close();}

@@ -68,6 +68,15 @@ struct Canvas {
         Color(gray);
         target->DrawLine(D2D1::Point2F(x, y), D2D1::Point2F(x2, y2), brush, weight);
     }
+    void Chevron(float x, float y, bool expanded, float gray = .46f) {
+        if (expanded) {
+            Line(x - 4, y - 2, x, y + 2, gray);
+            Line(x, y + 2, x + 4, y - 2, gray);
+        } else {
+            Line(x - 2, y - 4, x + 2, y, gray);
+            Line(x + 2, y, x - 2, y + 4, gray);
+        }
+    }
     void Circle(float x, float y, float radius, float gray, bool fill = false) {
         Color(gray);
         auto e = D2D1::Ellipse(D2D1::Point2F(x, y), radius, radius);
