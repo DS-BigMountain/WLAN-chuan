@@ -114,7 +114,7 @@ cmake --build .\build\v2.1 --config Release --target Chuan
 .\tools\package.ps1 -BuildDirectory ".\build\v2.1"
 ```
 
-打包脚本沿用项目当前版本，默认在 `__release_packages__\临时\时间\` 中创建交付目录；指定 `-VersionedRelease` 时，文件直接写入 `__release_packages__\V<版本号>\`，目标目录已存在时停止打包。脚本验证可执行文件内容、签名状态及 ZIP 内容。脚本将本次交付目录和可执行文件设置为中完整性级别，避免继承构建目录的低完整性标签。
+打包脚本沿用项目当前版本，默认在 `__release_packages__\临时\时间\` 中创建交付目录；指定 `-VersionedRelease` 时，文件直接写入 `__release_packages__\<版本号>\`，目标目录已存在时停止打包。脚本验证可执行文件内容、签名状态及 ZIP 内容。脚本将本次交付目录和可执行文件设置为中完整性级别，避免继承构建目录的低完整性标签。
 
 ## 快速开始
 
