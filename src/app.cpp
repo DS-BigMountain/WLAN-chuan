@@ -29,6 +29,24 @@ const D2D1_COLOR_F Accent = D2D1::ColorF(0x2164F3), AccentLight = D2D1::ColorF(0
     Success = D2D1::ColorF(0x08A344), PendingSurface = D2D1::ColorF(0xFFF8E9),
     TextInk = D2D1::ColorF(0x171B24), TextMuted = D2D1::ColorF(0x6B7485),
     SoftBorder = D2D1::ColorF(0xDCE2EA), SideSurface = D2D1::ColorF(0xF1F4F7);
+RECT WindowWorkArea(HWND window = nullptr) {
+    POINT cursor{};
+    GetCursorPos(&cursor);
+    const auto monitor = window ? MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST)
+                                : MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO info{sizeof(info)};
+    if (GetMonitorInfoW(monitor, &info)) return info.rcWork;
+    RECT area{};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &area, 0);
+    return area;
+}
+RECT DefaultWindowBounds(const RECT &workArea) {
+    const LONG width = (workArea.right - workArea.left) * 2 / 3;
+    const LONG height = (workArea.bottom - workArea.top) * 2 / 3;
+    const LONG left = workArea.left + (workArea.right - workArea.left - width) / 2;
+    const LONG top = workArea.top + (workArea.bottom - workArea.top - height) / 2;
+    return {left, top, left + width, top + height};
+}
 struct App {
     Engine &engine;
     HWND window = nullptr, devices = nullptr, tasks = nullptr, drop = nullptr, request = nullptr,
@@ -456,14 +474,23 @@ struct App {
         auto oldJobs = shownJobs;
         auto visibleTransfers = snapshot.transfers;
         if (taskFilter) std::erase_if(visibleTransfers, [&](const auto &job) { return job.receiving != (taskFilter == 2); });
-        std::stable_sort(visibleTransfers.begin(), visibleTransfers.end(), [](const auto &a, const auto &b) {
-            return (a.state < State::Completed) > (b.state < State::Completed);
+        std::map<std::string, bool> activeGroups;
+        for (const auto &row : summaryRows) if (row.folderRow) activeGroups[row.group] = row.state < State::Completed;
+        const auto isActive = [&](const auto &job) {
+            const auto group = activeGroups.find(TransferGroup(job));
+            return group == activeGroups.end() ? job.state < State::Completed : group->second;
+        };
+        // 文件夹按批次状态排序，避免成员文件完成时改变批次位置。
+        std::stable_sort(visibleTransfers.begin(), visibleTransfers.end(), [&](const auto &a, const auto &b) {
+            return isActive(a) > isActive(b);
         });
         shownJobs = TransferRows(visibleTransfers, expandedFolders);
         bool content = oldJobs.size() != shownJobs.size();
         if (!content)
             for (size_t i = 0; i < oldJobs.size(); ++i)
-                if (oldJobs[i].id != shownJobs[i].id || oldJobs[i].treePath != shownJobs[i].treePath || oldJobs[i].state != shownJobs[i].state || oldJobs[i].completedFiles != shownJobs[i].completedFiles || oldJobs[i].failedFiles != shownJobs[i].failedFiles)
+                if (oldJobs[i].id != shownJobs[i].id || oldJobs[i].group != shownJobs[i].group ||
+                    oldJobs[i].treePath != shownJobs[i].treePath || oldJobs[i].childRow != shownJobs[i].childRow ||
+                    oldJobs[i].directoryRow != shownJobs[i].directoryRow || oldJobs[i].folderRow != shownJobs[i].folderRow)
                     content = true;
         int top = static_cast<int>(SendMessageW(tasks, LB_GETTOPINDEX, 0, 0));
         int sel = -1;
@@ -471,13 +498,11 @@ struct App {
             SendMessageW(tasks, WM_SETREDRAW, FALSE, 0);
             SendMessageW(tasks, LB_RESETCONTENT, 0, 0);
             for (auto &j : shownJobs) {
-                std::wstring label = (j.folderRow ? L"文件夹 " : L"") + j.name + L" · " + TransferText(j) + L" · " + j.peer;
+                std::wstring label = (j.folderRow ? L"文件夹 " : L"") + j.name + L" · " + TransferAction(j) + L" · " + j.peer;
                 SendMessageW(tasks, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
             }
             if (shownJobs.empty())
                 SendMessageW(tasks, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"暂无传输任务"));
-            SendMessageW(tasks, WM_SETREDRAW, TRUE, 0);
-            SendMessageW(tasks, LB_SETTOPINDEX, top, 0);
             TaskHeights();
         }
         for (size_t i = 0; i < shownJobs.size(); ++i)
@@ -489,6 +514,10 @@ struct App {
         }
         if (SendMessageW(tasks, LB_GETCURSEL, 0, 0) != sel)
             SendMessageW(tasks, LB_SETCURSEL, sel, 0);
+        if (content) {
+            SendMessageW(tasks, LB_SETTOPINDEX, top, 0);
+            SendMessageW(tasks, WM_SETREDRAW, TRUE, 0);
+        }
         const auto oldPending=pending;auto oldRequests=std::move(pendingJobs);pendingJobs.clear();
         for(const auto &job:snapshot.transfers)if(job.receiving&&job.state==State::Waiting&&job.awaitingApproval)pendingJobs.push_back(job);
         pending=pendingJobs.empty()?0:pendingJobs.front().id;
@@ -528,14 +557,19 @@ struct App {
             InvalidateRect(devices, nullptr, FALSE);
         }
         if (content) {
-            TaskHeights();
             InvalidateRect(tasks, nullptr, FALSE);
         } else {
             for (size_t i = 0; i < shownJobs.size(); ++i) {
                 auto &a = oldJobs[i];
                 auto &b = shownJobs[i];
                 if (a.done != b.done || a.total != b.total || a.speed != b.speed || a.error != b.error ||
-                    a.name != b.name || a.peer != b.peer) {
+                    a.name != b.name || a.peer != b.peer || a.state != b.state || a.activity != b.activity ||
+                    a.completedFiles != b.completedFiles || a.failedFiles != b.failedFiles ||
+                    a.cancelledFiles != b.cancelledFiles || a.skippedFiles != b.skippedFiles ||
+                    a.folderCount != b.folderCount || a.awaitingApproval != b.awaitingApproval ||
+                    a.savedPath != b.savedPath || a.canRetry != b.canRetry || a.skipped != b.skipped ||
+                    a.currentFile != b.currentFile || a.currentAction != b.currentAction || a.stageSummary != b.stageSummary ||
+                    a.currentDone!=b.currentDone||a.currentTotal!=b.currentTotal||a.currentCount!=b.currentCount||a.currentTransferring!=b.currentTransferring) {
                     RECT row{};
                     SendMessageW(tasks, LB_GETITEMRECT, i, reinterpret_cast<LPARAM>(&row));
                     InvalidateRect(tasks, &row, FALSE);
@@ -730,18 +764,21 @@ struct App {
                 const bool active = j.state < State::Completed;
                 const bool completed = j.state == State::Completed;
                 if (j.childRow) {
-                    const float indent=22.f+std::min(8u,j.depth)*18.f;
-                    c.BoxColor(1,0,w-2,h,0,D2D1::ColorF(0xF8FAFD));
-                    c.Line(indent-9,0,indent-9,h,.86f,1);
-                    c.Line(indent-9,h/2,indent-1,h/2,.86f,1);
+                    const float indent=24.f+std::min(8u,j.depth)*24.f;
+                    c.BoxColor(1,0,w-2,h,0,selected?D2D1::ColorF(0xEDF3FF):D2D1::ColorF(0xFFFFFF));
+                    c.Line(20,h-1,w-20,h-1,.94f,1);
                     const bool open=j.directoryRow&&expandedFolders.contains(j.group+"|"+Utf8(j.treePath));
-                    if(j.directoryRow)c.TextColor(open?L"⌄":L"›",indent,0,16,h,normal,TextMuted);
-                    c.Icon(j.directoryRow?3:2,indent+19,j.directoryRow?11.f:13.f,.4f,.8f);
-                    const float nameX=indent+47,statusX=std::max(nameX+100,w-220),sizeX=std::max(nameX+40,statusX-110);
-                    c.TextColor(j.name,nameX,j.directoryRow?3.f:6.f,std::max(40.f,sizeX-nameX-10),25,captionFormat,TextInk);
-                    c.TextColor(FormatBytes(j.total),sizeX,j.directoryRow?3.f:6.f,96,25,captionFormat,TextMuted,DWRITE_TEXT_ALIGNMENT_TRAILING);
-                    const auto stateLabel=j.directoryRow?std::to_wstring(j.completedFiles)+L"/"+std::to_wstring(j.folderCount)+L" 个文件":TransferText(j);
-                    c.TextColor(stateLabel,statusX,j.directoryRow?3.f:6.f,w-statusX-14,25,captionFormat,j.state==State::Completed?Success:j.state==State::Failed?D2D1::ColorF(0xB4523B):TextMuted,DWRITE_TEXT_ALIGNMENT_TRAILING);
+                    const float lineY=j.directoryRow?(h-28)/2:7.f;
+                    if(j.directoryRow)c.Chevron(indent+4,h/2,open);
+                    c.BoxColor(indent+19,lineY,28,28,6,j.directoryRow?D2D1::ColorF(0xFFF4D8):D2D1::ColorF(0xF1F4F8));
+                    c.Icon(j.directoryRow?3:2,indent+23,lineY+4,j.directoryRow?.43f:.53f,.8f);
+                    const float nameX=indent+58,statusX=w-178,sizeX=statusX-124;
+                    c.TextColor(j.name,nameX,lineY,std::max(24.f,sizeX-nameX-20),28,captionFormat,TextInk);
+                    c.TextColor(FormatBytes(j.total),sizeX,lineY,104,28,captionFormat,TextMuted,DWRITE_TEXT_ALIGNMENT_TRAILING);
+                    const bool complete=j.state==State::Completed,failed=j.state==State::Failed;
+                    const auto stateLabel=j.directoryRow?(complete?L"已完成  ":failed?L"有失败  ":L"")+std::to_wstring(j.completedFiles)+L" / "+std::to_wstring(j.folderCount):TransferAction(j);
+                    c.BoxColor(statusX,lineY,158,28,14,complete?D2D1::ColorF(0xEAF7EF):failed?D2D1::ColorF(0xFFF0E9):D2D1::ColorF(0xF1F4F8));
+                    c.TextColor(stateLabel,statusX+8,lineY,142,28,captionFormat,complete?Success:failed?D2D1::ColorF(0xB4523B):TextMuted,DWRITE_TEXT_ALIGNMENT_CENTER);
                     if(!j.directoryRow){
                         const double percent=j.total?100.0*j.done/j.total:j.state==State::Completed?100:0;
                         if(j.state==State::Running){const float track=std::min(160.f,std::max(40.f,w-nameX-275));c.BoxColor(nameX,42,track,5,2.5f,D2D1::ColorF(0xDEE3EC));if(percent>0)c.BoxColor(nameX,42,track*static_cast<float>(std::min(100.0,percent))/100,5,2.5f,Accent);c.TextColor((j.done&&percent<.1?L"<0.1":std::to_wstring(static_cast<unsigned>(percent)))+std::wstring(L"% · ")+FormatBytes(static_cast<uint64_t>(j.speed))+L"/s",nameX+track+12,31,w-nameX-track-26,25,captionFormat,TextMuted);}
@@ -751,7 +788,8 @@ struct App {
                 }
                 const float rowLeft = j.childRow ? 24.f : 1.f;
                 c.BoxColor(rowLeft, 1, w - rowLeft - 1, h - 2, 4,
-                           selected ? D2D1::ColorF(0xFAFCFF) : D2D1::ColorF(0xFFFFFF), keyboardFocus ? Accent : SoftBorder);
+                           selected ? D2D1::ColorF(0xFAFCFF) : active?D2D1::ColorF(0xF4F8FF):D2D1::ColorF(0xF3F4F6), keyboardFocus ? Accent : SoftBorder);
+                c.BoxColor(rowLeft+1,5,4,h-10,2,active?Accent:D2D1::ColorF(0xBCC4D0));
                 if (j.childRow) c.Line(18, 0, 18, h, .86f, 1);
                 const float actionX = w - 154, indent = j.childRow ? 24.f : 0.f;
                 const float titleX = wide ? 210.f + indent : 46.f + indent;
@@ -765,11 +803,14 @@ struct App {
                 }
                 c.Icon(j.folderRow ? 3 : 2, wide ? 172.f + indent : 14.f + indent, wide ? 24.f : 16.f, .36f, wide ? 1.25f : 1.f);
                 const float titleWidth = wide ? statusX - titleX - 15 : actionX - titleX - 14;
-                c.TextColor(j.name + (j.folderRow ? expandedFolders.contains(j.group)?L"  ⌄":L"  ›" : L""), titleX, wide ? 12.f : 7.f, titleWidth, 27, strongFormat, j.folderRow ? Accent : TextInk);
-                std::wstring metadata = j.folderRow ? std::to_wstring(j.completedFiles)+L"/"+std::to_wstring(j.folderCount)+L" 个文件 · "+FormatBytes(j.done)+L"/"+FormatBytes(j.total) : FormatBytes(j.total);
+                if(j.folderRow)c.Chevron(titleX+4,wide?25.f:20.f,expandedFolders.contains(j.group));
+                c.TextColor(j.name,titleX+(j.folderRow?20.f:0.f),wide?12.f:7.f,titleWidth-(j.folderRow?20.f:0.f),27,strongFormat,TextInk);
+                std::wstring metadata = j.folderRow ? std::to_wstring(j.completedFiles)+L"/"+std::to_wstring(j.folderCount)+L" 项 · "+FormatBytes(j.done)+L"/"+FormatBytes(j.total) : FormatBytes(j.total);
+                metadata=(active?L"进行中 · ":L"已结束 · ")+metadata;
+                if(j.folderRow&&j.skippedFiles)metadata+=L" · 跳过 "+std::to_wstring(j.skippedFiles)+L" 个文件";
                 if (j.failedFiles) metadata += L" · "+std::to_wstring(j.failedFiles)+L" 个失败";
                 if (j.cancelledFiles) metadata += L" · "+std::to_wstring(j.cancelledFiles)+L" 个未完成";
-                if (j.folderRow && active) metadata += L" · "+FormatBytes(static_cast<uint64_t>(j.speed))+L"/s";
+                if (j.folderRow && active && j.currentTransferring) metadata += L" · "+FormatBytes(static_cast<uint64_t>(j.speed))+L"/s";
                 if (!wide) metadata = (j.receiving ? L"接收 · " : L"发送 · ") + j.peer + L" · " + metadata;
                 c.TextColor(metadata, titleX, wide ? 40.f : 34.f, j.folderRow&&wide?actionX-titleX-12:titleWidth, 25, captionFormat, TextMuted);
                 if (active) {
@@ -779,7 +820,7 @@ struct App {
                         c.BoxColor(statusX, 25, trackWidth, 10, 5, D2D1::ColorF(0xDEE3EC));
                         if (fraction > 0) c.BoxColor(statusX, 25, trackWidth * fraction, 10, 5, Accent);
                         c.TextColor(j.done && fraction*100<.1f ? L"<0.1%" : std::to_wstring(static_cast<unsigned>(fraction * 100)) + L"%", statusX + trackWidth + 6, 15, 48, 28, captionFormat, TextInk);
-                        if(!j.folderRow)c.TextColor(!j.activity.empty() ? j.activity : j.state == State::Running ? FormatBytes(static_cast<uint64_t>(j.speed)) + L"/s" : TransferText(j),
+                        if(!j.folderRow)c.TextColor(!j.activity.empty() ? j.activity : j.state == State::Running ? FormatBytes(static_cast<uint64_t>(j.speed)) + L"/s" : TransferAction(j),
                                     statusX, 42, statusWidth, 22, captionFormat, TextMuted);
                     } else {
                         const float trackWidth = std::max(8.f, actionX - titleX - 10);
@@ -787,15 +828,27 @@ struct App {
                         if (fraction > 0) c.BoxColor(titleX, h - 12, trackWidth * fraction, 5, 2.5f, Accent);
                     }
                 } else if (wide) {
-                    const auto label=j.folderRow?(j.state==State::Failed?L"部分失败":TransferText(j)):j.error.empty()?completed?(j.receiving?L"接收完成":L"发送完成"):TransferText(j):j.error;
+                    const auto label=j.folderRow?(j.state==State::Failed?L"部分失败":TransferAction(j)):j.error.empty()?completed?(j.receiving?L"接收完成":L"发送完成"):TransferAction(j):j.error;
                     c.TextColor(label,statusX,j.folderRow?11.f:22.f,statusWidth,j.folderRow?27.f:34.f,normal,completed?Success:TextMuted);
                 }
-                if (!wide) c.TextColor(j.error.empty() ? TransferText(j) : j.error, titleX, 59,
+                if (!wide) c.TextColor(j.error.empty() ? (j.folderRow?StateText(j.state,j.receiving):TransferAction(j)) : j.error, titleX, 59,
                                       titleWidth, 22, captionFormat, completed ? Success : TextMuted);
+                if (j.folderRow && active) {
+                    const auto detail = j.currentAction + (j.currentFile.empty() ? L"" : L"：" + j.currentFile)+
+                        (j.currentTransferring?L"  ·  "+FormatBytes(j.currentDone)+L" / "+FormatBytes(j.currentTotal):L"")+
+                        (j.stageSummary.empty()?L"":L"  ·  "+j.stageSummary);
+                    IDWriteInlineObject *ellipsis = nullptr;
+                    write->CreateEllipsisTrimmingSign(captionFormat,&ellipsis);
+                    const DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_CHARACTER,L'\\',1};
+                    captionFormat->SetTrimming(&trimming,ellipsis);
+                    c.TextColor(detail,titleX,wide?72.f:84.f,w-titleX-24,22,captionFormat,Accent);
+                    const DWRITE_TRIMMING none{};captionFormat->SetTrimming(&none,nullptr);
+                    if(ellipsis)ellipsis->Release();
+                }
                 c.BoxColor(actionX, (h - 38) / 2, 92, 38, 5, D2D1::ColorF(0xF9FAFC), SoftBorder);
                 const bool retry = j.canRetry && !j.receiving && j.state >= State::Cancelled;
-                c.TextColor(retry ? L"重试" : L"打开文件夹", actionX + 3, (h - 38) / 2, 86, 38, captionFormat,
-                            !retry && j.savedPath.empty() ? D2D1::ColorF(0xA3AAB5) : Accent, DWRITE_TEXT_ALIGNMENT_CENTER);
+                c.TextColor(active?(j.paused?L"继续":L"暂停"):retry ? L"重试" : L"打开文件夹", actionX + 3, (h - 38) / 2, 86, 38, captionFormat,
+                            !active&&!retry && j.savedPath.empty() ? D2D1::ColorF(0xA3AAB5) : Accent, DWRITE_TEXT_ALIGNMENT_CENTER);
                 c.BoxColor(w - 58, (h - 38) / 2, 50, 38, 5, D2D1::ColorF(0xF9FAFC), SoftBorder);
                 c.TextColor(active ? L"取消" : L"删除", w - 56, (h - 38) / 2, 46, 38, captionFormat, Accent, DWRITE_TEXT_ALIGNMENT_CENTER);
             }
@@ -867,7 +920,11 @@ struct App {
             Update();
             return;
         }
-        engine.SendFiles(*it, files);
+        bool pack=false;
+        if(it->browser&&!it->directoryReceive&&!snapshot.config.zipFolders&&std::any_of(files.begin(),files.end(),[](const auto &path){return fs::is_directory(path);})){
+            const TASKDIALOG_BUTTON choices[]={{IDYES,L"打包传输"},{IDCANCEL,L"取消"}};TASKDIALOGCONFIG dialog{};dialog.cbSize=sizeof(dialog);dialog.hwndParent=window;dialog.pszWindowTitle=L"接收端无法接收文件夹";dialog.pszMainInstruction=L"目标 Web 页面不支持直接保存目录";dialog.pszContent=L"建议将文件夹打包为 ZIP 后发送。此操作仅对本次传输生效。";dialog.cButtons=2;dialog.pButtons=choices;dialog.nDefaultButton=IDYES;int selected=IDCANCEL;TaskDialogIndirect(&dialog,&selected,nullptr,nullptr);if(selected!=IDYES)return;pack=true;
+        }
+        engine.SendFiles(*it, files,pack);
         localNotice = L"";
         Update();
     }
@@ -975,7 +1032,7 @@ struct App {
     void NoteDialog();
     void PartialDialog();
     int TaskHeight(size_t index) const {
-        return Px(index<shownJobs.size() ? shownJobs[index].childRow ? shownJobs[index].directoryRow ? 42.f : 66.f : static_cast<float>(taskRowHeight) : height<720?100.f:124.f);
+        return Px(index<shownJobs.size() ? shownJobs[index].childRow ? shownJobs[index].directoryRow ? 48.f : 66.f : static_cast<float>(taskRowHeight+(shownJobs[index].folderRow?24:0)) : height<720?100.f:124.f);
     }
     void TaskHeights(){for(size_t i=0;i<std::max<size_t>(1,shownJobs.size());++i)SendMessageW(tasks,LB_SETITEMHEIGHT,i,TaskHeight(i));}
     bool ToggleTask(WPARAM key = VK_SPACE) {
@@ -996,8 +1053,10 @@ struct App {
     }
     void OpenOrRetryTask() {
         auto found = std::find_if(shownJobs.begin(), shownJobs.end(), [&](auto &j) { return j.id == selectedTask; });
+        if(found!=shownJobs.end()&&found->state<State::Completed){engine.Pause(found->folderRow&&!found->members.empty()?found->members.front():found->id,!found->paused);Update();return;}
         if (found != shownJobs.end() && found->canRetry && !found->receiving && found->state >= State::Cancelled) {
             std::wstring error;
+            if(found->folderRow&&found->state==State::Failed){for(const auto &job:snapshot.transfers)if(job.state==State::Failed&&std::find(found->members.begin(),found->members.end(),job.id)!=found->members.end())engine.RetryTransfer(job.id,error);localNotice=error.empty()?L"失败文件已加入独立重试通道":error;Update();return;}
             auto id = found->id;
             if (found->folderRow) for (const auto &job : snapshot.transfers)
                 if (job.state >= State::Cancelled && std::find(found->members.begin(), found->members.end(), job.id) != found->members.end()) { id = job.id; break; }
@@ -1026,7 +1085,7 @@ struct App {
         if (found == shownJobs.end() || found->state == State::Queued || found->state == State::Waiting ||
             found->state == State::Running)
             return;
-        auto message = std::wstring(found->folderRow ? L"删除此文件夹批次的传输记录及对应文件。\n\n" : L"删除此传输记录及对应文件。\n\n") +
+        auto message = std::wstring(found->folderRow ? L"删除此批次记录及本次传输的文件。目录和跳过的已有文件将保留。\n\n" : L"删除此传输记录及对应文件。目录和跳过的已有文件将保留。\n\n") +
                        (found->savedPath.empty() ? found->name : found->savedPath.wstring());
         if (MessageBoxW(window, message.c_str(), L"删除记录和文件",
                         MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2) != IDOK)
@@ -1035,7 +1094,7 @@ struct App {
         bool removed = true;
         if (found->folderRow) { for (auto id : found->members) if (!engine.DeleteTransfer(id, true, error)) removed = false; }
         else removed = engine.DeleteTransfer(selectedTask, true, error);
-        localNotice = removed ? L"记录和对应文件已删除" : error;
+        localNotice = removed ? L"记录已删除；目录和跳过的已有文件已保留" : error;
         Update();
     }
     void Command(int id, int code) {
@@ -1137,7 +1196,7 @@ struct App {
 
 struct Modal {
     App &app;
-    HWND window = nullptr, name = nullptr, path = nullptr, autoReceive = nullptr, share = nullptr,
+    HWND window = nullptr, name = nullptr, path = nullptr, autoReceive = nullptr, share = nullptr, zipFolders = nullptr,
          port = nullptr, help = nullptr, maxFiles = nullptr, maxBytes = nullptr, itemList = nullptr;
     bool settings = false, done = false, web = false, note = false, approval = false, directory = false;
     uint64_t approvalId = 0;
@@ -1273,7 +1332,10 @@ struct Modal {
             Control(L"STATIC", L"单批大小 / MiB（0 = 无限）", 0, 238, 319, 206, 22, 0);
             maxBytes = Control(L"EDIT", std::to_wstring(cfg.maxTransferBytes / 1048576).c_str(), WS_TABSTOP | ES_NUMBER | ES_AUTOHSCROLL, 238, 347, 206, 31, 13);
             SendMessageW(maxFiles, EM_SETLIMITTEXT, 20, 0); SendMessageW(maxBytes, EM_SETLIMITTEXT, 14, 0);
-            help = Control(L"STATIC", L"上限同时用于发送和接收。关闭自动接收可逐批审批。", SS_LEFT, 24, 394, 420, 42, 0);
+            zipFolders = Control(L"BUTTON", L"发送文件夹时打包为 ZIP（默认关闭）", WS_TABSTOP | BS_AUTOCHECKBOX, 24, 392, 420, 28, 14);
+            SendMessageW(zipFolders, BM_SETCHECK, cfg.zipFolders ? BST_CHECKED : BST_UNCHECKED, 0);
+            help = Control(L"STATIC", L"关闭时逐文件复制，跳过内容相同的文件。", SS_LEFT, 24, 424, 420, 22, 0);
+            Control(L"BUTTON", L"导出诊断日志", WS_TABSTOP | BS_PUSHBUTTON, 24, 457, 150, 33, 15);
             Control(L"BUTTON", L"取消", WS_TABSTOP | BS_PUSHBUTTON, 268, 457, 81, 33, 8);
             Control(L"BUTTON", L"保存", WS_TABSTOP | BS_DEFPUSHBUTTON, 360, 457, 84, 33, 9);
         } else {
@@ -1356,6 +1418,7 @@ struct Modal {
             Config cfg = app.snapshot.config;
             cfg.name = Value(name);
             cfg.receiveDir = Value(path);
+            cfg.zipFolders = SendMessageW(zipFolders, BM_GETCHECK, 0, 0) == BST_CHECKED;
             cfg.autoReceive = SendMessageW(autoReceive, BM_GETCHECK, 0, 0) == BST_CHECKED;
             cfg.shareSoftware = SendMessageW(share, BM_GETCHECK, 0, 0) == BST_CHECKED;
             if (!ValidPort(Value(port), cfg.port)) {
@@ -1408,6 +1471,10 @@ struct Modal {
             self->Paint();
             return 0;
         case WM_COMMAND:
+            if(self->settings&&LOWORD(w)==15&&HIWORD(w)==BN_CLICKED){
+                try{const auto file=self->app.engine.ExportDiagnostics();ShellExecuteW(h,L"open",L"explorer.exe",(L"/select,\""+file.wstring()+L"\"").c_str(),nullptr,SW_SHOWNORMAL);}
+                catch(const std::exception &error){MessageBoxW(h,Wide(error.what()).c_str(),L"日志导出失败",MB_OK|MB_ICONERROR);}
+            }
             if (self->directory && LOWORD(w) == 12 && HIWORD(w) == BN_CLICKED)
                 self->OpenDirectory();
             if (self->web && HIWORD(w) == BN_CLICKED) {
@@ -1545,7 +1612,9 @@ LRESULT CALLBACK WindowProc(HWND h, UINT message, WPARAM w, LPARAM l) {
         return 0;
     case WM_GETMINMAXINFO: {
         auto *m = reinterpret_cast<MINMAXINFO *>(l);
-        m->ptMinTrackSize = {app->Px(920), app->Px(660)};
+        const auto bounds = DefaultWindowBounds(WindowWorkArea(h));
+        m->ptMinTrackSize = {std::min<LONG>(app->Px(920), bounds.right - bounds.left),
+                             std::min<LONG>(app->Px(660), bounds.bottom - bounds.top)};
         return 0;
     }
     case WM_ERASEBKGND:
@@ -1742,13 +1811,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int show) {
                                                 LR_DEFAULTCOLOR));
     cls.hbrBackground = app.white;
     RegisterClassExW(&cls);
-    UINT dpi = GetDpiForSystem();
-    RECT workArea{}; SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
-    const int availableWidth = MulDiv(workArea.right - workArea.left, 96, dpi), availableHeight = MulDiv(workArea.bottom - workArea.top, 96, dpi);
-    RECT r{0, 0, MulDiv(std::clamp(availableWidth - 40, 920, 1280), dpi, 96), MulDiv(std::clamp(availableHeight - 80, 660, 800), dpi, 96)};
-    AdjustWindowRectExForDpi(&r, WS_OVERLAPPEDWINDOW, FALSE, 0, dpi);
+    const auto r = DefaultWindowBounds(WindowWorkArea());
     HWND window = CreateWindowExW(0, cls.lpszClassName, L"传 · 局域网文件传输",
-                                  WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
+                                  WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, r.left, r.top,
                                   r.right - r.left, r.bottom - r.top, nullptr, nullptr, instance, &app);
     if (!window) {
         engine.Stop();

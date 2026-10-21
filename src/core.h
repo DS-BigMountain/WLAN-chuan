@@ -1,4 +1,5 @@
 #pragma once
+#include "pipeline.h"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -9,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <semaphore>
 #include <string>
 #include <thread>
 #include <vector>
@@ -18,8 +20,8 @@
 
 namespace chuan {
 namespace diagnostic { class Log; }
-namespace archive { struct Artifact; }
-inline constexpr wchar_t Version[] = L"2.0";
+namespace archive { struct Artifact; struct Plan; }
+inline constexpr wchar_t Version[] = L"2.1";
 inline constexpr unsigned short DefaultPort = 45871;
 inline constexpr unsigned short DefaultDiscoveryPort = 45872;
 namespace fs = std::filesystem;
@@ -44,6 +46,7 @@ struct Config {
     unsigned short discoveryPort = DefaultDiscoveryPort;
     bool autoReceive = true;
     bool shareSoftware = true;
+    bool zipFolders = false;
     bool automaticName = false;
     uint64_t maxTransferFiles = 0, maxTransferBytes = 0; // Zero disables the business limit.
 };
@@ -56,6 +59,7 @@ struct Peer {
     uint64_t seen = 0;
     bool manual = false;
     bool browser = false;
+    bool directoryReceive = false;
     std::string gateway;
     std::wstring owner;
     bool reachable = true;
@@ -76,10 +80,12 @@ struct Transfer {
     std::wstring name, peer, error, activity;
     fs::path savedPath;
     bool receiving = false;
+    bool directory = false, skipped = false, folderStopped = false;
     bool awaitingApproval = false;
     bool removed = false;
     bool requestOnly = false;
     bool canRetry = false;
+    bool paused = false;
     std::vector<OfferItem> offerItems;
     std::string offerSelection;
     std::wstring folderName;
@@ -89,7 +95,7 @@ struct Transfer {
     double speed = 0;
     uint64_t started = 0;
 };
-inline std::wstring TransferText(const Transfer &job){return job.state<State::Completed&&!job.activity.empty()?job.activity:StateText(job.state,job.receiving);}
+inline std::wstring TransferText(const Transfer &job){return job.skipped ? L"内容相同，已跳过" : job.state<State::Completed&&!job.activity.empty()?job.activity:StateText(job.state,job.receiving);}
 struct Snapshot {
     Config config;
     unsigned short boundPort = 0;
@@ -118,12 +124,14 @@ class Engine {
     bool Start(std::wstring &error);
     void Stop();
     Snapshot GetSnapshot();
+    fs::path ExportDiagnostics(const std::string &client = {});
     bool UpdateConfig(const Config &config, std::wstring &error);
     void Refresh();
     bool AddPeer(const std::string &address, std::wstring &error);
-    void SendFiles(const Peer &peer, const std::vector<fs::path> &files);
+    void SendFiles(const Peer &peer, const std::vector<fs::path> &files,bool forceZip=false);
     bool RetryTransfer(uint64_t id, std::wstring &error);
     void Cancel(uint64_t id);
+    void Pause(uint64_t id, bool paused);
     void Decide(uint64_t id, bool accept);
     void DecideItems(uint64_t id, const std::string &selection);
     bool HasActiveTransfers();
@@ -139,6 +147,9 @@ class Engine {
     struct Job {
         Transfer view;
         std::atomic<bool> cancel{false};
+        std::atomic<bool> paused{false};
+        bool remotePaused=false;
+        bool resumeReset=false;
         int decision = 0;
         std::condition_variable cv;
         std::string webClient, webUpload, webTab;
@@ -147,17 +158,23 @@ class Engine {
         std::string nativeOwner;
         fs::path archiveSource;
         std::shared_ptr<archive::Artifact> archiveFile;
+        std::shared_ptr<archive::Plan> archivePlan;
         std::string folderId, folderKey;
         std::string batchId, selection, asyncOfferKey;
         size_t batchItem = 0;
         std::string recipient;
         BY_HANDLE_FILE_INFORMATION fileIdentity{};
         bool hasIdentity = false;
+        bool verificationPending = false;
         bool staging = false;
         bool hidden = false;
         bool diagnosticReported = false;
+        int traceState=-1;std::wstring tracePhase,traceError;
+        uint64_t traceAt=0,traceCreated=0,traceSample=0,traceBytes=0;
         bool announced = false;
-        uint64_t finishedAt = 0;
+        uint64_t finishedAt = 0,progressBase=0;
+        std::atomic<uint64_t> retryDeadline{0};
+        std::atomic<bool> retryExpired{false};
         std::wstring targetId;
         std::wstring senderName;
         std::set<std::string> hiddenClients;
@@ -209,10 +226,28 @@ class Engine {
         std::set<size_t> announcedItems;
     };
     std::map<std::string, BatchApproval> batchApprovals_;
+    struct WebArchiveStream {
+        SOCKET socket=INVALID_SOCKET;std::mutex mutex;std::atomic<uint64_t> touched{0};
+        std::string client,tab;uint64_t total=0,received=0,offset=0;bool direct=false;
+        std::shared_ptr<Job> job;std::function<void(SOCKET)> close;
+        ~WebArchiveStream(){if(socket!=INVALID_SOCKET&&close)close(socket);}
+    };
+    std::map<std::string,std::shared_ptr<WebArchiveStream>> webArchiveStreams_;
+    void WebArchive(SOCKET socket,const std::map<std::string,std::string> &headers,const std::string &ip,const std::string &path);
+    void ResumeProbe(SOCKET socket,const std::map<std::string,std::string> &headers,const std::string &ip,bool browser);
+
     void ReceiveOffer(SOCKET socket, const std::map<std::string, std::string> &headers, const std::string &ip, bool browser);
     void CompleteOfferLocked(const std::shared_ptr<Job> &job, const std::string &selection);
     void ReceiveOfferStatus(SOCKET socket, const std::map<std::string, std::string> &headers, const std::string &ip, bool browser, bool cancel);
     void ReceiveBatchFiles(SOCKET socket, const std::map<std::string, std::string> &headers, const std::string &ip, bool status, bool browser=true);
+    void ReceivePhase(SOCKET socket,const std::map<std::string,std::string> &headers,const std::string &ip,const std::string &upload,bool browser);
+    void RetryUpload(SOCKET socket,const std::map<std::string,std::string> &headers,const std::string &ip,const std::string &upload,bool browser);
+    void QueueRetry(const Peer &peer,const fs::path &path,const std::shared_ptr<Job> &job);
+    struct RetryItem {Peer peer;fs::path path;std::shared_ptr<Job> job;};
+    std::vector<RetryItem> retryQueue_;
+    std::thread retryThread_,retryTimerThread_;
+    std::condition_variable retryCv_;
+    void RetryLoop();
     int BatchCommand(const Peer &peer,const std::string &path,const std::string &batch,const std::string &body,std::string &response,const std::shared_ptr<Job> &job);
     bool SendOffer(const Peer &peer, const std::string &batch, const std::vector<OfferItem> &items,
                    std::string &selection, std::wstring &error, const std::shared_ptr<Job> &control = {},
@@ -222,6 +257,7 @@ class Engine {
     std::string webToken_;
     struct BrowserSession {
         std::wstring id, name;
+        bool directoryReceive=false;
         std::string platform;
         std::string token, ip;
         std::map<std::string, uint64_t> tabs;
@@ -246,6 +282,10 @@ class Engine {
     bool RequestPeer(const Peer &peer, const std::string &path, const std::string &extra, std::string &body);
     bool PingNow(const Peer &peer, std::wstring &error);
     std::vector<Worker> workers_;
+    std::counting_semaphore<FileProbeLimit> preparationSlots_{FileProbeLimit};
+    std::counting_semaphore<FileVerificationLimit> verificationSlots_{FileVerificationLimit};
+    std::counting_semaphore<FileTransferLimit> transferSlots_{FileTransferLimit};
+    std::atomic<unsigned> diagnosticPreparing_{0},diagnosticVerifying_{0},diagnosticTransferring_{0};
     std::map<SOCKET, std::weak_ptr<Job>> sockets_;
     std::vector<Network> networks_;
     std::atomic<bool> running_{false};
@@ -261,16 +301,18 @@ class Engine {
     void HandleClient(SOCKET socket, const std::string &ip);
     bool HandleWeb(SOCKET socket, const std::string &ip, const std::string &method, const std::string &path,
                    const std::map<std::string, std::string> &headers);
-    void WebDownload(SOCKET socket, const std::string &ip, uint64_t id, const std::string &client = {});
+    void WebDownload(SOCKET socket, const std::string &ip, uint64_t id, const std::string &client = {},bool checksum=false,uint64_t offset=0,const std::string &prefix={},bool range=false);
     void QueueBrowser(const Peer &peer, const fs::path &path, const std::shared_ptr<Job> &job,
                       const fs::path &root = {});
     void RememberFile(const std::shared_ptr<Job> &job, const fs::path &path);
     void ObserveNative(const std::map<std::string, std::string> &headers, const std::string &ip);
+    enum class SendStage { All, Prepare, Probe, Verify, Transfer };
     void SendOne(const Peer &peer, const fs::path &path, const std::wstring &relative,
-                 const std::shared_ptr<Job> &job, const fs::path &webRoot = {});
+                 const std::shared_ptr<Job> &job, const fs::path &webRoot = {}, SendStage stage = SendStage::All);
     std::shared_ptr<Job> NewJob(const std::wstring &name, const std::wstring &peer, uint64_t total,
                                 bool receiving);
     void SetState(const std::shared_ptr<Job> &job, State state, const std::wstring &error = L"");
+    void TraceJobLocked(const std::shared_ptr<Job> &job, bool sample=false);
     void Progress(const std::shared_ptr<Job> &job, uint64_t done);
     void TrackSocket(SOCKET socket, const std::shared_ptr<Job> &job = {});
     void ReleaseSocket(SOCKET socket);
@@ -279,6 +321,6 @@ class Engine {
     std::set<std::string> BusyFoldersLocked();
     std::string Advertisement();
     void ReceiveUpload(SOCKET socket, const std::map<std::string, std::string> &headers,
-                       const std::string &ip, bool browser = false);
+                       const std::string &ip, bool browser = false, bool probe = false);
 };
 } // namespace chuan

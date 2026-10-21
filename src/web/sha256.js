@@ -46,4 +46,5 @@ export class Sha256 {
     for(let i=0;i<tail.length;i+=64)this.compress(tail,i);
     const result=new Uint8Array(32), view=new DataView(result.buffer); this.h.forEach((v,i)=>view.setUint32(i*4,v));return result;
   }
+  clone(){const copy=new Sha256();copy.h.set(this.h);copy.block.set(this.block);copy.used=this.used;copy.bytes=this.bytes;return copy;}
 }

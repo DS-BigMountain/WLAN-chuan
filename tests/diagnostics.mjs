@@ -54,7 +54,15 @@ try {
    });let response='';socket.on('data',b=>response+=b);socket.on('end',()=>resolve(response));socket.on('error',reject);socket.setTimeout(5000,()=>socket.destroy(new Error('timeout')));
  });assert(truncated.startsWith('HTTP/1.1 422'),'interrupted raw upload rejected');
  assert(!(await readdir(path.join(work,'received'))).some(n=>n==='truncated.bin'||n.endsWith('.part')),'interrupted raw upload cleaned');
- await delay(100);
+ assert.equal((await post('/web/api/diagnostics-export',Buffer.alloc(0),{'X-Chuan-Token':'wrong'})).status,403);
+ const exported=await post('/web/api/diagnostics-export',Buffer.alloc(0));assert.equal(exported.status,200);
+ const exportedEvents=exported.body.toString('utf8').trim().split('\n').map(JSON.parse);
+ assert.equal(exportedEvents[0].event,'export_manifest');assert.equal(exportedEvents[0].dropped_events,0);
+ assert(exportedEvents.some(e=>e.event==='file_phase'&&String(e.id)===String(id)));
+ assert(exportedEvents.some(e=>e.event==='transfer_end'&&String(e.id)===String(id)));
+ const otherExport=await request('/web/api/diagnostics-export',{'X-Chuan-Client':other,'X-Chuan-Tab':other,'X-Chuan-Token':otherState.token},Buffer.alloc(0));
+ assert(!otherExport.body.toString('utf8').includes('sample.bin'),'another session cannot export file names from this transfer');
+ await delay(350);
  const directory=path.join(work,'config/logs'),logs=(await readdir(directory)).filter(n=>n.endsWith('.jsonl'));assert.equal(logs.length,1);
  const raw=await readFile(path.join(directory,logs[0]),'utf8'),events=raw.trim().split('\n').map(JSON.parse);
  assert(!raw.includes(token)&&!raw.includes(otherState.token),'session secrets excluded');

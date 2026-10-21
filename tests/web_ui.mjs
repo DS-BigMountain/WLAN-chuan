@@ -16,7 +16,7 @@ const server=http.createServer(async(req,res)=>{
       if(req.url==='/web/api/decision/90'){state.requests=[];state.jobs=[{id:'91',name:'会议纪要.pdf',peer:'BIGMOUNTAIN',total:3355443,done:0,speed:0,state:1,stateText:'等待接收',receiving:true,batchId:'batch-90',uploadKey:''}];state.inbox=[{id:'91',received:false}];}
       res.setHeader('Content-Type','application/json');res.end(req.url==='/web/api/state'?JSON.stringify(state):'');return;
     }
-    const file=req.url==='/'?'index.html':req.url.replace('/web/','');if(!['index.html','app.js','style.css','files.js','transfers.js','sha256.js','session.js','zip_store.js','zip_worker.js'].includes(file)){res.writeHead(404);res.end();return;}
+    const file=req.url==='/'?'index.html':req.url.replace('/web/','');if(!['index.html','app.js','style.css','files.js','transfers.js','sha256.js','session.js','zip_store.js','zip_worker.js','hash_file.js','hash_worker.js','zip_stream_worker.js'].includes(file)){res.writeHead(404);res.end();return;}
     let body=await readFile(path.join('src/web',file),'utf8');
     if(file==='app.js')body=body.replace('poll();setInterval(poll,2000);',`await poll();globalThis.uiTest={
       set(data){latestJobs=data.jobs;inbox=data.files||[];operations.splice(0,operations.length,...(data.ops||[]));renderJobs();},

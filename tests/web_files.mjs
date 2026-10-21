@@ -7,19 +7,21 @@ assert.equal(selectedFiles([file('中文.txt')])[0].path,'中文.txt');
 assert.equal(selectedFiles([file('同名.txt','目录/甲/同名.txt')],true)[0].path,'目录/甲/同名.txt');
 assert.equal(relativePath('目录\\子目录\\说明.txt'),'目录/子目录/说明.txt');
 for(const invalid of ['../x','a/../x','/root','C:\\file','a//b','a/./b',''])assert.throws(()=>relativePath(invalid));
-assert.throws(()=>selectedFiles([file('flat.txt')],true),/未返回文件夹层级/);
+assert.throws(()=>selectedFiles([file('flat.txt')],true),/未提供文件夹目录/);
 const leaf=name=>({name,isFile:true,file(resolve){resolve(file(name));}});
 function directory(name,children) {
   return {name,isDirectory:true,createReader(){let offset=0;return {readEntries(resolve){const batch=children.slice(offset,offset+100);offset+=100;resolve(batch);}};}};
 }
 const root=directory('项目',[directory('甲',[leaf('同名.txt')]),directory('乙',[leaf('同名.txt')]),...Array.from({length:203},(_,i)=>leaf(i+'.txt'))]);
 const result=await droppedFiles({items:[{kind:'file',webkitGetAsEntry:()=>root}],files:[]});
-assert.equal(result.length,205);
-assert.equal(result[0].path,'项目/甲/同名.txt');
-assert.equal(result[1].path,'项目/乙/同名.txt');
+assert.equal(result.length,208);
+assert.deepEqual(result.filter(item=>item.directory).map(item=>item.path),['项目','项目/甲','项目/乙']);
+assert.equal(result.filter(item=>!item.directory)[0].path,'项目/甲/同名.txt');
+assert.equal(result.filter(item=>!item.directory)[1].path,'项目/乙/同名.txt');
 assert.equal(result.at(-1).path,'项目/202.txt');
 assert.equal((await droppedFiles({items:[],files:[file('fallback.txt')]}))[0].path,'fallback.txt');
-assert.deepEqual(await droppedFiles({items:[{kind:'file',webkitGetAsEntry:()=>directory('空',[])}],files:[]}),[]);
+const empty=await droppedFiles({items:[{kind:'file',webkitGetAsEntry:()=>directory('空',[])}],files:[]});
+assert.equal(empty.length,1);assert.equal(empty[0].path,'空');assert(empty[0].directory);assert.equal(empty[0].file.size,0);
 await assert.rejects(()=>droppedFiles({items:[{kind:'file',webkitGetAsEntry:()=>root},{kind:'file'}],files:[]}),/部分拖放项目/);
 await assert.rejects(()=>droppedFiles({items:[{kind:'file',webkitGetAsEntry:()=>({name:'失败',isFile:true,file(resolve,reject){reject(new Error('denied'));}})}],files:[]}),/denied/);
 console.log('PASS relative paths, unsafe paths, directory selection, recursive drop, >100-entry batches, same-name children and read failures');
@@ -35,7 +37,7 @@ const {batchPlan,limitValue}=await import(`data:text/javascript;base64,${source.
 const many=Array.from({length:6001},(_,i)=>({path:`large/${i}.txt`,file:{size:i%7}}));
 let sequence=0;const makeId=()=>String(++sequence);
 const plan=batchPlan(many,makeId);
-assert.equal(plan.entries.length,6001);assert.equal(plan.items.length,1);assert.equal(plan.items[0].count,'6001');
+assert.equal(plan.entries.length,6002);assert.equal(plan.items.length,1);assert.equal(plan.items[0].count,'6002');assert.equal(plan.entries[0].path,'large');assert(plan.entries[0].directory);
 assert.equal(plan.items[0].total,String(many.reduce((total,item)=>total+item.file.size,0)));
 assert(plan.entries.every(entry=>entry.item===0),'folder is a single consent item');
 const loose=batchPlan(Array.from({length:50},(_,i)=>({path:`${i}.txt`,file:{size:2}})),makeId);

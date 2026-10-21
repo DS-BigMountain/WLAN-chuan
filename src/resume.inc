@@ -1,0 +1,20 @@
+// A resume identifier only finds a candidate. Its entire saved prefix must match
+// SHA-256 from the selected source before any bytes can be appended.
+void Engine::ResumeProbe(SOCKET s,const std::map<std::string,std::string> &h,const std::string &ip,bool browser){
+    uint64_t total=0,item=0;const auto key=Get(h,"x-chuan-resume-key"),owner=Get(h,browser?"x-chuan-client":"x-chuan-id");const auto name=SanitizeRelative(Wide(Unhex(Get(h,"x-chuan-path"))));
+    if(Get(h,"content-length")!="0"||!Get(h,"transfer-encoding").empty()||!ResumeKeyValid(key)||name.empty()||!Number(Get(h,"x-chuan-size"),total)||!Number(Get(h,"x-chuan-item"),item)){Reply(s,400,"Bad Request");return;}
+    Config cfg;Peer remote;bool direct=false,paused=false;
+    {std::lock_guard lock(mutex_);cfg=config_;const auto found=batchApprovals_.find(std::string(browser?"web:":"native:")+ip+":"+owner+":"+Get(h,"x-chuan-batch"));
+     if(found==batchApprovals_.end()||item>=found->second.items.size()||found->second.selection[item]!='1'||found->second.cancelledItems.contains(item)){Reply(s,403,"Forbidden");return;}
+     const auto &entry=found->second.items[item];if((entry.folder?!(name.starts_with(entry.name+L"\\")):name!=entry.name)||total>entry.total||found->second.target!=Get(h,"x-chuan-target")){Reply(s,403,"Forbidden");return;}found->second.touched=Now();for(const auto &job:jobs_)if(job->batchId==Get(h,"x-chuan-batch")&&job->webUpload==Get(h,"x-chuan-upload")&&(browser?job->webClient:job->nativeOwner)==owner)paused=job->paused;
+     const auto target=Wide(Unhex(Get(h,"x-chuan-target")));if(browser&&Get(h,"x-chuan-resume-direct")=="1"&&!target.empty()&&target!=cfg.id){for(const auto &p:peers_)if(p.id==target){remote=p;direct=!p.browser||!p.owner.empty();break;}}
+    }
+    if(direct){SOCKET peer=Connect(remote.gateway.empty()?remote.ip:remote.gateway,remote.port);if(peer==INVALID_SOCKET){Reply(s,502,"Bad Gateway");return;}TrackSocket(peer);SetTimeout(peer,150000,30000);std::string query="POST /api/resume HTTP/1.1\r\nHost: "+remote.ip+":"+std::to_string(remote.port)+"\r\nConnection: close\r\nX-Chuan-Id: "+Hex(Utf8(cfg.id))+"\r\nX-Chuan-Server: "+Utf8(remote.owner.empty()?remote.id:remote.owner)+"\r\n";
+      for(const auto *field:{"x-chuan-resume-key","x-chuan-resume-reset","x-chuan-path","x-chuan-size","x-chuan-batch","x-chuan-item","x-chuan-upload"})query+=std::string(field)+": "+Get(h,field)+"\r\n";
+      std::string reply,body;std::map<std::string,std::string> headers;uint64_t length=0;bool ok=SendAll(peer,query+"Content-Length: 0\r\n\r\n")&&ReadHeader(peer,reply,headers)&&Number(Get(headers,"content-length"),length)&&length<=4096;if(ok){body.resize(static_cast<size_t>(length));ok=ReadExact(peer,body.data(),body.size());}ReleaseSocket(peer);Reply(s,ok&&reply.starts_with("HTTP/1.1 200 ")?200:409,ok?"OK":"Conflict",body,"application/json");return;}
+    auto base=cfg.receiveDir;if(browser){const auto target=Wide(Unhex(Get(h,"x-chuan-target")));if(!target.empty()&&target!=cfg.id)base=cfg.dataDir/L"relay";}
+    try{fs::create_directories(base);const auto partial=ResumePath(base,owner,name,total,key);const auto attributes=GetFileAttributesW(partial.c_str());if(attributes!=INVALID_FILE_ATTRIBUTES&&(attributes&(FILE_ATTRIBUTE_REPARSE_POINT|FILE_ATTRIBUTE_DIRECTORY)))throw std::runtime_error("unsafe resume file");
+      uint64_t offset=0;if(attributes!=INVALID_FILE_ATTRIBUTES){WinFile file(CreateFileW(partial.c_str(),GENERIC_READ|(Get(h,"x-chuan-resume-reset")=="1"?GENERIC_WRITE:0),FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr));LARGE_INTEGER size{};if(file.value==INVALID_HANDLE_VALUE||!GetFileSizeEx(file.value,&size))throw std::runtime_error("续传数据正在使用");offset=static_cast<uint64_t>(size.QuadPart);if(offset>total)throw std::runtime_error("续传长度无效");if(Get(h,"x-chuan-resume-reset")=="1"){if(!SetEndOfFile(file.value))throw std::runtime_error("无法重置续传数据");offset=0;}}
+      Reply(s,200,"OK","{\"offset\":"+std::to_string(offset)+",\"paused\":"+(paused?"true":"false")+"}","application/json");
+    }catch(const std::exception &error){Reply(s,409,"Conflict",error.what());}
+}

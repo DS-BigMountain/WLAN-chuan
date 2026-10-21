@@ -18,7 +18,7 @@ const server=http.createServer(async(req,res)=>{
       req.resume();res.setHeader('Content-Type','application/json');res.end(req.url==='/web/api/state'?JSON.stringify(state):'');return;
     }
     const file=req.url==='/'?'index.html':req.url.replace('/web/','');
-    if(!['index.html','app.js','style.css','files.js','transfers.js','sha256.js','session.js','zip_store.js','zip_worker.js','approvals.js'].includes(file)){res.writeHead(404);res.end();return;}
+    if(!['index.html','app.js','style.css','files.js','transfers.js','sha256.js','session.js','zip_store.js','zip_worker.js','hash_file.js','hash_worker.js','zip_stream_worker.js','approvals.js'].includes(file)){res.writeHead(404);res.end();return;}
     let body=await readFile(file==='app.js'&&baseline?process.argv[3]:path.join('src/web',file),'utf8');
     if(file==='app.js')body=body.replace('poll();setInterval(poll,2000);',`await poll();
       globalThis.renderTest={

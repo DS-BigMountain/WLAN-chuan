@@ -75,6 +75,7 @@ int wmain(int argc,wchar_t **argv){try{
     sample.transfers=preview;const auto previewGroup=TransferGroup(preview.front());app.expandedFolders={previewGroup,previewGroup+"|"+Utf8(L"HT\\产品资料")};
     RECT size{0,0,1280,1000};AdjustWindowRectEx(&size,WS_OVERLAPPEDWINDOW,FALSE,0);SetWindowPos(parent,nullptr,0,0,size.right-size.left,size.bottom-size.top,SWP_NOMOVE|SWP_NOACTIVATE|SWP_NOZORDER);app.Update(&sample);app.Layout();Capture(app,root/L"native-inline-folder.bmp");
     Check(app.shownJobs.size()==6,"expanded preview has parent, directory and four file rows");Check(SendMessageW(app.tasks,LB_GETITEMHEIGHT,2,0)<SendMessageW(app.tasks,LB_GETITEMHEIGHT,0,0),"file rows are more compact than parent");
+    size={0,0,980,900};AdjustWindowRectEx(&size,WS_OVERLAPPEDWINDOW,FALSE,0);SetWindowPos(parent,nullptr,0,0,size.right-size.left,size.bottom-size.top,SWP_NOMOVE|SWP_NOACTIVATE|SWP_NOZORDER);app.Layout();Capture(app,root/L"native-inline-folder-narrow.bmp");
     app.scale=1.5f;app.Fonts();size={0,0,1920,1500};AdjustWindowRectEx(&size,WS_OVERLAPPEDWINDOW,FALSE,0);SetWindowPos(parent,nullptr,0,0,size.right-size.left,size.bottom-size.top,SWP_NOMOVE|SWP_NOACTIVATE|SWP_NOZORDER);app.Layout();Capture(app,root/L"native-inline-folder-150.bmp");
     DestroyWindow(parent);CoUninitialize();std::cout<<"PASS native inline HT hierarchy: 1490 files, row states, collapse, compact heights, progress and 150% layout\n";return 0;
 }catch(const std::exception &error){std::cerr<<error.what()<<'\n';return 1;}}

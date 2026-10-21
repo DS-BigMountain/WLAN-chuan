@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>传 · Web 界面方案</title>
+  <link rel="stylesheet" href="ui.css">
+  <script defer src="ui.js"></script>
+</head>
+<body data-layout="desktop">
+<svg class="symbols" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><defs>
+<symbol id="i-transfer" viewBox="0 0 24 24"><path d="M4 7h15m-4-4 4 4-4 4M20 17H5m4-4-4 4 4 4"/></symbol>
+<symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 16V3m-5 5 5-5 5 5M4 14v7h16v-7"/></symbol>
+<symbol id="i-download" viewBox="0 0 24 24"><path d="M12 3v13m-5-5 5 5 5-5M4 17v4h16v-4"/></symbol>
+<symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 10a8 8 0 1 0-1 8M20 3v7h-7"/></symbol>
+<symbol id="i-computer" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M12 17v4m-4 0h8"/></symbol>
+<symbol id="i-browser" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="18" rx="2"/><path d="M2 8h20M6 5.5h.1m3 0h.1"/></symbol>
+<symbol id="i-ping" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3"/><path d="M12 1v4m0 14v4M1 12h4m14 0h4"/></symbol>
+<symbol id="i-note" viewBox="0 0 24 24"><path d="m5 18 1-5L16 3l5 5-10 10H5Zm-1 4h16"/></symbol>
+<symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7V5h6l3 3h9v12H3V7Z"/></symbol>
+<symbol id="i-file" viewBox="0 0 24 24"><rect x="5" y="3" width="14" height="18" rx="2"/><path d="M9 10h6m-6 4h6"/></symbol>
+<symbol id="i-delete" viewBox="0 0 24 24"><path d="M4 6h16M9 3h6M6 9l1 12h10l1-12M10 10v7m4-7v7"/></symbol>
+<symbol id="i-stop" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2"/></symbol>
+</defs></svg>
+<header class="app-header">
+  <div class="brand"><img src="assets/chuan.svg" width="44" height="44" alt=""><div><strong>传</strong><span>局域网文件传输</span></div></div>
+  <div class="identity"><span id="client-identity"></span><span>服务主机：BIGMOUNTAIN · 192.168.1.12</span></div>
+  <span class="connection-badge"><span class="online-dot"></span><span id="connection-label">已连接服务主机</span></span>
+  <div class="header-actions"><button id="limits-button">设置</button><button id="native-client" class="desktop-only"><svg class="icon"><use href="#i-download"/></svg>Windows 客户端</button></div>
+</header>
+<div id="notice" class="notice" role="status" hidden></div>
+<div class="workspace">
+  <aside class="sidebar">
+    <div class="section-heading"><h2>附近设备 <span class="count">3</span></h2><button id="refresh" class="icon-button" aria-label="刷新设备"><svg class="icon"><use href="#i-refresh"/></svg></button></div>
+    <div id="device-list" class="device-list"></div>
+    <div class="peer-tools"><button id="ping"><svg class="icon"><use href="#i-ping"/></svg>Ping</button><button id="note"><svg class="icon"><use href="#i-note"/></svg>IP 备注</button></div>
+    <div class="host-summary"><span>当前浏览器</span><strong id="sidebar-identity"></strong><span id="sidebar-ip"></span><hr><span>服务地址</span><code>http://192.168.1.12:45871/</code></div>
+  </aside>
+  <main class="main">
+    <div class="content-heading desktop-only"><div><h1>文件传输</h1><p>选择目标设备后发送文件</p></div><span id="target-mode" class="muted"></span></div>
+    <div id="target-bar" class="target-bar">
+      <svg class="icon target-icon"><use id="target-glyph" href="#i-computer"/></svg>
+      <div class="target-copy"><span>目标设备</span><strong id="target-name">DESKTOP-02</strong><small id="target-ip">192.168.1.20</small></div>
+      <span id="route-label" class="route-label">经 BIGMOUNTAIN 转发</span>
+      <button id="switch-device" class="mobile-only">切换</button>
+    </div>
+    <nav class="mobile-tabs mobile-only" aria-label="传输视图">
+      <button data-tab="send" class="active"><svg class="icon"><use href="#i-upload"/></svg>发送</button>
+      <button data-tab="receive"><svg class="icon"><use href="#i-download"/></svg>接收 <span id="request-count" class="tab-count">1</span></button>
+      <button data-tab="status"><svg class="icon"><use href="#i-transfer"/></svg>状态 <span id="job-count" class="tab-count neutral">2</span></button>
+    </nav>
+    <section class="send-section" data-view="send" aria-label="发送文件">
+      <div id="drop" class="drop">
+        <span class="upload-icon"><svg class="icon"><use href="#i-upload"/></svg></span>
+        <h2 id="drop-title">拖入文件或文件夹</h2><p id="drop-destination">发送至 DESKTOP-02</p>
+        <div class="file-actions"><button id="choose-files" class="primary"><svg class="icon"><use href="#i-file"/></svg>选择文件</button><button id="choose-folder"><svg class="icon"><use href="#i-folder"/></svg>选择文件夹</button></div>
+        <p class="mobile-only directory-help">当前浏览器不支持文件夹选择，请压缩后发送。</p>
+      </div>
+      <div class="route-description"><span class="online-dot"></span><span id="send-route">浏览器 → BIGMOUNTAIN → DESKTOP-02</span></div>
+      <div class="mobile-current mobile-only"><div class="section-heading"><h2>当前传输</h2><button id="show-status" class="text-button">查看状态</button></div><div id="mobile-current-job"></div></div>
+    </section>
+    <section id="receive-section" class="receive-section" data-view="receive" aria-label="接收审批">
+      <div class="request-heading"><svg class="icon"><use href="#i-download"/></svg><div><h2>待确认的接收请求</h2><p>来自 BIGMOUNTAIN · 2 个项目 · 86 MB</p></div><span class="status-tag amber">待确认</span></div>
+      <div class="directory-notice"><strong>文件夹接收不可用</strong><span>此页面无法写入本地目录。可选择单文件接收；文件夹请使用 Windows 客户端，或先压缩后发送。</span></div>
+      <div class="choices">
+        <label class="choice unavailable"><input type="checkbox" id="receive-folder" disabled><svg class="icon"><use href="#i-folder"/></svg><span><strong>方案图纸</strong><small>8 个文件 · 82.8 MB · 文件夹按整体接收</small></span><em>目录写入不可用</em></label>
+        <label class="choice"><input type="checkbox" id="receive-file"><svg class="icon"><use href="#i-file"/></svg><span><strong>会议纪要.pdf</strong><small>1 个文件 · 3.2 MB</small></span></label>
+      </div>
+      <div class="request-actions"><span id="selection-summary">尚未选择接收项目</span><div><button id="reject-request">拒绝</button><button id="accept-all" disabled title="当前页面无法接收此批次中的文件夹">全部接受</button><button id="accept-selected" class="primary" disabled>接受所选</button></div></div>
+    </section>
+    <section id="receive-empty" class="receive-empty" data-view="receive" hidden><svg class="icon"><use href="#i-download"/></svg><h2>暂无待确认请求</h2><p>已接受的单文件可在“状态”中下载。</p><button id="receive-show-status" class="primary">查看状态</button></section>
+    <section class="jobs-section" data-view="status" aria-label="本次传输">
+      <div class="section-heading"><h2>本次传输</h2><div class="filters desktop-only"><button data-filter="all" class="active">全部</button><button data-filter="send">发送</button><button data-filter="receive">接收</button></div><button id="clear-finished" class="text-button"><svg class="icon"><use href="#i-delete"/></svg>清除已结束</button></div>
+      <div id="jobs" class="jobs"></div>
+      <div class="browser-save-note"><svg class="icon"><use href="#i-browser"/></svg>单文件由浏览器处理下载；请在浏览器下载列表中核对保存结果。</div>
+    </section>
+  </main>
+</div>
+<footer><span>本次浏览器会话</span><span>服务地址：http://192.168.1.12:45871/</span><span>传 · 局域网文件传输</span></footer>
+<dialog id="device-dialog"><div class="dialog-heading"><h2>选择目标设备</h2><button data-close="device-dialog" class="text-button">关闭</button></div><div id="sheet-device-list"></div><p class="muted">选择后返回发送视图，已有任务的目标保持不变。</p></dialog>
+<dialog id="limits-dialog"><form id="limits-form"><div class="dialog-heading"><h2>传输上限</h2><button type="button" data-close="limits-dialog" class="text-button">关闭</button></div><p>0 表示不限制；服务主机与接收方的上限仍然有效。</p><label>单批文件数量<input id="limit-files" inputmode="numeric" value="0" pattern="[0-9]+" required></label><label>单批总大小（MiB）<input id="limit-size" inputmode="numeric" value="0" pattern="[0-9]+" required></label><p id="limits-error" class="error" role="alert"></p><button class="primary" type="submit">保存</button></form></dialog>
+<dialog id="note-dialog"><form id="note-form"><div class="dialog-heading"><h2>IP 临时备注</h2><button type="button" data-close="note-dialog" class="text-button">关闭</button></div><p id="note-ip"></p><label>备注<input id="note-value" maxlength="48" autocomplete="off"></label><p>备注仅在当前浏览器会话中可见。</p><button class="primary" type="submit">保存</button></form></dialog>
+</body>
+</html>

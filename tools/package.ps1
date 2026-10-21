@@ -93,9 +93,9 @@ function Get-StreamSha256([IO.Stream]$Stream) {
 
 $taskChinaTime = [TimeZoneInfo]::ConvertTimeBySystemTimeZoneId([DateTime]::UtcNow, 'China Standard Time')
 $taskStamp = $taskChinaTime.ToString('yyyyMMdd-HHmmss')
-$taskReleaseRoot = if ($VersionedRelease) { Join-Path $taskProjectRoot ('__release_packages__\' + $taskVersion) } else { Join-Path $taskProjectRoot '__release_packages__\临时' }
-$taskPackageDir = Join-Path $taskReleaseRoot $taskStamp
-if (Test-Path -LiteralPath $taskPackageDir) { throw '同一时间的交付目录已存在；已有交付包不覆盖。' }
+$taskReleaseRoot = if ($VersionedRelease) { Join-Path $taskProjectRoot ('__release_packages__\V' + $taskVersion) } else { Join-Path $taskProjectRoot '__release_packages__\临时' }
+$taskPackageDir = if ($VersionedRelease) { $taskReleaseRoot } else { Join-Path $taskReleaseRoot $taskStamp }
+if (Test-Path -LiteralPath $taskPackageDir) { throw '交付目录已存在；已有交付包不覆盖。' }
 New-Item -ItemType Directory -Path $taskPackageDir | Out-Null
 # 仅校正本次新建的交付目录，避免继承构建工作区的低完整性标签。
 Set-PackageMediumIntegrity $taskPackageDir $true

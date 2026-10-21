@@ -11,7 +11,7 @@ for(const file of ['index.html','style.css','app.js','files.js','transfers.js','
   const response=await fetch(origin+(file==='index.html'?'/':'/web/'+file));assert.equal(response.status,200);
   assert.deepEqual(Buffer.from(await response.arrayBuffer()),await readFile('src/web/'+file),file);
 }
-for(const [url,local] of [['/download/Chuan.exe','build/v2.0/Release/Chuan.exe'],['/download/Chuan.apk','mobile/build/outputs/Chuan-2.0-android.apk']]){
+for(const [url,local] of [['/download/Chuan.exe','build/v2.1/Release/Chuan.exe'],['/download/Chuan.apk','mobile/build/outputs/Chuan-2.1-android.apk']]){
   const response=await fetch(origin+url);assert.equal(response.status,200);
   assert.match(response.headers.get("content-disposition"),/attachment; filename=/);assert.deepEqual(Buffer.from(await response.arrayBuffer()),await readFile(local),url);
 }
