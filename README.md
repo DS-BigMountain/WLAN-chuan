@@ -4,7 +4,7 @@
 
 **传（Chuan）** 用于在同一局域网内的设备之间快速传输文件与文件夹，提供 Windows 桌面客户端、Android 应用以及内置 Web 访问能力。程序无需部署独立服务器，也不依赖 Node.js、Python 等运行环境，可通过局域网自动发现设备或手动指定 IP 地址建立连接。
 
-当前版本：**V2.1**
+当前版本：**V2.1.0**
 
 ## 功能特性
 
@@ -114,7 +114,7 @@ cmake --build .\build\v2.1 --config Release --target Chuan
 .\tools\package.ps1 -BuildDirectory ".\build\v2.1"
 ```
 
-打包脚本沿用项目当前版本，默认在 `__release_packages__\临时\时间\` 中创建交付目录；指定 `-VersionedRelease` 时，文件直接写入 `__release_packages__\<版本号>\`，目标目录已存在时停止打包。脚本验证可执行文件内容、签名状态及 ZIP 内容。脚本将本次交付目录和可执行文件设置为中完整性级别，避免继承构建目录的低完整性标签。
+打包脚本沿用项目当前版本，默认在 `__release_packages__\临时\时间\` 中创建交付目录；指定 `-VersionedRelease` 时，文件直接写入 `__release_packages__\Vx.x.x\`，目标目录已存在时停止打包。脚本验证可执行文件内容、签名状态及 ZIP 内容。脚本将本次交付目录和可执行文件设置为中完整性级别，避免继承构建目录的低完整性标签。
 
 ## 快速开始
 
@@ -225,7 +225,7 @@ Web 客户端支持：
 
 ## Android 使用方法
 
-Android 应用源码位于项目根目录的 `mobile/` 文件夹，当前版本为 **2.1**。
+Android 应用源码位于项目根目录的 `mobile/` 文件夹，当前版本为 **V2.1.0**。
 
 ### 安装与桌面下载入口
 

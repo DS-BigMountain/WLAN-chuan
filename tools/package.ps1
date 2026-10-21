@@ -19,6 +19,7 @@ $taskVersionMatch = [regex]::Match((Get-Content -LiteralPath (Join-Path $taskPro
                                   'project\(Chuan\s+VERSION\s+(\d+\.\d+(?:\.\d+)?)\s')
 if (-not $taskVersionMatch.Success) { throw '无法读取当前软件版本号。' }
 $taskVersion = $taskVersionMatch.Groups[1].Value
+$taskReleaseVersion = 'V' + $taskVersion + $(if ($taskVersion.Split('.').Count -eq 2) { '.0' } else { '' })
 if (-not (Test-Path -LiteralPath $taskSourceExe -PathType Leaf)) { throw '请先完成指定目录中的 Release 构建。' }
 if ((Get-Item -LiteralPath $taskSourceExe).VersionInfo.ProductVersion -ne $taskVersion) {
     throw '可执行文件版本与项目当前版本不一致。'
@@ -93,7 +94,7 @@ function Get-StreamSha256([IO.Stream]$Stream) {
 
 $taskChinaTime = [TimeZoneInfo]::ConvertTimeBySystemTimeZoneId([DateTime]::UtcNow, 'China Standard Time')
 $taskStamp = $taskChinaTime.ToString('yyyyMMdd-HHmmss')
-$taskReleaseRoot = if ($VersionedRelease) { Join-Path $taskProjectRoot ('__release_packages__\' + $taskVersion) } else { Join-Path $taskProjectRoot '__release_packages__\临时' }
+$taskReleaseRoot = if ($VersionedRelease) { Join-Path $taskProjectRoot ('__release_packages__\' + $taskReleaseVersion) } else { Join-Path $taskProjectRoot '__release_packages__\临时' }
 $taskPackageDir = if ($VersionedRelease) { $taskReleaseRoot } else { Join-Path $taskReleaseRoot $taskStamp }
 if (Test-Path -LiteralPath $taskPackageDir) { throw '交付目录已存在；已有交付包不覆盖。' }
 New-Item -ItemType Directory -Path $taskPackageDir | Out-Null
