@@ -21,7 +21,7 @@
 namespace chuan {
 namespace diagnostic { class Log; }
 namespace archive { struct Artifact; struct Plan; }
-inline constexpr wchar_t Version[] = L"2.1";
+inline constexpr wchar_t Version[] = L"2.1.1";
 inline constexpr unsigned short DefaultPort = 45871;
 inline constexpr unsigned short DefaultDiscoveryPort = 45872;
 namespace fs = std::filesystem;
