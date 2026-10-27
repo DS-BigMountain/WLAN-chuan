@@ -2,7 +2,7 @@
 
 传用于同一局域网内的文件与文件夹传输，提供 Windows 客户端、Android 应用和浏览器访问入口，无需部署独立服务器。
 
-当前版本：**V2.1.0**。安装包与便携包见 [GitHub Releases](https://github.com/DS-BigMountain/WLAN-chuan/releases)。
+当前版本：**V2.1.1**。安装包与便携包见 [GitHub Releases](https://github.com/DS-BigMountain/WLAN-chuan/releases)。
 
 ## 主要功能
 

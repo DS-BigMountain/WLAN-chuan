@@ -2179,6 +2179,9 @@ void Engine::ReceiveUpload(SOCKET s, const std::map<std::string, std::string> &h
     const auto recipientId = Wide(Unhex(Get(h, "x-chuan-recipient")));
     Peer browserPeer;
     if (!recipientId.empty()) {
+        if (Get(h, "x-chuan-batch").empty()) {
+            Reply(s, 409, "Conflict", Utf8(L"浏览器接收文件需要批次审批")); return;
+        }
         auto snapshot = GetSnapshot();
         auto found = std::find_if(snapshot.peers.begin(), snapshot.peers.end(), [&](auto &p) { return p.id == recipientId && p.browser && p.owner.empty(); });
         if (browser || found == snapshot.peers.end() || !cfg.shareSoftware) { Reply(s, 409, "Conflict"); return; }
@@ -2436,9 +2439,12 @@ void Engine::ReceiveUpload(SOCKET s, const std::map<std::string, std::string> &h
         Reply(s,208,"Already Reported","{\"id\":"+Json(std::to_string(j->view.id))+",\"skipped\":true}","application/json"); return;
     }
     ULARGE_INTEGER available{};
-    if (!GetDiskFreeSpaceExW(cfg.receiveDir.c_str(), &available, nullptr, nullptr) ||
+    const bool spaceKnown = GetDiskFreeSpaceExW(cfg.receiveDir.c_str(), &available, nullptr, nullptr) != FALSE;
+    if (!spaceKnown ||
         total-resumeOffset > available.QuadPart || available.QuadPart - (total-resumeOffset) < 2 * 1024 * 1024) {
-        Reply(s, 507, "Insufficient Storage");
+        const auto reason = spaceKnown ? L"接收目录磁盘空间不足" : L"无法查询接收目录可用空间";
+        SetState(j, State::Failed, reason);
+        Reply(s, 507, "Insufficient Storage", Utf8(reason));
         return;
     }
     diagnostic_->Write("\"event\":\"receive_space\",\"id\":"+std::to_string(j->view.id)+",\"available_bytes\":"+std::to_string(available.QuadPart)+",\"remaining_bytes\":"+std::to_string(total-resumeOffset)+",\"resume_offset\":"+std::to_string(resumeOffset));

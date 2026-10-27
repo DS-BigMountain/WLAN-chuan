@@ -10,7 +10,7 @@ import static local.chuan.core.Protocol.*;
 
 /** Chuan protocol 1 host. No Android dependencies: exercised against the Windows host on the JVM. */
 public final class Engine implements Closeable {
-    public static final String VERSION="2.1";
+    public static final String VERSION="2.1.1";
     static final long BROWSER_PRESENCE_GRACE=5*60*1000L;
     public static final class Config {
         public volatile String id=random(),name="Android 手机";
