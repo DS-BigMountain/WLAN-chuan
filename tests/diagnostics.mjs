@@ -71,6 +71,8 @@ try {
  assert(events.some(e=>e.event==='transfer_end'&&e.result==='sent_to_socket'&&e.done_bytes===data.length));
  assert(events.some(e=>e.event==='transfer_end'&&e.failure_stage==='checksum'&&e.result==='failed'));
  const fastEnd=events.find(e=>e.event==='transfer_end'&&String(e.id)===String(fastId));assert.equal(fastEnd.result,'length_checked_and_saved');assert.equal(fastEnd.hash_ms,0);assert.equal(fastEnd.done_bytes,data.length);
+ assert.equal(fastEnd.disk_write_calls,Math.ceil(data.length/(256*1024)),'TCP fragments are coalesced into disk blocks');assert(fastEnd.receive_calls>=fastEnd.disk_write_calls);
+ assert(events.some(e=>e.event==='transfer_end'&&e.result==='sent_to_socket'&&e.send_mode==='overlapped'&&e.send_queue_limit_bytes===4*1024*1024));
  assert.equal(events.filter(e=>e.event==='browser_upload_report').length,1);
  assert(events.every(e=>!Number.isNaN(Date.parse(e.utc))));
  console.log('PASS upload/download integrity, phase timings, TCP metadata, browser report ownership, validation, deduplication, checksum failure, JSONL and secret exclusion');

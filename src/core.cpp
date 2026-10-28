@@ -3,6 +3,9 @@
 #include "transfer_view.h"
 #include "zip_store.h"
 #include "pipeline.h"
+#include "socket_send_queue.h"
+#include "parallel_reader.h"
+#include "segment_connections.h"
 #include <algorithm>
 #include <bcrypt.h>
 #include <cctype>
@@ -19,6 +22,9 @@
 
 namespace chuan {
 namespace {
+thread_local bool allowConnectionReuse=false;
+thread_local bool reuseConnection=false;
+thread_local std::string requestTraceId;
 bool PermanentTransferFailure(const std::wstring &message){
     return message.find(L"同名文件")!=std::wstring::npos||message.find(L"类型冲突")!=std::wstring::npos||
         message.find(L"原文件已保留")!=std::wstring::npos||message.find(L"源文件")!=std::wstring::npos||message.find(L"文件路径已变更")!=std::wstring::npos;
@@ -228,10 +234,15 @@ bool ReadHeader(SOCKET s, std::string &first, std::map<std::string, std::string>
 }
 void Reply(SOCKET s, int status, const std::string &reason, const std::string &body = "",
            const std::string &type = "text/plain; charset=utf-8") {
+    reuseConnection=false;
     SendAll(s, "HTTP/1.1 " + std::to_string(status) + " " + reason +
                    "\r\nConnection: close\r\nContent-Type: " + type +
                    "\r\nContent-Length: " + std::to_string(body.size()) +
                    "\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\n\r\n" + body);
+}
+void ReplyReusable(SOCKET s,int status,const std::string &reason){
+    reuseConnection=SendAll(s,"HTTP/1.1 "+std::to_string(status)+" "+reason+"\r\nConnection: "+
+        (allowConnectionReuse?"keep-alive":"close")+"\r\nContent-Length: 0\r\nCache-Control: no-store\r\n\r\n")&&allowConnectionReuse;
 }
 std::string Get(const std::map<std::string, std::string> &h, const std::string &key) {
     auto i = h.find(key);
@@ -891,6 +902,7 @@ void Engine::Stop() {
     }
     if(retryThread_.joinable())retryThread_.join();
     if(retryTimerThread_.joinable())retryTimerThread_.join();
+    {std::lock_guard lock(mutex_);for(auto &[ticket,channel]:parallelUploads_)channel->Close();parallelUploads_.clear();}
     if (serverThread_.joinable())
         serverThread_.join();
     if (discoveryThread_.joinable())
@@ -920,12 +932,14 @@ void Engine::Stop() {
 }
 void Engine::TrackSocket(SOCKET s, const std::shared_ptr<Job> &job) {
     std::lock_guard lock(socketsMutex_);
+    diagnostic_->transport.Register(s);
     sockets_[s] = job;
     if (!running_ || (job&&job->retryExpired))
         shutdown(s, SD_BOTH);
 }
 void Engine::ReleaseSocket(SOCKET s) {
     std::lock_guard lock(socketsMutex_);
+    diagnostic_->transport.Close(s);
     sockets_.erase(s);
     closesocket(s);
 }
@@ -967,7 +981,7 @@ bool Engine::IsLocal(const std::string &ip) const {
             return true;
     return false;
 }
-Snapshot Engine::GetSnapshot() {
+Snapshot Engine::GetSnapshot(const std::string &browserClient) {
     std::lock_guard lock(mutex_);
     ExpireLocked();
     Snapshot out;
@@ -987,7 +1001,18 @@ Snapshot Engine::GetSnapshot() {
     // Keep the accepted request visible until its concrete manifest arrives.
     // Both sides of this handoff are sampled under the same engine lock.
     for(const auto &job:jobs_)if(job->view.requestOnly&&job->view.state==State::Completed&&!job->cancel&&job->selection.find('1')!=std::string::npos){
-        bool registered=false;for(const auto &other:jobs_)if(!other->view.requestOnly&&other->batchId==job->batchId&&other->view.receiving&&other->webClient==job->webClient&&other->nativeOwner==job->nativeOwner){registered=true;break;}
+        // Browser consent belongs to its recipient, not to the host receive list.
+        if(!job->recipient.empty()&&job->recipient!=browserClient)continue;
+        if(job->hiddenClients.contains(browserClient))continue;
+        bool registered=false;
+        for(const auto &other:jobs_){
+            if(other->view.requestOnly||other->batchId!=job->batchId)continue;
+            const bool received=other->view.receiving&&other->webClient==job->webClient&&other->nativeOwner==job->nativeOwner;
+            // A local browser downloads the existing outgoing job; no receiving job is created.
+            const bool localDelivery=!other->view.receiving&&!job->recipient.empty()&&other->recipient==job->recipient&&
+                job->webClient.empty()&&other->webClient.empty()&&job->nativeOwner==Hex(Utf8(config_.id));
+            if(received||localDelivery){registered=true;break;}
+        }
         if(registered||(!job->targetId.empty()&&job->targetId!=config_.id&&job->recipient.empty()))continue;
         auto pending=job->view;pending.requestOnly=false;pending.awaitingApproval=false;pending.state=State::Waiting;pending.activity=L"已接收，等待发送端开始";pending.error.clear();pending.total=0;pending.done=0;
         size_t accepted=0;for(size_t i=0;i<job->view.offerItems.size();++i)if(i<job->selection.size()&&job->selection[i]=='1'){if(!accepted)pending.name=job->view.offerItems[i].name;pending.total+=job->view.offerItems[i].total;++accepted;}if(accepted>1)pending.name+=L" 等 "+std::to_wstring(accepted)+L" 项";out.transfers.push_back(std::move(pending));
@@ -1188,7 +1213,14 @@ void Engine::ServerLoop() {
         TrackSocket(s);
         if (!Launch([this, s, ip = std::string(ip)] {
                 try {
-                    HandleClient(s, ip);
+                    do{
+                        reuseConnection=false;allowConnectionReuse=false;HandleClient(s,ip);
+                        if(!running_||!reuseConnection)break;
+                        TrackSocket(s);
+                        fd_set readable;FD_ZERO(&readable);FD_SET(s,&readable);timeval idle{4,0};
+                        if(select(0,&readable,nullptr,nullptr,&idle)<=0)break;
+                        char byte=0;if(recv(s,&byte,1,MSG_PEEK)<=0)break;
+                    }while(running_);
                 } catch (...) {
                     Reply(s, 500, "Internal Server Error");
                 }
@@ -1228,6 +1260,11 @@ void Engine::HandleClient(SOCKET s, const std::string &ip) {
         Reply(s, 400, "Bad Request");
         return;
     }
+    auto connection=Get(headers,"connection");std::transform(connection.begin(),connection.end(),connection.begin(),[](unsigned char c){return static_cast<char>(std::tolower(c));});
+    requestTraceId=Get(headers,"x-chuan-trace").substr(0,96);
+    allowConnectionReuse=version=="HTTP/1.1"&&connection.find("close")==std::string::npos&&
+        ((method=="GET"&&(path.starts_with("/api/segments/")||path.starts_with("/web/files/")))||
+         (method=="POST"&&path.starts_with("/web/api/parallel/part/")));
     if (!Get(headers, "x-chuan-server").empty()) {
         std::lock_guard lock(mutex_);
         if (Get(headers, "x-chuan-server") != Utf8(config_.id)) {
@@ -1236,6 +1273,15 @@ void Engine::HandleClient(SOCKET s, const std::string &ip) {
     }
     if (path.starts_with("/api/"))
         ObserveNative(headers, ip);
+    if(method=="POST"&&path=="/api/parallel-support"){Reply(s,200,"OK","parallel-v1");return;}
+    if(method=="GET"&&path.starts_with("/api/segments/")){
+        WebFile source;bool allowed=false;
+        {std::lock_guard lock(mutex_);auto found=nativeSegments_.find(path.substr(14));if(found!=nativeSegments_.end()&&found->second.second==ip){source=found->second.first;allowed=true;}}
+        uint64_t offset=0,length=0;
+        if(!allowed){Reply(s,404,"Not Found");return;}
+        if(!Number(Get(headers,"x-chuan-offset"),offset)||!Number(Get(headers,"x-chuan-length"),length)){Reply(s,400,"Bad Request");return;}
+        ServeSegment(s,source,offset,length,false);return;
+    }
     if ((path == "/" || path.starts_with("/web/")) && HandleWeb(s, ip, method, path, headers))
         return;
     if (method == "POST" && path == "/api/offer") { ReceiveOffer(s, headers, ip, false); return; }
@@ -1394,10 +1440,27 @@ bool Engine::HandleWeb(SOCKET s, const std::string &ip, const std::string &metho
             Reply(s, 403, "Forbidden", Utf8(L"请求无效，请刷新网页"));
             return true;
         }
+        if(path.starts_with("/web/api/parallel/")){WebParallelUpload(s,path,h);return true;}
+        if(path=="/web/api/diagnostics-clear"){
+            if(Get(h,"content-length")!="0"){Reply(s,400,"Bad Request");return true;}
+            bool local=ip.starts_with("127.");{std::lock_guard lock(mutex_);for(const auto &network:networks_)if(network.text==ip)local=true;}
+            if(!local){Reply(s,403,"Forbidden");return true;}
+            const bool cleared=ClearDiagnostics();Reply(s,cleared?200:500,cleared?"OK":"Error");return true;
+        }
+        if(path=="/web/api/diagnostic-events"){
+            uint64_t epoch=0;if(!Number(Get(h,"x-chuan-diagnostic-epoch"),epoch)||epoch!=diagnostic_->Epoch()){Reply(s,409,"Conflict");return true;}
+            uint64_t size=0;if(!Number(Get(h,"content-length"),size)||size>65536||!Get(h,"transfer-encoding").empty()){Reply(s,413,"Content Too Large");return true;}
+            std::string body(static_cast<size_t>(size),'\0');if(size&&!ReadExact(s,body.data(),body.size()))return true;
+            std::istringstream records(body);std::string record;std::vector<std::string> entries;
+            while(std::getline(records,record)){if(record.size()>8192||entries.size()>=128){Reply(s,413,"Content Too Large");return true;}if(!record.empty())entries.push_back(std::move(record));}
+            for(const auto &entry:entries)diagnostic_->Write("\"event\":\"browser_trace\",\"client_id\":"+Json(Get(h,"x-chuan-client"))+",\"remote_ip\":"+Json(ip)+",\"browser_record_json\":"+Json(entry),epoch);
+            Reply(s,200,"OK");return true;
+        }
         if(path=="/web/api/diagnostics-export"){
-            try{const auto file=ExportDiagnostics(Get(h,"x-chuan-client"));std::ifstream input(file,std::ios::binary);
-                const auto length=fs::file_size(file);SendAll(s,"HTTP/1.1 200 OK\r\nConnection: close\r\nCache-Control: no-store\r\nContent-Type: application/x-ndjson\r\nContent-Disposition: attachment; filename=Chuan-diagnostics.jsonl\r\nContent-Length: "+std::to_string(length)+"\r\n\r\n");
-                std::array<char,65536> buffer;while(input){input.read(buffer.data(),buffer.size());if(input.gcount()&&!SendAll(s,buffer.data(),static_cast<size_t>(input.gcount())))break;}
+            try{bool local=ip.starts_with("127.");{std::lock_guard lock(mutex_);for(const auto &network:networks_)if(network.text==ip)local=true;}const auto file=ExportDiagnostics(local?std::string{}:Get(h,"x-chuan-client"),false);std::ifstream input(file,std::ios::binary);
+                const auto length=fs::file_size(file);bool sent=SendAll(s,"HTTP/1.1 200 OK\r\nConnection: close\r\nCache-Control: no-store\r\nContent-Type: application/x-ndjson\r\nContent-Disposition: attachment; filename=Chuan-diagnostics.jsonl\r\nContent-Length: "+std::to_string(length)+"\r\n\r\n");
+                std::array<char,65536> buffer;uint64_t delivered=0;while(sent&&input){input.read(buffer.data(),buffer.size());if(input.gcount()){sent=SendAll(s,buffer.data(),static_cast<size_t>(input.gcount()));if(sent)delivered+=static_cast<uint64_t>(input.gcount());}}
+                if(sent&&delivered==length){if(!diagnostic_->CommitExport(file))diagnostic_->Write("\"event\":\"export_cursor_commit_failed\"");}else diagnostic_->AbortExport(file);
                 input.close();std::error_code ec;fs::remove(file,ec);
             }catch(...){Reply(s,500,"Internal Server Error");}return true;
         }
@@ -1762,7 +1825,7 @@ bool Engine::HandleWeb(SOCKET s, const std::string &ip, const std::string &metho
             session = current;
         }
         if (newSession && !coordinator.id.empty()) SyncMesh(coordinator);
-        auto snapshot = GetSnapshot();
+        auto snapshot = GetSnapshot(client);
         const auto clientIp = ip.starts_with("127.") && !snapshot.addresses.empty() ? snapshot.addresses.front() : ip;
         std::error_code apkError;
         const bool androidAvailable = fs::is_regular_file(AndroidPackagePath(), apkError);
@@ -1771,7 +1834,7 @@ bool Engine::HandleWeb(SOCKET s, const std::string &ip, const std::string &metho
             << ",\"serverInstance\":" << Json(webToken_) << ",\"platform\":\"windows\""
             << ",\"androidAvailable\":" << (androidAvailable ? "true" : "false")
             << ",\"webUploadChecksumOptional\":true,\"webCopyCheck\":true,\"webDownloadChecksum\":true,\"webBatchFiles\":true,\"webUploadStatus\":true,\"webZipArchives\":true,\"webZipStream\":true,\"webResume\":true,\"webOfferAsync\":true"
-            << ",\"webTransferWait\":true"
+            << ",\"webTransferWait\":true,\"webParallelDownload\":true,\"webParallelUpload\":true,\"diagnosticEpoch\":"<<diagnostic_->Epoch()<<",\"canClearDiagnostics\":"<<((ip.starts_with("127.")||std::find(snapshot.addresses.begin(),snapshot.addresses.end(),ip)!=snapshot.addresses.end())?"true":"false")
             << ",\"autoReceive\":" << (snapshot.config.autoReceive ? "true" : "false")
             << ",\"maxTransferFiles\":" << Json(std::to_string(snapshot.config.maxTransferFiles))
             << ",\"maxTransferBytes\":" << Json(std::to_string(snapshot.config.maxTransferBytes))
@@ -1889,6 +1952,7 @@ bool Engine::HandleWeb(SOCKET s, const std::string &ip, const std::string &metho
                 << ",\"paused\":" << (j.paused?"true":"false") << ",\"stateText\":" << Json(Utf8(j.skipped?L"内容相同，已跳过":j.activity.empty() || j.state>=State::Completed ? StateText(j.state, receiving) : j.activity))
                 << ",\"receiving\":" << (receiving ? "true" : "false")
                 << ",\"canDelete\":" << (canDelete ? "true" : "false")
+                << ",\"parallelDownload\":" << ([&]{std::lock_guard lock(mutex_);const auto file=webFiles_.find(j.id);return file!=webFiles_.end()&&file->second.hasIdentity&&file->second.delivery&&file->second.recipient==client;}()?"true":"false")
                 << ",\"stage\":" << Json(webStage)
                 << ",\"target\":" << Json(Utf8(webTarget))
                 << ",\"fileId\":" << Json(std::to_string(j.id)) << ",\"error\":" << Json(Utf8(j.error))
@@ -1929,6 +1993,13 @@ bool Engine::HandleWeb(SOCKET s, const std::string &ip, const std::string &metho
         if (!Number(path.substr(11, query == std::string::npos ? std::string::npos : query - 11), id))
             Reply(s, 404, "Not Found");
         else {
+            if(parameters["segment"]=="1"){
+                uint64_t offset=0,length=0;WebFile source;bool allowed=false;
+                {std::lock_guard lock(mutex_);auto found=webFiles_.find(id);if(found!=webFiles_.end()&&(found->second.owner==client||found->second.recipient==client)){source=found->second;allowed=true;}}
+                if(!allowed){Reply(s,404,"Not Found");return true;}
+                if(!Number(Get(h,"x-chuan-offset"),offset)||!Number(Get(h,"x-chuan-length"),length)){Reply(s,400,"Bad Request");return true;}
+                ServeSegment(s,source,offset,length,true);return true;
+            }
             uint64_t offset=0;auto start=Get(h,"x-chuan-offset");bool range=false;if(start.empty()&&!Get(h,"range").empty()){const auto value=Get(h,"range");if(!value.starts_with("bytes=")||!value.ends_with("-")){Reply(s,416,"Range Not Satisfiable");return true;}start=value.substr(6,value.size()-7);range=true;}if(!start.empty()&&!Number(start,offset)){Reply(s,416,"Range Not Satisfiable");return true;}WebDownload(s, ip, id, client,parameters["checksum"]=="trailer",offset,Get(h,"x-chuan-prefix"),range);
         }
         return true;
@@ -2012,7 +2083,7 @@ void Engine::WebDownload(SOCKET s, const std::string &ip, uint64_t id, const std
     TrackSocket(s, job);
     SetState(job, State::Running);
     {std::lock_guard lock(mutex_);job->view.activity=L"正在发送文件";TraceJobLocked(job);}
-    diagnostic::Transfer trace(*diagnostic_, s, job->view.id, entry.size, "web_download", ",\"client_id\":"+Json(job->webClient)+",\"recipient_id\":"+Json(job->recipient)+",\"batch_id\":"+Json(job->batchId)+",\"upload_id\":"+Json(job->webUpload));
+    diagnostic::Transfer trace(*diagnostic_, s, job->view.id, entry.size, "web_download", ",\"client_id\":"+Json(job->webClient)+",\"recipient_id\":"+Json(job->recipient)+",\"batch_id\":"+Json(job->batchId)+",\"upload_id\":"+Json(job->webUpload)+",\"send_mode\":\"overlapped\",\"send_queue_limit_bytes\":4194304");
     std::unique_ptr<Hash> hash;if(checksum||!prefix.empty())hash=std::make_unique<Hash>();
     if(offset){if(hash){std::vector<char> bytes(1024*1024);uint64_t checked=0;while(checked<offset){DWORD count=0;if(job->paused||job->cancel||!ReadFile(file.value,bytes.data(),static_cast<DWORD>(std::min<uint64_t>(bytes.size(),offset-checked)),&count,nullptr)||!count){SetState(job,State::Failed);Reply(s,409,"Conflict");return;}hash->Add(bytes.data(),count);checked+=count;}if(!prefix.empty()&&hash->Snapshot()!=prefix){SetState(job,State::Failed,L"续传内容不一致");Reply(s,409,"Conflict","续传内容不一致");return;}}else{LARGE_INTEGER position{};position.QuadPart=offset;if(!SetFilePointerEx(file.value,position,nullptr,FILE_BEGIN)){Reply(s,409,"Conflict");return;}}}
     if(!checksum)hash.reset();job->progressBase=offset;trace.StartAt(offset);
@@ -2022,23 +2093,27 @@ void Engine::WebDownload(SOCKET s, const std::string &ip, uint64_t id, const std
                        PercentEncode(Utf8(entry.path.filename().wstring())) +
                        "\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\nContent-Length: " +
                        std::to_string(entry.size-offset+(checksum?32:0)) + "\r\n\r\n");
-    std::vector<char> buffer(256 * 1024);
     uint64_t done = offset;
-    while (ok && running_ && !job->paused && !job->cancel && done < entry.size) {
-        DWORD read = 0;
-        { diagnostic::Measure time(trace.diskMs);
-          ok = ReadFile(file.value, buffer.data(), static_cast<DWORD>(std::min<uint64_t>(buffer.size(),entry.size-done)), &read, nullptr) && read;
-          if (!ok) { trace.fileError = GetLastError(); trace.failureStage = "read"; } }
-        if(ok&&hash)hash->Add(buffer.data(),read);
-        if (ok) { diagnostic::Measure time(trace.networkMs);
-            ok = SendAll(s, buffer.data(), read);
-            if (!ok) { trace.socketError = WSAGetLastError(); trace.failureStage = "send"; }
+    try {
+        SocketSendQueue sends(s, entry.size-offset, [&]{return running_&&!job->paused&&!job->cancel;},
+            [&](size_t bytes){done+=bytes;Progress(job,done);trace.done=done;trace.Sample();}, trace.socketError);
+        sends.SetObserver([&](size_t pending,uint64_t bytes,uint64_t oldest){trace.Gauge("send_pending_operations",pending);trace.Gauge("send_pending_bytes",bytes);trace.Gauge("send_oldest_operation_ms",oldest);});
+        uint64_t loaded = offset;
+        while (ok && loaded < entry.size) {
+            std::vector<char> *buffer;
+            { auto time=trace.Stage("send_queue_wait",trace.networkMs); buffer=&sends.Buffer(); }
+            DWORD read = 0;
+            { auto time=trace.Stage("disk_io",trace.diskMs);
+              ok=ReadFile(file.value,buffer->data(),static_cast<DWORD>(std::min<uint64_t>(buffer->size(),entry.size-loaded)),&read,nullptr)&&read;
+              if(!ok){trace.fileError=GetLastError();trace.failureStage="read";} }
+            if(!ok)break;
+            if(hash){auto time=trace.Stage("checksum",trace.hashMs);hash->Add(buffer->data(),read);}
+            { auto time=trace.Stage("network_or_queue_wait",trace.networkMs); sends.Submit(read); }
+            loaded+=read;
         }
-        if (ok) {
-            done += read;
-            Progress(job, done);
-            trace.done = done; trace.Sample();
-        }
+        if(ok){auto time=trace.Stage("network_or_queue_wait",trace.networkMs);sends.Finish();}
+    } catch(const std::exception &error) {
+        ok=false;trace.failureStage=error.what();
     }
     if(ok&&done==entry.size&&hash&&!job->cancel){const auto digest=hash->Finish();ok=SendAll(s,digest.data(),digest.size());}
     trace.result = job->cancel || !running_ ? "cancelled" : ok && done == entry.size ? "sent_to_socket" : "failed";
@@ -2058,11 +2133,12 @@ std::shared_ptr<Engine::Job> Engine::NewJob(const std::wstring &name, const std:
     jobs_.push_back(j);TraceJobLocked(j);
     return j;
 }
-fs::path Engine::ExportDiagnostics(const std::string &client){
-    fs::path directory;{std::lock_guard lock(mutex_);directory=config_.dataDir/L"diagnostic-exports";for(const auto &job:jobs_)TraceJobLocked(job);}
+fs::path Engine::ExportDiagnostics(const std::string &client,bool consume){
+    fs::path directory;{std::lock_guard lock(mutex_);directory=config_.dataDir/L"diagnostic-exports";for(const auto &job:jobs_)if(job->view.state<State::Completed)TraceJobLocked(job,true);}
     fs::create_directories(directory);const auto target=directory/(L"Chuan-diagnostics-"+std::to_wstring(Now())+L"-"+Guid()+L".jsonl");
-    if(!diagnostic_->Export(target,client.empty()?"":Json(client)))throw std::runtime_error("日志导出失败，请检查可用空间与写入权限");return target;
+    if(!diagnostic_->Export(target,client.empty()?"":Json(client),consume))throw std::runtime_error("日志导出失败，请检查可用空间与写入权限");return target;
 }
+bool Engine::ClearDiagnostics(){return diagnostic_->Clear();}
 void Engine::TraceJobLocked(const std::shared_ptr<Job> &j,bool sample){
     const auto tick=Now();const bool changed=j->traceState!=static_cast<int>(j->view.state)||j->tracePhase!=j->view.activity||j->traceError!=j->view.error;
     if(!changed&&(!sample||tick-j->traceSample<1000))return;
@@ -2146,6 +2222,7 @@ void Engine::QueueBrowser(const Peer &peer, const fs::path &path, const std::sha
 }
 #include "web_archive.inc"
 #include "resume.inc"
+#include "parallel_transfer.inc"
 void Engine::ReceiveUpload(SOCKET s, const std::map<std::string, std::string> &h, const std::string &ip,
                            bool browser, bool probe) {
     const bool directory = Get(h, "x-chuan-directory") == "1";
@@ -2157,18 +2234,26 @@ void Engine::ReceiveUpload(SOCKET s, const std::map<std::string, std::string> &h
     const bool verifyChecksum = !(browser && checksum == "none");
     const uint64_t trailerBytes = verifyChecksum ? 32 : 0;
     const auto resumeKey=Get(h,"x-chuan-resume-key");uint64_t resumeOffset=0;
+    const auto pullToken=Get(h,"x-chuan-pull-token");
+    const bool parallelPull=!browser&&!probe&&!pullToken.empty();uint64_t pullPort=0;
+    const auto uploadTicket=Get(h,"x-chuan-parallel-upload");const bool parallelWeb=browser&&!probe&&!uploadTicket.empty();
+    std::shared_ptr<ParallelUpload> uploadChannel;
+    if(parallelWeb){std::lock_guard lock(mutex_);auto found=parallelUploads_.find(uploadTicket);if(found==parallelUploads_.end()||found->second->client!=Get(h,"x-chuan-client")||found->second->upload!=Get(h,"x-chuan-upload")||found->second->batch!=Get(h,"x-chuan-batch")){Reply(s,403,"Forbidden");return;}uploadChannel=found->second;}
+    if(parallelPull&&(!WebKey(pullToken)||!Number(Get(h,"x-chuan-port"),pullPort)||pullPort<1024||pullPort>65535||directory)){Reply(s,400,"Bad Request");return;}
     if((!resumeKey.empty()&&!ResumeKeyValid(resumeKey))||(!Get(h,"x-chuan-offset").empty()&&!Number(Get(h,"x-chuan-offset"),resumeOffset))){Reply(s,400,"Bad Request");return;}
     if (name.empty() || sender.empty() || sender.size() > 64 ||
         (!checksum.empty() && checksum != "sha256" && !(browser && checksum == "none")) ||
         sender.find_first_of(L"\r\n") != std::wstring::npos || !Number(Get(h, "x-chuan-size"), total) ||
         !Number(Get(h, "content-length"), length) ||
-        total > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) - trailerBytes || resumeOffset>total || (resumeOffset&&resumeKey.empty()) || length != (probe ? 0 : total-resumeOffset + trailerBytes) ||
+        total > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) - trailerBytes || resumeOffset>total || (resumeOffset&&resumeKey.empty()) || length != (probe ? 0 : parallelWeb?0:parallelPull?trailerBytes:total-resumeOffset + trailerBytes) ||
         (!browser && !probe && Get(h, "expect") != "100-continue") || !Get(h, "transfer-encoding").empty() ||
         (browser && (total > 9007199254740991ull || !Get(h, "expect").empty() ||
                      !WebKey(Get(h, "x-chuan-client")) || !WebKey(Get(h, "x-chuan-upload"))))) {
         Reply(s, 400, "Bad Request");
         return;
     }
+    if(parallelWeb&&(verifyChecksum||directory||uploadChannel->total!=total||uploadChannel->start!=resumeOffset)){Reply(s,400,"Bad Request");return;}
+    const auto closeUploadChannel=std::shared_ptr<void>(nullptr,[this,uploadChannel,uploadTicket](void*){if(uploadChannel){uploadChannel->Close();std::lock_guard lock(mutex_);parallelUploads_.erase(uploadTicket);}});
     Config cfg;
     {
         std::lock_guard lock(mutex_);
@@ -2455,6 +2540,7 @@ void Engine::ReceiveUpload(SOCKET s, const std::map<std::string, std::string> &h
     diagnostic::Transfer trace(*diagnostic_, s, j->view.id, total, browser ? "web_upload" : "native_upload",
         ",\"client_id\":"+Json(j->webClient)+",\"recipient_id\":"+Json(j->recipient)+",\"batch_id\":"+Json(j->batchId)+",\"upload_id\":"+Json(j->webUpload)+",\"path\":"+Json(Utf8(j->view.name))+",\"staging\":" + std::string(staging ? "true" : "false") +
         ",\"checksum\":\"" + (verifyChecksum ? "sha256" : "none") + "\"" +
+        ",\"receive_mode\":"+Json(parallelPull?"parallel_pull":parallelWeb?"parallel_http":"stream")+
         (browser && hashTimingValid ? ",\"browser_hash_ms\":" + std::to_string(browserHashMs) : ""));
     try {
         if (!SafeParents(cfg.receiveDir, destination.parent_path()))
@@ -2479,38 +2565,53 @@ void Engine::ReceiveUpload(SOCKET s, const std::map<std::string, std::string> &h
             if (!browser && !SendAll(s, "HTTP/1.1 100 Continue\r\n\r\n"))
                 throw std::runtime_error("connection");
             j->progressBase=resumeOffset;SetState(j, State::Running);trace.StartAt(resumeOffset);
+            if(uploadChannel){uploadChannel->SetObserver([log=diagnostic_.get(),context=trace.Context()](const std::string &fields){log->Write("\"event\":\"upload_reorder\","+context+","+fields);});uploadChannel->Attach(j->view.id);}
+            std::unique_ptr<ParallelReader> parallel;
+            if(parallelPull){auto connections=std::make_shared<SegmentConnections>([this](SOCKET socket){ReleaseSocket(socket);});parallel=std::make_unique<ParallelReader>(resumeOffset,total,[this,ip,pullPort,pullToken,j,connections](uint64_t offset,uint64_t count){return FetchSegment(ip,static_cast<unsigned short>(pullPort),pullToken,offset,count,j,connections);},[&](const char *event,uint64_t offset,size_t pending,size_t ready,double wait){trace.Gauge("prefetch_pending_segments",pending);trace.Gauge("prefetch_ready_segments",ready);trace.Note(event,"\"offset\":"+std::to_string(offset)+",\"pending_segments\":"+std::to_string(pending)+",\"ready_segments\":"+std::to_string(ready)+",\"wait_ms\":"+std::to_string(wait));});}
             std::vector<char> buffer(256 * 1024);
             uint64_t done = resumeOffset;Progress(j,done);
+            auto pullKeepalive=Now();
             while (done < total) {
                 if (j->cancel || j->paused || !running_)
                     throw std::runtime_error("cancel");
                 size_t want = static_cast<size_t>(std::min<uint64_t>(buffer.size(), total - done));
-                int n;
-                { diagnostic::Measure time(trace.networkMs);
-                  n = recv(s, buffer.data(), static_cast<int>(want), 0);
-                  if (n <= 0) { trace.socketError = n < 0 ? WSAGetLastError() : 0; throw std::runtime_error("connection"); } }
+                size_t buffered = 0; bool connected = true;
+                // TCP fragments are not disk blocks. Coalesce them before writing and hashing.
+                while (buffered < want && running_ && !j->cancel && !j->paused) {
+                    auto time=trace.Stage("network_or_queue_wait",trace.networkMs);
+                    const int received = uploadChannel?static_cast<int>(uploadChannel->Read(buffer.data()+buffered,want-buffered,[&]{return running_&&!j->cancel&&!j->paused;})):parallel?static_cast<int>(parallel->Read(buffer.data()+buffered,want-buffered)):recv(s, buffer.data()+buffered, static_cast<int>(want-buffered), 0);
+                    ++trace.receiveCalls;
+                    if(received<=0){trace.socketError=received<0?WSAGetLastError():0;connected=false;break;}
+                    buffered+=static_cast<size_t>(received);
+                }
+                // Preserve every received byte for resume, including the last partial block on disconnect.
+                if (buffered) {
                 DWORD written = 0;
-                { diagnostic::Measure time(trace.diskMs);
-                  const BOOL ok=WriteFile(file.value, buffer.data(), static_cast<DWORD>(n), &written, nullptr);
+                { auto time=trace.Stage("disk_io",trace.diskMs);
+                  ++trace.diskWriteCalls;
+                  const BOOL ok=WriteFile(file.value, buffer.data(), static_cast<DWORD>(buffered), &written, nullptr);
                   const DWORD error=ok?0:GetLastError();
-                  if (!ok||written!=static_cast<DWORD>(n)){trace.fileError=error;throw std::runtime_error("disk");} }
-                if (hash) { diagnostic::Measure time(trace.hashMs); hash->Add(buffer.data(), n); }
-                done += static_cast<uint64_t>(n);
+                  if (!ok||written!=buffered){trace.fileError=error;throw std::runtime_error("disk");} }
+                if (hash) { auto time=trace.Stage("checksum",trace.hashMs); hash->Add(buffer.data(), buffered); }
+                done += buffered;
                 Progress(j, done);
                 trace.done = done; trace.Sample();
+                }
+                if(!connected)throw std::runtime_error("connection");
+                if(parallelPull&&Now()-pullKeepalive>=2000){if(!SendAll(s,"HTTP/1.1 102 Processing\r\n\r\n"))throw std::runtime_error("connection");pullKeepalive=Now();}
             }
             if (hash) {
                 { std::lock_guard lock(mutex_); j->view.activity = L"正在校验接收内容";TraceJobLocked(j); }
                 std::array<unsigned char, 32> expected{};
-                { diagnostic::Measure time(trace.networkMs);
+                { auto time=trace.Stage("network_or_queue_wait",trace.networkMs);
                   if (!ReadExact(s, expected.data(), expected.size())) { trace.socketError = WSAGetLastError(); throw std::runtime_error("checksum_read"); } }
-                { diagnostic::Measure time(trace.hashMs);
+                { auto time=trace.Stage("checksum",trace.hashMs);
                   if (hash->Finish() != expected) throw std::runtime_error("checksum"); }
             }
             if (j->cancel || !running_)
                 throw std::runtime_error("cancel");
             { std::lock_guard lock(mutex_); j->view.activity = L"正在保存文件";TraceJobLocked(j); }
-            { diagnostic::Measure time(trace.flushMs);
+            { auto time=trace.Stage("disk_flush",trace.flushMs);
               if (!FlushFileBuffers(file.value)) { trace.fileError = GetLastError(); throw std::runtime_error("flush"); } }
         }
         fs::path chosen;
@@ -2617,6 +2718,8 @@ void Engine::SendOne(const Peer &peer, const fs::path &path, const std::wstring 
     TrackSocket(s, j);
     SetTimeout(s, 150000, 30000);
     std::unique_ptr<diagnostic::Transfer> trace;
+    std::string parallelToken;
+    const auto removeParallelSource=std::shared_ptr<void>(nullptr,[this,&parallelToken](void*){if(!parallelToken.empty()){std::lock_guard lock(mutex_);nativeSegments_.erase(parallelToken);}});
     try {
         SetState(j, State::Waiting);
         std::wstring sender, senderId;
@@ -2700,6 +2803,16 @@ void Engine::SendOne(const Peer &peer, const fs::path &path, const std::wstring 
             }else if(!reply.starts_with("HTTP/1.1 404 "))throw std::runtime_error("resume_busy");
             ReleaseSocket(s);s=Connect(peer.gateway.empty()?peer.ip:peer.gateway,peer.port);if(s==INVALID_SOCKET)throw std::runtime_error("connect");TrackSocket(s,j);SetTimeout(s,150000,30000);
         }
+        if(!archiveStream&&!j->view.directory&&!j->parallelDisabled&&peer.gateway.empty()&&peer.owner.empty()&&total-resumeOffset>=32ull*1024*1024){
+            std::string support;
+            if(BatchCommand(peer,"/api/parallel-support",j->batchId,"",support,j)==200&&support=="parallel-v1"){
+                GUID ticket{};CoCreateGuid(&ticket);parallelToken=Hex(std::string(reinterpret_cast<char*>(&ticket),sizeof(ticket)));
+                // The native ticket is scoped to this file, peer address and active transfer.
+                {std::lock_guard lock(mutex_);nativeSegments_[parallelToken]={{path,path.parent_path(),total,"",j,"",j->fileIdentity,j->hasIdentity,relative},peer.ip};j->segmentDone=resumeOffset;}
+                request.insert(request.find("Content-Length:"),"X-Chuan-Pull-Token: "+parallelToken+"\r\n");
+                request.replace(request.find("Content-Length:"),std::string::npos,"Content-Length: 32\r\n\r\n");
+            }
+        }
         { std::lock_guard lock(mutex_); j->view.activity = L"等待接收端确认";TraceJobLocked(j); }
         if (!SendAll(s, request))
             throw std::runtime_error("request");
@@ -2707,6 +2820,7 @@ void Engine::SendOne(const Peer &peer, const fs::path &path, const std::wstring 
         std::map<std::string, std::string> headers;
         do{headers.clear();if(!ReadHeader(s,first,headers))throw std::runtime_error("response");if(j->retryDeadline)j->retryDeadline=Now()+30000;}while(first.starts_with("HTTP/1.1 102 "));
         if (!first.starts_with("HTTP/1.1 100 ")) {
+            if(!parallelToken.empty())j->parallelDisabled=true;
             if(first.starts_with("HTTP/1.1 409 ")){uint64_t n=0;std::string reason;if(Number(Get(headers,"content-length"),n)&&n<4096){reason.resize(static_cast<size_t>(n));ReadExact(s,reason.data(),reason.size());}if(reason.find("续传内容不一致")!=std::string::npos)j->resumeReset=true;}
             SetState(j, first.starts_with("HTTP/1.1 417") ? State::Rejected : State::Failed,
                      first.starts_with("HTTP/1.1 507") ? L"目标设备磁盘空间不足"
@@ -2715,12 +2829,11 @@ void Engine::SendOne(const Peer &peer, const fs::path &path, const std::wstring 
             return;
         }
         SetTimeout(s);
-        trace=std::make_unique<diagnostic::Transfer>(*diagnostic_,s,j->view.id,total,"native_send",",\"path\":"+Json(Utf8(j->view.name))+",\"batch_id\":"+Json(j->batchId)+",\"upload_id\":"+Json(j->webUpload)+",\"client_id\":"+Json(j->webClient)+",\"recipient_id\":"+Json(j->recipient));
+        trace=std::make_unique<diagnostic::Transfer>(*diagnostic_,s,j->view.id,total,"native_send",",\"path\":"+Json(Utf8(j->view.name))+",\"batch_id\":"+Json(j->batchId)+",\"upload_id\":"+Json(j->webUpload)+",\"client_id\":"+Json(j->webClient)+",\"recipient_id\":"+Json(j->recipient)+",\"send_mode\":"+Json(archiveStream?"blocking_archive":parallelToken.empty()?"overlapped":"parallel_pull")+",\"parallel_connections\":"+std::to_string(parallelToken.empty()?1:4)+",\"send_queue_limit_bytes\":"+std::to_string(archiveStream?0:parallelToken.empty()?4194304:16777216));
         trace->StartAt(resumeOffset);j->progressBase=resumeOffset;
         auto hash=std::move(contentHash);
         { std::lock_guard lock(mutex_); j->view.activity = L"正在发送文件";TraceJobLocked(j); }
         SetState(j, State::Running);
-        std::vector<char> buffer(256 * 1024);
         uint64_t done = resumeOffset;Progress(j,done);
         if(archiveStream){
             {std::lock_guard lock(mutex_);j->view.activity=L"边打包边发送 ZIP";TraceJobLocked(j);}
@@ -2728,46 +2841,59 @@ void Engine::SendOne(const Peer &peer, const fs::path &path, const std::wstring 
             uint64_t generated=0;archive::Emit(*j->archivePlan,[&](const void *data,size_t count){
                 if(j->cancel||j->paused||j->retryExpired||!running_)throw std::runtime_error("cancel");
                 const auto skip=static_cast<size_t>(std::min<uint64_t>(count,resumeOffset>generated?resumeOffset-generated:0));generated+=count;data=static_cast<const char*>(data)+skip;count-=skip;if(!count)return;
-                if(hash){diagnostic::Measure time(trace->hashMs);hash->Add(data,count);}
-                {diagnostic::Measure time(trace->networkMs);if(!SendAll(s,data,count))throw std::runtime_error("send");}
+                if(hash){auto time=trace->Stage("checksum",trace->hashMs);hash->Add(data,count);}
+                {auto time=trace->Stage("network_or_queue_wait",trace->networkMs);if(!SendAll(s,data,count))throw std::runtime_error("send");}
                 done+=count;Progress(j,done);trace->done=done;trace->Sample();
             },[](uint64_t,const std::wstring &){},[&]{return j->cancel||j->retryExpired||!running_;});
+        }else if(!parallelToken.empty()){
+            // Compute the whole-file digest while the receiver pulls segments on four connections.
+            std::vector<char> bytes(1024*1024);uint64_t loaded=resumeOffset;
+            while(loaded<total){
+                if(!running_||j->cancel||j->paused)throw std::runtime_error("cancel");
+                DWORD count=0;{auto time=trace->Stage("disk_io",trace->diskMs);if(!ReadFile(file.value,bytes.data(),static_cast<DWORD>(std::min<uint64_t>(bytes.size(),total-loaded)),&count,nullptr)||!count)throw std::runtime_error("read");}
+                {auto time=trace->Stage("checksum",trace->hashMs);hash->Add(bytes.data(),count);}loaded+=count;
+            }
         }else{
-        while (done < total) {
-            if (j->cancel || j->paused || !running_)
-                throw std::runtime_error("cancel");
+        SocketSendQueue sends(s,total-resumeOffset,[&]{return running_&&!j->cancel&&!j->paused&&!j->retryExpired;},
+            [&](size_t bytes){done+=bytes;Progress(j,done);trace->done=done;trace->Sample();},trace->socketError);
+        sends.SetObserver([&](size_t pending,uint64_t bytes,uint64_t oldest){trace->Gauge("send_pending_operations",pending);trace->Gauge("send_pending_bytes",bytes);trace->Gauge("send_oldest_operation_ms",oldest);});
+        uint64_t loaded=resumeOffset;
+        while (loaded < total) {
+            std::vector<char> *buffer;
+            {auto time=trace->Stage("send_queue_wait",trace->networkMs);buffer=&sends.Buffer();}
             DWORD count = 0;
-            {diagnostic::Measure time(trace->diskMs);
-            if (!ReadFile(file.value, buffer.data(),
-                          static_cast<DWORD>(std::min<uint64_t>(buffer.size(), total - done)), &count,
+            {auto time=trace->Stage("disk_io",trace->diskMs);
+            if (!ReadFile(file.value, buffer->data(),
+                          static_cast<DWORD>(std::min<uint64_t>(buffer->size(), total - loaded)), &count,
                           nullptr) ||
                 !count)
                 {trace->fileError=GetLastError();throw std::runtime_error("file");}}
-            if(hash){diagnostic::Measure time(trace->hashMs);hash->Add(buffer.data(), count);}
-            {diagnostic::Measure time(trace->networkMs);if (!SendAll(s, buffer.data(), count))
-                {trace->socketError=WSAGetLastError();throw std::runtime_error("send");}}
-            done += count;
-            Progress(j, done);trace->done=done;trace->Sample();
+            if(hash){auto time=trace->Stage("checksum",trace->hashMs);hash->Add(buffer->data(), count);}
+            {auto time=trace->Stage("network_or_queue_wait",trace->networkMs);sends.Submit(count);}
+            loaded+=count;
         }
+        {auto time=trace->Stage("network_or_queue_wait",trace->networkMs);sends.Finish();}
         }
         std::string sentDigest;if(hash){const auto bytes=hash->Finish();sentDigest.assign(reinterpret_cast<const char*>(bytes.data()),bytes.size());}else sentDigest=Unhex(digest);
         if (!SendAll(s, sentDigest.data(), sentDigest.size()))
             throw std::runtime_error("send");
-        { std::lock_guard lock(mutex_); j->view.activity = L"等待接收端保存确认";TraceJobLocked(j); }
+        { std::lock_guard lock(mutex_); j->view.activity = parallelToken.empty()?L"等待接收端保存确认":L"多连接并行发送";TraceJobLocked(j); }
         headers.clear();
         if (!ReadHeader(s, first, headers)) throw std::runtime_error("confirmation");
         while (first.starts_with("HTTP/1.1 102 ")) {
-            SetState(j, State::Waiting); headers.clear();
+            if(parallelToken.empty())SetState(j, State::Waiting); headers.clear();
             if (j->cancel || !ReadHeader(s, first, headers)) throw std::runtime_error("confirmation");
         }
         if (!first.starts_with("HTTP/1.1 201 ")) {
+            if(!parallelToken.empty())j->parallelDisabled=true;
             uint64_t length=0;std::string reason;
             if(Number(Get(headers,"content-length"),length)&&length<=131072){reason.resize(static_cast<size_t>(length));if(!ReadExact(s,reason.data(),reason.size()))reason.clear();}
             SetState(j,State::Failed,reason.empty()?L"目标设备未确认保存":Wide(reason));
             if(trace){trace->result="failed";trace->failureStage="confirmation";trace->Sample(true);}ReleaseSocket(s);return;
         }
-        trace->result="confirmed_saved";SetState(j, State::Completed);
+        trace->done=total;trace->result="confirmed_saved";SetState(j, State::Completed);
     } catch (const std::exception &error) {
+        if(!parallelToken.empty())j->parallelDisabled=true;
         if(trace){trace->result=j->cancel?"cancelled":"failed";trace->failureStage=error.what();}
         SetState(j, j->cancel || !running_ ? State::Cancelled : State::Failed,
                  archiveStream?Wide(error.what()):L"连接中断或目标设备未确认保存");

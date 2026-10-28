@@ -1,5 +1,6 @@
 #pragma once
 #include "pipeline.h"
+#include "parallel_upload.h"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -19,9 +20,10 @@
 #include <ws2tcpip.h>
 
 namespace chuan {
+class SegmentConnections;
 namespace diagnostic { class Log; }
 namespace archive { struct Artifact; struct Plan; }
-inline constexpr wchar_t Version[] = L"2.1.1";
+inline constexpr wchar_t Version[] = L"2.2.0";
 inline constexpr unsigned short DefaultPort = 45871;
 inline constexpr unsigned short DefaultDiscoveryPort = 45872;
 namespace fs = std::filesystem;
@@ -123,8 +125,9 @@ class Engine {
     Engine(const Engine &) = delete;
     bool Start(std::wstring &error);
     void Stop();
-    Snapshot GetSnapshot();
-    fs::path ExportDiagnostics(const std::string &client = {});
+    Snapshot GetSnapshot(const std::string &browserClient = {});
+    fs::path ExportDiagnostics(const std::string &client = {},bool consume=true);
+    bool ClearDiagnostics();
     bool UpdateConfig(const Config &config, std::wstring &error);
     void Refresh();
     bool AddPeer(const std::string &address, std::wstring &error);
@@ -177,6 +180,9 @@ class Engine {
         std::atomic<bool> retryExpired{false};
         std::wstring targetId;
         std::wstring senderName;
+        std::atomic<unsigned> segmentActive{0};
+        std::atomic<uint64_t> segmentDone{0};
+        bool parallelDisabled = false;
         std::set<std::string> hiddenClients;
     };
     struct WebFile {
@@ -208,6 +214,8 @@ class Engine {
     std::vector<Peer> peers_;
     std::vector<std::shared_ptr<Job>> jobs_;
     std::map<uint64_t, WebFile> webFiles_;
+    std::map<std::string, std::pair<WebFile,std::string>> nativeSegments_;
+    std::map<std::string,std::shared_ptr<ParallelUpload>> parallelUploads_;
     struct FolderApproval {
         std::wstring name;
         uint64_t count = 0, total = 0, reserved = 0, prompt = 0;
@@ -302,6 +310,9 @@ class Engine {
     bool HandleWeb(SOCKET socket, const std::string &ip, const std::string &method, const std::string &path,
                    const std::map<std::string, std::string> &headers);
     void WebDownload(SOCKET socket, const std::string &ip, uint64_t id, const std::string &client = {},bool checksum=false,uint64_t offset=0,const std::string &prefix={},bool range=false);
+    void ServeSegment(SOCKET socket,const WebFile &file,uint64_t offset,uint64_t length,bool web);
+    std::vector<char> FetchSegment(const std::string &ip,unsigned short port,const std::string &token,uint64_t offset,uint64_t length,const std::shared_ptr<Job> &job,const std::shared_ptr<SegmentConnections> &connections);
+    void WebParallelUpload(SOCKET socket,const std::string &path,const std::map<std::string,std::string> &headers);
     void QueueBrowser(const Peer &peer, const fs::path &path, const std::shared_ptr<Job> &job,
                       const fs::path &root = {});
     void RememberFile(const std::shared_ptr<Job> &job, const fs::path &path);

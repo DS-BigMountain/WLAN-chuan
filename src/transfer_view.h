@@ -9,7 +9,7 @@ struct TransferRow : Transfer {
     unsigned depth = 0;
     std::wstring treePath;
     std::wstring currentFile, currentAction, stageSummary;
-    uint64_t currentDone=0,currentTotal=0,currentCount=0;
+    uint64_t currentDone=0,currentTotal=0,currentCount=0,transferringFiles=0;
     bool currentTransferring=false;
     std::string group;
     std::vector<uint64_t> members;
@@ -41,6 +41,12 @@ inline std::wstring TransferAction(const Transfer &job) {
     if(job.awaitingApproval)return L"等待接收方确认";
     if(job.state==State::Running)return job.directory?L"创建目录":job.receiving?L"接收文件":L"发送文件";
     return job.receiving?L"等待发送端开始下一项":L"排队等待";
+}
+inline bool TransferringFile(const Transfer &job) {
+    if(job.state!=State::Running||job.directory||job.paused)return false;
+    const auto action=TransferAction(job);
+    return job.activity.empty()||action==L"发送文件"||action==L"接收文件"||
+        action==L"多连接并行发送"||action==L"多连接并行接收"||action==L"边打包边发送 ZIP";
 }
 struct FolderNode {
     std::wstring path, parent, name, error;
@@ -87,7 +93,7 @@ inline std::vector<TransferRow> TransferRows(const std::vector<Transfer> &jobs, 
         for (auto *job : groups[key]) {
             if(job->state<State::Completed&&!job->removed){
                 const auto action=TransferAction(*job);
-                transferring+=job->state==State::Running&&!job->directory&&(job->activity.empty()||action==L"发送文件"||action==L"接收文件");
+                transferring+=TransferringFile(*job);
                 probing+=action==L"检查接收位置";
                 verifying+=action==L"核对同名文件"||action==L"发送端正在核对同名文件"||action==L"等待接收端核对同名文件"||action==L"打包文件";
                 deferred+=job->activity==L"等待核对同名文件"||job->activity==L"等待打包文件";
@@ -119,6 +125,7 @@ inline std::vector<TransferRow> TransferRows(const std::vector<Transfer> &jobs, 
         }
         row.id |= (1ull << 63);
         if(probing+verifying+deferred+transferring+ready>1)row.stageSummary=L"检查 "+std::to_wstring(probing)+L" · 核对 "+std::to_wstring(verifying)+L" · 传输 "+std::to_wstring(transferring)+L" · 待传 "+std::to_wstring(ready)+(deferred?L" · 待核对 "+std::to_wstring(deferred):L"");
+        row.transferringFiles=transferring;
         row.done = std::min(row.done, row.total);
         if (row.failedFiles) failure = State::Failed;
         row.state = active ? (running ? State::Running : waiting ? State::Waiting : State::Queued) :
@@ -131,8 +138,7 @@ inline std::vector<TransferRow> TransferRows(const std::vector<Transfer> &jobs, 
             if (row.currentFile.empty() || row.currentFile == L".") row.currentFile = current->name;
             row.currentAction=TransferAction(*current);
             row.currentDone=current->done;row.currentTotal=current->total;
-            row.currentTransferring=current->state==State::Running&&!current->directory&&
-                (current->activity.empty()||current->activity==L"正在发送文件"||current->activity==L"正在接收文件");
+            row.currentTransferring=TransferringFile(*current);
             row.activity = row.currentAction;
         } else if (row.state < State::Completed) {
             row.currentAction=!idleAction.empty()?idleAction:browserReady?L"等待浏览器开始接收":row.awaitingApproval?L"等待接收方确认":row.receiving?L"等待发送端开始下一项":L"排队中，等待前一项完成";

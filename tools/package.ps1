@@ -120,6 +120,9 @@ if ($AndroidApk) {
 if ((Get-FileHash -LiteralPath $taskPackageExe -Algorithm SHA256).Hash -ne $taskSourceHash) {
     throw '可执行文件复制完整性检查失败。'
 }
+$taskLicense = Join-Path $taskPackageDir 'THIRD-PARTY-NOTICES.txt'
+Copy-Item -LiteralPath (Join-Path $taskProjectRoot 'src/third_party/qrcodegen/THIRD-PARTY-NOTICES.txt') -Destination $taskLicense
+$taskExpectedHashes['THIRD-PARTY-NOTICES.txt'] = (Get-FileHash -LiteralPath $taskLicense -Algorithm SHA256).Hash
 $taskSignature = Get-AuthenticodeSignature -LiteralPath $taskPackageExe
 if ($taskSignature.Status -notin @('Valid', 'NotSigned')) { throw ('发行文件签名验证失败：' + $taskSignature.Status) }
 
