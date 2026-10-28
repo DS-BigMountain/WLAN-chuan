@@ -1,6 +1,6 @@
 import {createApprovalPanel} from '/web/approvals.js';
 import {Sha256} from '/web/sha256.js';
-import {hashFile} from '/web/hash_file.js';
+import {hashFile,setHashDiagnostics} from '/web/hash_file.js';
 import {selectedFiles,droppedFiles,batchPlan,limitValue} from '/web/files.js';
 import {transferGroups,pingEffect,timedNotice,folderProgress,createFolderDisclosure,transferAction,currentOperation,createFilePipeline,createDiagnostics} from '/web/transfers.js';
 import {ServerSession,deviceLabel,browserDeviceType} from '/web/session.js';
@@ -15,11 +15,21 @@ const tab=random();
 let chosen='', peers=[], latestJobs=[], inbox=[], pingAck=0, followPoll=false;
 let token='', online=false, polling=false, queueRunning=false, actionMessage='', hostId='';
 let webUploadChecksumOptional=false, webCopyCheck=false, webDownloadChecksum=false, webTransferWait=false, webBatchFiles=false, webUploadStatus=false, webZipArchives=false, webZipStream=false,webResume=false, webOfferAsync=false, hostAutoReceive=false;
+let webParallelDownload=false,webParallelUpload=false;
 let latestOffers=[],zipFolders=false;
 const approvalWaiters=new Map();
 let hostName='',jobFilter='all',currentRequests=[];
 const queue=[], operations=[], signatures=new Map();
+let diagnosticEpoch=null;
 const trace=createDiagnostics(()=>({client_id:client,host_id:hostId,server_instance:serverSession.instance||''}));
+trace.setForwarder(async records=>{
+  if(!online||!token||!Number.isSafeInteger(diagnosticEpoch)||serverSession.blocked)return false;
+  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),5000);
+  try{const response=await fetch('/web/api/diagnostic-events',{method:'POST',keepalive:true,headers:{...serverSession.headers(),'X-Chuan-Client':client,'X-Chuan-Tab':tab,'X-Chuan-Token':token,'X-Chuan-Diagnostic-Epoch':String(diagnosticEpoch),'Content-Type':'text/plain;charset=UTF-8'},body:records,signal:controller.signal});if(response.status===409)poll();return response.ok;}finally{clearTimeout(timer);}
+});
+setHashDiagnostics(fields=>trace.write(fields.event,fields));
+try{new PerformanceObserver(list=>{for(const entry of list.getEntries()){const url=new URL(entry.name,location.href);let route='';if(url.pathname.startsWith('/web/api/parallel/part/'))route='parallel_upload_part';else if(url.pathname.startsWith('/web/files/')&&url.searchParams.get('segment')==='1')route='parallel_download_segment';else if(url.pathname==='/web/api/upload')route='upload_control_or_stream';if(route)trace.write('http_resource',{route,start_ms:entry.startTime,duration_ms:entry.duration,request_start_ms:entry.requestStart,response_start_ms:entry.responseStart,response_end_ms:entry.responseEnd,connect_ms:Math.max(0,entry.connectEnd-entry.connectStart),dns_ms:Math.max(0,entry.domainLookupEnd-entry.domainLookupStart),transfer_bytes:entry.transferSize,encoded_body_bytes:entry.encodedBodySize,decoded_body_bytes:entry.decodedBodySize,protocol:entry.nextHopProtocol});}}).observe({type:'resource',buffered:true});}catch{}
+try{if(PerformanceObserver.supportedEntryTypes.includes('longtask'))new PerformanceObserver(list=>{for(const entry of list.getEntries())trace.write('browser_long_task',{start_ms:entry.startTime,duration_ms:entry.duration});}).observe({type:'longtask',buffered:true});}catch{}
 const pipelineTrace=direction=>(phase,item,state)=>trace.write('pipeline',{direction,phase,...state,upload_id:item.key||item.uploadKey||'',batch_id:item.plan?.id||item.batchId||'',path:item.path||item.name||''});
 const retrying=new Set();
 const batchReports=new Set();let reportingBatch=false;
@@ -190,6 +200,7 @@ function renderJobs() {
   }
   async function pause(item,paused){if(item.receiving&&item.folderId){for(const member of latestJobs.filter(job=>job.receiving&&job.batchId===item.batchId&&job.folderId===item.folderId&&job.state!==3)){const id=String(member.id);if(paused){incomingPaused.add(id);const context=incomingContexts.get(id);if(context)context.pauseRequested=true;folderDownloadControllers.get(id)?.abort();}else{incomingPaused.delete(id);folderSaveErrors.delete(member.batchId);}}}if(item.op)await pauseOperation(item.op,paused);else await command('/web/api/'+(paused?'pause/':'resume-job/')+item.id);await poll();renderJobs();}
   async function stop(item){
+    parallelDownloads.get(String(item.id))?.abort();
     if(item.op){if(outgoingActive(item.op))await cancel(item.op);return;}
     if(item.receiving&&item.folderId){cancelledFolderBatches.add(item.batchId);acceptedBatches.delete(item.batchId);folderDestinations.delete(item.batchId);for(const job of latestJobs)if(job.batchId===item.batchId)folderDownloadControllers.get(String(job.id))?.abort();}
     if(item.uploadKey!==undefined&&(item.serverState??item.state)<3)await command('/web/api/cancel/'+item.id);
@@ -203,7 +214,7 @@ function renderJobs() {
     d.querySelector('.direction').textContent=job.receiving?'接收':'发送';
     if(progress){progress.max=100;progress.setAttribute('aria-label','传输进度');metrics.append(progress,percentLabel);d.append(metrics);}
     const stage=text('div','','stages');d.append(stage);
-    if(file){const link=text('a',file.received?'重新下载':'下载','button');link.prepend(icon('download'));link.href=serverSession.blocked?'#':serverSession.download(file.id,token);link.onclick=event=>{if(!online){event.preventDefault();notice('服务主机未连接，暂时无法下载。');}};a.append(link);}
+    if(file){const link=text('a',file.received?'重新下载':'下载','button');link.prepend(icon('download'));link.href=serverSession.blocked?'#':serverSession.download(file.id,token);link.onclick=event=>{if(!online){event.preventDefault();notice('服务主机未连接，暂时无法下载。');return;}if(webParallelDownload&&job.parallelDownload&&job.total>=32*1024*1024&&!job.folderId&&(typeof showSaveFilePicker==='function'||job.total<=512*1024*1024)){event.preventDefault();parallelDownload(job).catch(error=>{if(error.name!=='AbortError')notice(error.message);});}};a.append(link);}
     if(active){if(!job.receiving||job.folderId){const toggle=button(job.paused?'继续':'暂停',()=>pause(job,!job.paused).catch(e=>notice(e.message)));toggle.className='pause';a.append(toggle);}a.append(button('取消',async()=>{try{await stop(job);await poll();renderJobs();}catch(e){notice(e.message);}}));}
     else {if(!job.receiving&&job.state>=4){const retry=button('重试',()=>retrySending([job]));retry.className='retry';a.append(retry);}a.append(button('删除',async()=>{
       if(job.canDelete&&!await ask('删除传输记录','将删除此记录及对应服务端副本。浏览器电脑上的原文件不受影响。\n\n'+job.name))return;
@@ -254,7 +265,7 @@ function renderJobs() {
       const needsDirectory=group.receiving&&group.state<3&&!folderDestinations.has(group.items[0].batchId);
       setText(currentLine,needsDirectory?'请选择保存目录以继续接收':currentOperation(group,bytes));currentLine.hidden=group.state>=3;currentLine.title=currentLine.textContent;
       statusLabel.classList.toggle('waiting',!!group.awaitingApproval);
-      metrics.hidden=!!group.awaitingApproval;setText(percentLabel,(group.done>0&&group.percent===0?'<0.1':group.percent)+'%'+(group.currentTransferring?'  '+bytes(Math.round(group.speed))+'/s':''));
+      metrics.hidden=!!group.awaitingApproval;setText(percentLabel,(group.done>0&&group.percent===0?'<0.1':group.percent)+'%'+(group.transferringFiles?'  '+bytes(Math.round(group.speed))+'/s':''));
       if(progress.value!==group.percent)progress.value=group.percent;
       const save=[...a.querySelectorAll('button')].find(button=>button.textContent==='保存文件夹');if(save){save.disabled=!online||!directoryReceiveAvailable();save.title=directoryReceiveAvailable()?'':'此页面不支持目录写入，请使用 Windows 客户端或先压缩后发送。';}
       const retry=a.querySelector('.retry');if(retry)retry.disabled=!online;
@@ -524,6 +535,8 @@ async function processOperation(op,stage='all'){
             op.fileId=lastResult.id;trace.write('archive_stream_end',{path:op.path,wire_bytes:sent,forwarded:op.streamForwarded});
           }catch(error){if(String(error.message).includes('续传内容不一致'))op.resumeReset=true;if(stream)await command('/web/api/archive/abort/'+stream,{'X-Chuan-Abort-Failed':op.cancelled&&!op.paused?'0':'1','X-Chuan-Error':encode(String(error.message||'ZIP 流中断').slice(0,512)),'X-Chuan-Paused':op.paused?'1':'0'},null).catch(()=>{});throw error;}
           finally{op.packController=null;op.xhr=null;}
+        }else if(webParallelUpload&&!op.directory&&!op.digest&&size-resumeOffset>=32*1024*1024){
+          await parallelUpload(op,resumeFields,resumeOffset);
         }else{
         await new Promise((resolve,reject)=>{
           const xhr=new XMLHttpRequest();op.xhr=xhr;xhr.open('POST','/web/api/upload');
@@ -610,6 +623,10 @@ async function poll() {
     webCopyCheck=state.webCopyCheck===true;
     webDownloadChecksum=state.webDownloadChecksum===true;
     webTransferWait=state.webTransferWait===true;
+    if(diagnosticEpoch!==null&&diagnosticEpoch!==state.diagnosticEpoch)trace.reset();diagnosticEpoch=state.diagnosticEpoch;
+    $('clear-diagnostics').hidden=state.canClearDiagnostics!==true;
+    webParallelDownload=state.webParallelDownload===true;
+    webParallelUpload=state.webParallelUpload===true;
     webBatchFiles=state.webBatchFiles===true;
     webUploadStatus=state.webUploadStatus===true;
     webZipArchives=state.webZipArchives===true;webZipStream=state.webZipStream===true;webResume=state.webResume===true;
@@ -690,6 +707,86 @@ async function negotiate(plan){
   }finally{plan.controller=null;plan.awaitingApproval=false;refreshUploads();}
 }
 const folderDestinations=new Map(), acceptedBatches=new Set(), downloaded=new Set(),savedFiles=new Set(),writingFiles=new Set();
+const parallelDownloads=new Map();
+async function parallelUpload(op,resumeFields,start){
+  const controller=new AbortController();op.xhr={abort:()=>controller.abort()};let ticket='';
+  const headers={...resumeFields,'X-Chuan-Checksum':'none','X-Chuan-Hash-Ms':'0','X-Chuan-Target':encode(op.target),'X-Chuan-Upload':op.key,'X-Chuan-Path':encode(op.path),'X-Chuan-Sender':encode(deviceName||'Web 浏览器'),'X-Chuan-Batch':op.plan.id,'X-Chuan-Item':String(op.item),'X-Chuan-Size':String(op.file.size)};
+  if(op.batch)Object.assign(headers,{'X-Chuan-Copy':'1','X-Chuan-Folder':op.batch.id,'X-Chuan-Folder-Name':encode(op.batch.name),'X-Chuan-Folder-Count':String(op.batch.count),'X-Chuan-Folder-Size':op.batch.totalExact});
+  const tasks=[];let control;
+  try{
+    ({ticket}=JSON.parse(await command('/web/api/parallel/open',{'X-Chuan-Upload':op.key,'X-Chuan-Batch':op.plan.id,'X-Chuan-Size':String(op.file.size),'X-Chuan-Offset':String(start)},null,controller.signal)));
+    control=command('/web/api/upload',{...headers,'X-Chuan-Parallel-Upload':ticket},null,controller.signal);control.catch(()=>controller.abort());
+    let next=start,done=start;const started=performance.now();
+    const lane=async()=>{
+      while(next<op.file.size){
+        if(controller.signal.aborted)throw new DOMException('已取消','AbortError');
+        const offset=next,length=Math.min(8*1024*1024,op.file.size-offset);next+=length;
+        const span=trace.span('upload_segment',{upload_id:op.key,batch_id:op.plan.id,offset,bytes:length});
+        try{
+          span.phase('source_read_and_hash');const hashing=performance.now();
+          const part=op.file.slice(offset,offset+length),digest=await hashFile(part,controller.signal,false,{span_id:span.id,upload_id:op.key,offset});
+          const hashMs=performance.now()-hashing;span.phase('http_upload');const sending=performance.now();
+          await command('/web/api/parallel/part/'+ticket,{'X-Chuan-Trace':span.id,'X-Chuan-Offset':String(offset),'X-Chuan-Length':String(length),'Content-Type':'application/octet-stream'},new Blob([part,digest]),controller.signal);
+          span.end({result:'accepted',hash_ms:hashMs,http_ms:performance.now()-sending});
+        }catch(error){span.end({result:'failed',error:error.message});throw error;}
+        done+=length;op.retryActivity=Date.now();op.uploadDone=done;op.percent=Math.floor(done*100/op.file.size);op.speed=(done-start)*1000/Math.max(1,performance.now()-started);op.status=done===op.file.size?'等待接收确认':'多连接并行发送';refreshUploads();
+      }
+    };
+    for(let i=0;i<4;i++)tasks.push(lane());
+    await Promise.all(tasks);const response=JSON.parse(await control);op.fileId=response.id;
+  }catch(error){if(String(error.message).includes('续传内容不一致'))op.resumeReset=true;throw error;}finally{
+    controller.abort();
+    if(ticket){const closing=new AbortController(),timer=setTimeout(()=>closing.abort(),5000);try{await command('/web/api/parallel/close/'+ticket,{},null,closing.signal);}catch{}finally{clearTimeout(timer);}}
+    await Promise.allSettled([...tasks,...(control?[control]:[])]);op.xhr=null;
+  }
+}
+async function parallelDownload(job){
+  const id=String(job.id);if(parallelDownloads.has(id))return;
+  const controller=new AbortController();parallelDownloads.set(id,controller);
+  let writable,complete=false;const pending=new Map(),parts=[];
+  const segmentBytes=8*1024*1024;
+  try{
+    if(typeof showSaveFilePicker==='function'){
+      const handle=await showSaveFilePicker({suggestedName:job.name.split(/[\\/]/).pop()});writable=await handle.createWritable();
+    }
+    const url=serverSession.download(id,token)+'&segment=1';
+    const fetchPart=async offset=>{
+      const length=Math.min(segmentBytes,job.total-offset),span=trace.span('download_segment',{id,offset,bytes:length});
+      try{
+        span.phase('request_headers');const requested=performance.now();
+        const response=await fetch(url,{headers:{...serverSession.headers(),'X-Chuan-Trace':span.id,'X-Chuan-Offset':String(offset),'X-Chuan-Length':String(length)},signal:controller.signal,cache:'no-store'});
+        const headerMs=performance.now()-requested;if(!response.ok)throw Error('并行下载失败 ('+response.status+')');
+        span.phase('receive_body');const receiving=performance.now();const payload=new Uint8Array(await response.arrayBuffer());const bodyMs=performance.now()-receiving;if(payload.length!==length+32)throw Error('接收分段长度异常');
+        span.phase('verify_hash');const hashing=performance.now();
+        const bytes=new Blob([payload.subarray(0,length)]),digest=await hashFile(bytes,controller.signal,false,{span_id:span.id,id,offset});
+        if(hex(digest)!==hex(payload.subarray(length)))throw Error('接收分段完整性校验失败');
+        span.end({result:'verified',headers_ms:headerMs,body_ms:bodyMs,hash_ms:performance.now()-hashing});return bytes;
+      }catch(error){span.end({result:'failed',error:error.message});throw error;}
+    };
+    let next=0;
+    const fill=()=>{while(next<job.total&&pending.size<4){const offset=next;next+=segmentBytes;const task=fetchPart(offset);task.catch(()=>{});pending.set(offset,task);}};
+    fill();
+    for(let offset=0;offset<job.total;offset+=segmentBytes){
+      const span=trace.span('ordered_download_write',{id,offset,pending_segments:pending.size});
+      try{span.phase('wait_for_segment');const waiting=performance.now();const bytes=await pending.get(offset);const waitMs=performance.now()-waiting;pending.delete(offset);fill();span.phase(writable?'write_file':'retain_blob');const writing=performance.now();
+        if(writable)await writable.write(bytes);else parts.push(bytes);
+        span.end({result:'written',ordered_wait_ms:waitMs,write_ms:performance.now()-writing,output_mode:writable?'file_stream':'blob',retained_blob_parts:parts.length});
+      }catch(error){span.end({result:'failed',error:error.message});throw error;}
+    }
+    if(controller.signal.aborted)throw new DOMException('已取消','AbortError');
+    if(writable){await writable.close();writable=null;}
+    else{
+      const blob=new Blob(parts),url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download=job.name.split(/[\\/]/).pop();document.body.append(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),60000);
+    }
+    await command('/web/api/file-saved/'+id,{},null,controller.signal);complete=true;await poll();
+  }catch(error){if(error.name==='AbortError')controller.abort();throw error;}finally{
+    const wasAborted=controller.signal.aborted;
+    controller.abort();await Promise.allSettled(pending.values());
+    if(writable)await writable.abort().catch(()=>{});
+    parallelDownloads.delete(id);
+    if(!complete&&!wasAborted&&!serverSession.blocked)command('/web/api/file-failed/'+id).catch(()=>{});
+  }
+}
 const folderDownloadControllers=new Map(),cancelledFolderBatches=new Set(),folderSaveErrors=new Map(),folderActivities=new Map();
 async function chooseDestination(batch){
   if(!directoryReceiveAvailable())throw new Error('当前页面无法直接写入目录。保留文件夹结构接收需要使用 Windows 客户端，或支持目录写入的浏览器安全页面。');
@@ -880,11 +977,15 @@ updateViews();
 poll();setInterval(poll,2000);
 
 $('export-diagnostics').onclick=async()=>{
-  const control=$('export-diagnostics');control.disabled=true;$('limits-dialog').close();notice('正在导出诊断日志');
+  const control=$('export-diagnostics');control.disabled=true;$('limits-dialog').close();notice('正在导出新增诊断日志');
   try{
-    trace.write('export_requested',{send_pipeline:sendPipeline.state(),receive_pipeline:receivePipeline.state()});
-    const exportController=new AbortController(),exportTimer=setTimeout(()=>exportController.abort(),15000);
-    let server=new Blob();try{const response=await fetch('/web/api/diagnostics-export',{signal:exportController.signal,method:'POST',headers:{...serverSession.headers(),'X-Chuan-Client':client,'X-Chuan-Tab':tab,'X-Chuan-Token':token}});if(!response.ok)throw Error('服务端日志导出失败 ('+response.status+')');server=await response.blob();}catch(error){trace.write('server_export_failed',{error:error.message});notice('已导出页面日志；'+error.message);}finally{clearTimeout(exportTimer);}
-    const blob=new Blob([server,await trace.blob()],{type:'application/x-ndjson'}),url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download='Chuan-Web-diagnostics-'+new Date().toISOString().replaceAll(':','-')+'.jsonl';document.body.append(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),60000);
+    trace.write('export_requested',{send_pipeline:sendPipeline.state(),receive_pipeline:receivePipeline.state()});await trace.drain();
+    const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),15000);
+    let blob;try{const response=await fetch('/web/api/diagnostics-export',{method:'POST',signal:controller.signal,headers:{...serverSession.headers(),'X-Chuan-Client':client,'X-Chuan-Tab':tab,'X-Chuan-Token':token}});if(!response.ok)throw Error('服务端日志导出失败 ('+response.status+')');blob=await response.blob();}finally{clearTimeout(timer);}
+    const url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download='Chuan-diagnostics-'+new Date().toISOString().replaceAll(':','-')+'.jsonl';document.body.append(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),60000);notice('新增诊断日志已导出');
   }catch(error){notice(error.message);}finally{control.disabled=false;}
+};
+$('clear-diagnostics').onclick=async()=>{
+  const control=$('clear-diagnostics');control.disabled=true;
+  try{trace.reset();await command('/web/api/diagnostics-clear');await poll();notice('服务端日志已清除');}catch(error){notice(error.message);}finally{control.disabled=false;}
 };

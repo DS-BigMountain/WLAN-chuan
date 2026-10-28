@@ -1,3 +1,4 @@
+#include "third_party/qrcodegen/qrcodegen.hpp"
 #include "core.h"
 #include "ui.h"
 #include "transfer_view.h"
@@ -23,7 +24,7 @@ namespace {
 constexpr int Devices = 100, Drop = 101, Settings = 102, Refresh = 103, ConnectPeer = 104, CopyUrl = 105,
               OpenUrl = 106, Tasks = 107, Cancel = 108, Clear = 109, Accept = 110, Reject = 111,
               OpenFolder = 112, WebService = 113, Delete = 114, PingPeer = 115, NotePeer = 116, Partial = 117, SelectFiles = 118, SelectFolder = 119, ToggleAuto = 120,
-              AllTasks = 121, SentTasks = 122, ReceivedTasks = 123, PendingRequests = 124, SelectAllRequests = 125;
+              AllTasks = 121, SentTasks = 122, ReceivedTasks = 123, PendingRequests = 124, SelectAllRequests = 125, ShowQr = 126;
 constexpr COLORREF Ink = RGB(23, 27, 36), Muted = RGB(107, 116, 133), Line = RGB(220, 226, 234);
 const D2D1_COLOR_F Accent = D2D1::ColorF(0x2164F3), AccentLight = D2D1::ColorF(0xDFE9FC),
     Success = D2D1::ColorF(0x08A344), PendingSurface = D2D1::ColorF(0xFFF8E9),
@@ -52,7 +53,7 @@ struct App {
     HWND window = nullptr, devices = nullptr, tasks = nullptr, drop = nullptr, request = nullptr,
          status = nullptr, accept = nullptr, reject = nullptr, cancel = nullptr, partial = nullptr;
     HWND settingsButton = nullptr, refreshButton = nullptr, connectButton = nullptr, clearButton = nullptr,
-         folderButton = nullptr, webButton = nullptr, deleteButton = nullptr;
+         folderButton = nullptr, webButton = nullptr, deleteButton = nullptr, qrButton = nullptr;
     HWND pingButton = nullptr, noteButton = nullptr, flash = nullptr;
     HWND requestList = nullptr, selectAllRequests = nullptr;
     HDWP layoutBatch = nullptr;
@@ -308,6 +309,7 @@ struct App {
         refreshButton = Button(L"刷新", Refresh);
         connectButton = Button(L"手动连接", ConnectPeer);
         webButton = Button(L"Web 服务", WebService);
+        qrButton = Button(L"二维码", ShowQr);
         webAddress = Label(L"");
         webCopyButton = Button(L"复制", CopyUrl);
         webOpenButton = Button(L"打开", OpenUrl);
@@ -390,9 +392,10 @@ struct App {
         Move(tasks, left, jobTop, right - left, std::max(taskRowHeight, (height - jobTop - 94) / taskRowHeight * taskRowHeight));
         TaskHeights();
         const bool showWebAddress = width >= 1160;
-        Move(folderButton, left + 8, height - 85, right - left - (showWebAddress ? 480 : 144), 40);
-        Move(webButton, right - (showWebAddress ? 460 : 124), height - 85, 124, 40);
-        Move(webAddress, right - 328, height - 78, 200, 26);
+        Move(folderButton, left + 8, height - 85, right - left - (showWebAddress ? 544 : 220), 40);
+        Move(webButton, right - (showWebAddress ? 524 : 200), height - 85, 124, 40);
+        Move(qrButton, right - (showWebAddress ? 184 : 70), height - 83, showWebAddress ? 58 : 70, 36);
+        Move(webAddress, right - 392, height - 78, 200, 26);
         Move(webCopyButton, right - 120, height - 83, 54, 36);
         Move(webOpenButton, right - 60, height - 83, 54, 36);
         ShowWindow(webAddress, showWebAddress ? SW_SHOW : SW_HIDE);
@@ -419,6 +422,7 @@ struct App {
         SetTextIfChanged(webAddress, snapshot.config.shareSoftware ? L"http://" + Wide(snapshot.addresses.empty() ? "127.0.0.1" : snapshot.addresses.front()) + L":" +
                          std::to_wstring(snapshot.boundPort ? snapshot.boundPort : snapshot.config.port) + L"/" : L"Web 服务未启用");
         SetTextIfChanged(folderButton, L"接收目录：" + snapshot.config.receiveDir.wstring() + L" · 查看 / 修改");
+        EnableIfChanged(qrButton, snapshot.config.shareSoftware);
         EnableIfChanged(webCopyButton, snapshot.config.shareSoftware);
         EnableIfChanged(webOpenButton, snapshot.config.shareSoftware);
         if (oldAutoReceive != snapshot.config.autoReceive) InvalidateRect(autoButton, nullptr, FALSE);
@@ -569,7 +573,7 @@ struct App {
                     a.folderCount != b.folderCount || a.awaitingApproval != b.awaitingApproval ||
                     a.savedPath != b.savedPath || a.canRetry != b.canRetry || a.skipped != b.skipped ||
                     a.currentFile != b.currentFile || a.currentAction != b.currentAction || a.stageSummary != b.stageSummary ||
-                    a.currentDone!=b.currentDone||a.currentTotal!=b.currentTotal||a.currentCount!=b.currentCount||a.currentTransferring!=b.currentTransferring) {
+                    a.currentDone!=b.currentDone||a.currentTotal!=b.currentTotal||a.currentCount!=b.currentCount||a.currentTransferring!=b.currentTransferring||a.transferringFiles!=b.transferringFiles) {
                     RECT row{};
                     SendMessageW(tasks, LB_GETITEMRECT, i, reinterpret_cast<LPARAM>(&row));
                     InvalidateRect(tasks, &row, FALSE);
@@ -810,9 +814,11 @@ struct App {
                 if(j.folderRow&&j.skippedFiles)metadata+=L" · 跳过 "+std::to_wstring(j.skippedFiles)+L" 个文件";
                 if (j.failedFiles) metadata += L" · "+std::to_wstring(j.failedFiles)+L" 个失败";
                 if (j.cancelledFiles) metadata += L" · "+std::to_wstring(j.cancelledFiles)+L" 个未完成";
-                if (j.folderRow && active && j.currentTransferring) metadata += L" · "+FormatBytes(static_cast<uint64_t>(j.speed))+L"/s";
+                if (j.folderRow && active && j.transferringFiles) metadata += L" · "+FormatBytes(static_cast<uint64_t>(j.speed))+L"/s";
                 if (!wide) metadata = (j.receiving ? L"接收 · " : L"发送 · ") + j.peer + L" · " + metadata;
                 c.TextColor(metadata, titleX, wide ? 40.f : 34.f, j.folderRow&&wide?actionX-titleX-12:titleWidth, 25, captionFormat, TextMuted);
+                const auto statusLabel=j.error.empty()?TransferAction(j):j.error;
+                const auto progressLabel=(j.state==State::Running&&!j.paused&&!j.folderRow?FormatBytes(static_cast<uint64_t>(j.speed))+L"/s · ":L"")+statusLabel;
                 if (active) {
                     const float fraction = j.total ? static_cast<float>(std::min(1.0, static_cast<double>(j.done) / j.total)) : 0;
                     if (wide) {
@@ -820,7 +826,7 @@ struct App {
                         c.BoxColor(statusX, 25, trackWidth, 10, 5, D2D1::ColorF(0xDEE3EC));
                         if (fraction > 0) c.BoxColor(statusX, 25, trackWidth * fraction, 10, 5, Accent);
                         c.TextColor(j.done && fraction*100<.1f ? L"<0.1%" : std::to_wstring(static_cast<unsigned>(fraction * 100)) + L"%", statusX + trackWidth + 6, 15, 48, 28, captionFormat, TextInk);
-                        if(!j.folderRow)c.TextColor(!j.activity.empty() ? j.activity : j.state == State::Running ? FormatBytes(static_cast<uint64_t>(j.speed)) + L"/s" : TransferAction(j),
+                        if(!j.folderRow)c.TextColor(progressLabel,
                                     statusX, 42, statusWidth, 22, captionFormat, TextMuted);
                     } else {
                         const float trackWidth = std::max(8.f, actionX - titleX - 10);
@@ -831,7 +837,7 @@ struct App {
                     const auto label=j.folderRow?(j.state==State::Failed?L"部分失败":TransferAction(j)):j.error.empty()?completed?(j.receiving?L"接收完成":L"发送完成"):TransferAction(j):j.error;
                     c.TextColor(label,statusX,j.folderRow?11.f:22.f,statusWidth,j.folderRow?27.f:34.f,normal,completed?Success:TextMuted);
                 }
-                if (!wide) c.TextColor(j.error.empty() ? (j.folderRow?StateText(j.state,j.receiving):TransferAction(j)) : j.error, titleX, 59,
+                if (!wide) c.TextColor(j.folderRow?(j.error.empty()?StateText(j.state,j.receiving):j.error):progressLabel, titleX, 59,
                                       titleWidth, 22, captionFormat, completed ? Success : TextMuted);
                 if (j.folderRow && active) {
                     const auto detail = j.currentAction + (j.currentFile.empty() ? L"" : L"：" + j.currentFile)+
@@ -1028,6 +1034,7 @@ struct App {
     void SettingsDialog();
     void ConnectDialog();
     void WebDialog();
+    void QrDialog();
     void ReceiveDirectoryDialog();
     void NoteDialog();
     void PartialDialog();
@@ -1135,6 +1142,9 @@ struct App {
             InvalidateRect(allButton, nullptr, FALSE); InvalidateRect(sentButton, nullptr, FALSE); InvalidateRect(receivedButton, nullptr, FALSE);
             Update();
             break;
+        case ShowQr:
+            QrDialog();
+            break;
         case Settings:
             SettingsDialog();
             break;
@@ -1198,6 +1208,7 @@ struct Modal {
     App &app;
     HWND window = nullptr, name = nullptr, path = nullptr, autoReceive = nullptr, share = nullptr, zipFolders = nullptr,
          port = nullptr, help = nullptr, maxFiles = nullptr, maxBytes = nullptr, itemList = nullptr;
+    bool qr = false;std::unique_ptr<qrcodegen::QrCode> qrCode;
     bool settings = false, done = false, web = false, note = false, approval = false, directory = false;
     uint64_t approvalId = 0;
     std::vector<OfferItem> approvalItems;
@@ -1231,6 +1242,7 @@ struct Modal {
         RECT r{};
         GetClientRect(window, &r);
         app.Buffered(ps.hdc, r, 1, [&](ui::Canvas &c, float w, float) {
+            if(qr)return;
             for (auto &r : editFrames)
                 c.Box(r.left, r.top, r.right - r.left, r.bottom - r.top, 7, 1, .84f);
             c.Line(24,
@@ -1243,8 +1255,17 @@ struct Modal {
                               : 152.f,
                    .9f, 1);
         });
+        if(qr&&qrCode){
+            const int count=qrCode->getSize(),step=std::max(1,app.Px(272.f)/(count+8));
+            const int left=(r.right-step*(count+8))/2,top=app.Px(100.f);
+            RECT background{left,top,left+step*(count+8),top+step*(count+8)};FillRect(ps.hdc,&background,static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
+            for(int y=0;y<count;++y)for(int x=0;x<count;++x)if(qrCode->getModule(x,y)){
+                RECT pixel{left+(x+4)*step,top+(y+4)*step,left+(x+5)*step,top+(y+5)*step};FillRect(ps.hdc,&pixel,static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+            }
+        }
         EndPaint(window, &ps);
     }
+    void UpdateQr(){try{const auto url=Utf8(Value(name));qrCode=std::make_unique<qrcodegen::QrCode>(qrcodegen::QrCode::encodeText(url.c_str(),qrcodegen::QrCode::Ecc::MEDIUM));InvalidateRect(window,nullptr,FALSE);}catch(...){qrCode.reset();}}
     std::wstring Value(HWND c) {
         int n = GetWindowTextLengthW(c);
         std::wstring text(static_cast<size_t>(n) + 1, 0);
@@ -1254,7 +1275,18 @@ struct Modal {
     }
     void Create() {
         auto &cfg = app.snapshot.config;
-        if (approval) {
+        if(qr){
+            Control(L"STATIC",L"扫描二维码访问 Web 服务",0,24,18,352,24,0);
+            name=Control(L"COMBOBOX",L"",WS_TABSTOP|CBS_DROPDOWNLIST|CBS_HASSTRINGS|WS_VSCROLL,24,52,352,140,1);
+            auto addresses=app.snapshot.interfaces;
+            std::stable_sort(addresses.begin(),addresses.end(),[](const auto &a,const auto &b){const bool ap=!a.virtualAdapter&&!a.ip.starts_with("169.254."),bp=!b.virtualAdapter&&!b.ip.starts_with("169.254.");return ap>bp;});
+            for(const auto &address:addresses)if(!address.ip.starts_with("127.")&&address.ip!="0.0.0.0"){
+                const auto url=L"http://"+Wide(address.ip)+L":"+std::to_wstring(app.snapshot.boundPort)+L"/";SendMessageW(name,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(url.c_str()));
+            }
+            SendMessageW(name,CB_SETCURSEL,0,0);
+            help=Control(L"STATIC",L"设备需处于同一局域网。",SS_LEFT,24,378,352,24,0);
+            Control(L"BUTTON",L"关闭",WS_TABSTOP|BS_PUSHBUTTON,292,414,84,33,8);UpdateQr();
+        } else if (approval) {
             Control(L"STATIC", L"选择要接收的项目", 0, 24, 20, 560, 28, 0);
             itemList = Control(WC_LISTVIEWW, L"", WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS, 24, 60, 560, 340, 20);
             ListView_SetExtendedListViewStyle(itemList, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
@@ -1335,7 +1367,8 @@ struct Modal {
             zipFolders = Control(L"BUTTON", L"发送文件夹时打包为 ZIP（默认关闭）", WS_TABSTOP | BS_AUTOCHECKBOX, 24, 392, 420, 28, 14);
             SendMessageW(zipFolders, BM_SETCHECK, cfg.zipFolders ? BST_CHECKED : BST_UNCHECKED, 0);
             help = Control(L"STATIC", L"关闭时逐文件复制，跳过内容相同的文件。", SS_LEFT, 24, 424, 420, 22, 0);
-            Control(L"BUTTON", L"导出诊断日志", WS_TABSTOP | BS_PUSHBUTTON, 24, 457, 150, 33, 15);
+            Control(L"BUTTON", L"导出新增日志", WS_TABSTOP | BS_PUSHBUTTON, 24, 457, 140, 33, 15);
+            Control(L"BUTTON", L"清除日志", WS_TABSTOP | BS_PUSHBUTTON, 174, 457, 84, 33, 16);
             Control(L"BUTTON", L"取消", WS_TABSTOP | BS_PUSHBUTTON, 268, 457, 81, 33, 8);
             Control(L"BUTTON", L"保存", WS_TABSTOP | BS_DEFPUSHBUTTON, 360, 457, 84, 33, 9);
         } else {
@@ -1471,6 +1504,8 @@ struct Modal {
             self->Paint();
             return 0;
         case WM_COMMAND:
+            if(self->qr&&LOWORD(w)==1&&HIWORD(w)==CBN_SELCHANGE)self->UpdateQr();
+            if(self->settings&&LOWORD(w)==16&&HIWORD(w)==BN_CLICKED){const bool cleared=self->app.engine.ClearDiagnostics();MessageBoxW(h,cleared?L"服务端日志已清除。":L"日志清除失败，请检查文件权限。",L"诊断日志",MB_OK|(cleared?MB_ICONINFORMATION:MB_ICONERROR));}
             if(self->settings&&LOWORD(w)==15&&HIWORD(w)==BN_CLICKED){
                 try{const auto file=self->app.engine.ExportDiagnostics();ShellExecuteW(h,L"open",L"explorer.exe",(L"/select,\""+file.wstring()+L"\"").c_str(),nullptr,SW_SHOWNORMAL);}
                 catch(const std::exception &error){MessageBoxW(h,Wide(error.what()).c_str(),L"日志导出失败",MB_OK|MB_ICONERROR);}
@@ -1514,14 +1549,14 @@ struct Modal {
         cls.hCursor = LoadCursorW(nullptr, IDC_ARROW);
         cls.hbrBackground = app.white;
         RegisterClassW(&cls);
-        int h = web || directory ? 254 : settings ? 522 : approval ? 496 : 232;
-        RECT r{0, 0, app.Px(approval ? 608.f : web || directory ? 590.f : 470.f), app.Px(static_cast<float>(h))};
+        int h = qr ? 468 : web || directory ? 254 : settings ? 522 : approval ? 496 : 232;
+        RECT r{0, 0, app.Px(qr ? 400.f : approval ? 608.f : web || directory ? 590.f : 470.f), app.Px(static_cast<float>(h))};
         AdjustWindowRectExForDpi(&r, WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN, FALSE, WS_EX_DLGMODALFRAME,
                                  GetDpiForWindow(app.window));
         RECT owner{};
         GetWindowRect(app.window, &owner);
         window = CreateWindowExW(WS_EX_DLGMODALFRAME, L"ChuanModal",
-                                 directory  ? L"接收目录"
+                                 qr ? L"Web 服务二维码" : directory  ? L"接收目录"
                                  : web      ? L"Web 服务"
                                  : settings ? L"设置"
                                  : approval ? L"接受部分文件" : note ? L"IP 临时备注" : L"手动连接",
@@ -1567,6 +1602,12 @@ void App::PartialDialog() {
 }
 void App::NoteDialog() {
     for (auto &p : shownPeers) if (p.id == peerId) { Modal dialog(*this, false); dialog.note = true; dialog.noteIp = p.ip; dialog.Run(); break; }
+}
+void App::QrDialog(){
+    if(!snapshot.config.shareSoftware)return;
+    const bool available=std::any_of(snapshot.interfaces.begin(),snapshot.interfaces.end(),[](const auto &item){return !item.ip.starts_with("127.")&&item.ip!="0.0.0.0";});
+    if(!available){MessageBoxW(window,L"未检测到可供局域网访问的 IPv4 地址。",L"Web 服务二维码",MB_OK|MB_ICONINFORMATION);return;}
+    Modal dialog(*this,false);dialog.qr=true;dialog.Run();
 }
 void App::WebDialog() {
     Modal(*this, false, true).Run();

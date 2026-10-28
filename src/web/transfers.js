@@ -49,6 +49,8 @@ export function currentOperation(group,formatBytes){
     (group.currentTransferring?' · '+formatBytes(group.currentDone)+' / '+formatBytes(group.currentTotal):'')+
     (group.stageSummary?' · '+group.stageSummary:'');
 }
+const transferringFile=item=>item.state===2&&!item.directory&&!item.paused&&
+  (!phase(item)||['发送文件','接收文件','多连接并行发送','多连接并行接收','边打包边发送 ZIP'].includes(transferAction(item)));
 export function transferGroups(items) {
   const rows=[], groups=new Map();
   for(const item of items) {
@@ -69,7 +71,8 @@ export function transferGroups(items) {
     group.done=Math.min(group.done,group.total);
     group.paused=group.items.some(item=>item.state<3)&&group.items.filter(item=>item.state<3).every(item=>item.paused);
     const active=group.items.filter(item=>item.state<3), failure=group.failed?5:group.items.reduce((state,item)=>Math.max(state,item.state),3);
-    const transferring=active.filter(item=>item.state===2&&!item.directory&&(!phase(item)||['发送文件','接收文件'].includes(transferAction(item)))).length;
+    const transferring=active.filter(transferringFile).length;
+    group.transferringFiles=transferring;
     const probing=active.filter(item=>transferAction(item)==='检查接收位置').length;
     const verifying=active.filter(item=>['核对同名文件','发送端正在核对同名文件','等待接收端核对同名文件','打包文件'].includes(transferAction(item))).length;
     const waiting=active.filter(item=>['等待核对同名文件','等待打包文件'].includes(phase(item))).length;
@@ -82,7 +85,7 @@ export function transferGroups(items) {
     group.percent=group.total?Math.floor(group.done*1000/group.total)/10:Math.floor(group.completed*100/Math.max(1,group.count));
     const current=active.filter(processing).sort((a,b)=>Number(!!phase(b))-Number(!!phase(a))||Number(!!a.directory)-Number(!!b.directory));
     group.currentCount=current.length;group.currentFile='';group.currentAction='';group.currentTransferring=false;group.currentDone=0;group.currentTotal=0;
-    if(current.length){const item=current[0];group.currentFile=String(item.name||'').replaceAll('\\','/');if(group.currentFile.startsWith(group.name+'/'))group.currentFile=group.currentFile.slice(group.name.length+1);group.currentAction=transferAction(item);group.currentDone=item.done||0;group.currentTotal=item.total||0;group.currentTransferring=item.state===2&&!item.directory&&(!phase(item)||['发送文件','接收文件'].includes(group.currentAction));}
+    if(current.length){const item=current[0];group.currentFile=String(item.name||'').replaceAll('\\','/');if(group.currentFile.startsWith(group.name+'/'))group.currentFile=group.currentFile.slice(group.name.length+1);group.currentAction=transferAction(item);group.currentDone=item.done||0;group.currentTotal=item.total||0;group.currentTransferring=transferringFile(item);}
     else if(group.state<3){const paused=active.find(item=>['等待发送页面恢复','等待接收页面恢复','等待核对同名文件','等待打包文件'].includes(phase(item)));group.currentAction=paused?transferAction(paused):active.some(item=>phase(item)==='等待浏览器接收')?'等待浏览器开始接收':group.awaitingApproval?'等待接收方确认':group.receiving?'等待发送端开始下一项':'排队中，等待前一项完成';}
     group.items=group.items.filter(item=>!item.removed);
   }
@@ -160,30 +163,44 @@ export function timedNotice(show,clock=globalThis) {
   return (message,duration=0)=>{clock.clearTimeout(timer);show(message);if(duration)timer=clock.setTimeout(()=>show(''),duration);};
 }
 
-// Browser records are committed in batches; rendering and payload callbacks never wait for storage.
+// Browser diagnostics are an ephemeral delivery queue. The server is the sole log store.
 export function createDiagnostics(context=()=>({})){
-  const run=Date.now().toString(36)+'-'+Math.random().toString(36).slice(2),pending=[],fallback=[],states=new Map();
-  let dropped=0,storageErrors=0,observedAt=0,chain=Promise.resolve();
-  const database=new Promise(resolve=>{
-    try{const request=indexedDB.open('chuan-diagnostics-v2',1);request.onupgradeneeded=()=>request.result.createObjectStore('chunks',{autoIncrement:true});request.onsuccess=()=>resolve(request.result);request.onerror=()=>resolve(null);request.onblocked=()=>resolve(null);}catch{resolve(null);}
-  });
-  function write(event,fields={}){try{if(pending.length>=16384){dropped++;return;}pending.push(JSON.stringify({...context(),...fields,event,platform:'web',diagnostic_session:run,utc:new Date().toISOString(),mono_ms:performance.now()}));}catch{dropped++;}}
-  function flush(){chain=chain.then(async()=>{
-    if(!pending.length)return;const lines=pending.splice(0),db=await database;
-    if(db){try{await new Promise((resolve,reject)=>{const transaction=db.transaction('chunks','readwrite');transaction.objectStore('chunks').add(lines.join('\n')+'\n');transaction.oncomplete=resolve;transaction.onerror=()=>reject(transaction.error);transaction.onabort=()=>reject(transaction.error);});return;}catch{storageErrors++;}}
-    fallback.push(...lines);if(fallback.length>50000){dropped+=fallback.length-50000;fallback.splice(0,fallback.length-50000);}
-  }).catch(()=>{storageErrors++;});return chain;}
-  function observe(jobs){const observed=performance.now();if(jobs.length>200&&observed-observedAt<250)return;observedAt=observed;for(const job of jobs){
+  const run=Date.now().toString(36)+'-'+Math.random().toString(36).slice(2),pending=[],states=new Map(),stages=new Map();
+  let dropped=0,failures=0,sequence=0,pendingBytes=0,sink=null,inflight=null,generation=0;
+  try{indexedDB.deleteDatabase('chuan-diagnostics-v2');}catch{}
+  function write(event,fields={}){try{
+    const line=JSON.stringify({...context(),...fields,event,event_sequence:++sequence,platform:'web',diagnostic_session:run,utc:new Date().toISOString(),mono_ms:performance.now(),browser_epoch_ms:performance.timeOrigin+performance.now()});
+    const bytes=new TextEncoder().encode(line).length+1;if(bytes>8192){dropped++;return;}
+    while(pending.length&&(pending.length>=4096||pendingBytes+bytes>4*1024*1024)){pendingBytes-=pending.shift().bytes;dropped++;}
+    pending.push({line,bytes});pendingBytes+=bytes;
+  }catch{dropped++;}}
+  async function flush(){
+    if(inflight)return inflight;if(!sink||!pending.length)return false;
+    const batch=[],epoch=generation;let bytes=0;
+    for(const item of pending){if(batch.length>=64||bytes+item.bytes>48000)break;batch.push(item);bytes+=item.bytes;}
+    inflight=(async()=>{try{
+      const accepted=await sink(batch.map(item=>item.line).join('\n')+'\n');
+      if(accepted&&epoch===generation){for(const item of batch){const index=pending.indexOf(item);if(index>=0){pending.splice(index,1);pendingBytes-=item.bytes;}}return true;}
+      failures++;return false;
+    }catch{failures++;return false;}finally{inflight=null;}})();return inflight;
+  }
+  function reset(){generation++;pending.length=0;pendingBytes=0;states.clear();}
+  function span(name,fields={}){
+    const started=performance.now(),id=run+'-'+(++sequence),state={span_id:id,stage:name,phase:'start',started,...fields};stages.set(id,state);write('browser_stage_start',state);let ended=false;
+    return {id,phase(value){state.phase=value;},end(result={}){if(ended)return;ended=true;stages.delete(id);write('browser_stage_end',{...fields,span_id:id,stage:name,phase:state.phase,elapsed_ms:performance.now()-started,...result});}};
+  }
+  function observe(jobs){for(const job of jobs){
     const key=String(job.id)+':'+(job.stage||''),now=performance.now(),value=JSON.stringify([job.state,job.activity,job.error,!!job.skipped]),previous=states.get(key);
     const changed=!previous||value!==previous.value;if(!changed&&(job.state!==2||now-previous.sample<1000))continue;
-    write(changed?'file_phase':'file_sample',{id:String(job.id),upload_id:job.uploadKey||job.op?.key||'',batch_id:job.batchId||job.op?.plan?.id||'',folder_id:job.folderId||'',path:job.name,receiving:!!job.receiving,state:job.state,phase:job.activity||job.stateText||'',previous_ms:previous?now-previous.phaseAt:0,elapsed_ms:previous?now-previous.created:0,done_bytes:job.done,total_bytes:job.total,speed_bps:job.speed||0,skipped:!!job.skipped,error:job.error||''});
-    states.set(key,{value,sample:now,phaseAt:changed?now:previous.phaseAt,created:previous?.created??now});
+    write(changed?'file_phase':'file_sample',{id:String(job.id),upload_id:job.uploadKey||job.op?.key||'',batch_id:job.batchId||job.op?.plan?.id||'',path:job.name,receiving:!!job.receiving,state:job.state,phase:job.activity||job.stateText||'',previous_ms:previous?now-previous.phaseAt:0,done_bytes:job.done,total_bytes:job.total,speed_bps:job.speed||0,error:job.error||''});
+    states.set(key,{value,sample:now,phaseAt:changed?now:previous.phaseAt});
   }}
-  async function blob(){await flush();const chunks=[],db=await database;let size=0,omitted=0;
-    if(db)await new Promise(resolve=>{const transaction=db.transaction('chunks','readonly'),request=transaction.objectStore('chunks').openCursor(null,'prev');request.onsuccess=()=>{const cursor=request.result;if(!cursor){resolve();return;}const value=cursor.value;if(size+value.length<=256*1024*1024){chunks.push(value);size+=value.length;}else omitted++;cursor.continue();};request.onerror=()=>{storageErrors++;resolve();};});
-    return new Blob([JSON.stringify({event:'export_manifest',platform:'web',diagnostic_schema:2,dropped_events:dropped,storage_errors:storageErrors,omitted_chunks:omitted})+'\n',...chunks.reverse(),fallback.join('\n')+(fallback.length?'\n':'')],{type:'application/x-ndjson'});
-  }
-  const timer=setInterval(()=>{flush();},1000);globalThis.addEventListener?.('pagehide',()=>{flush();});
-  write('session_start',{diagnostic_schema:2,user_agent:globalThis.navigator?.userAgent||'',origin:globalThis.location?.origin||'',preparation_limit:FILE_PIPELINE_LIMITS.preparation,verification_limit:FILE_PIPELINE_LIMITS.verification,transfer_limit:FILE_PIPELINE_LIMITS.transfer,ready_limit:FILE_PIPELINE_LIMITS.ready});
-  return {write,observe,flush,blob,stop(){clearInterval(timer);return flush();}};
+  let expected=performance.now()+1000;
+  const timer=setInterval(()=>{const now=performance.now(),lag=Math.max(0,now-expected);expected=now+1000;
+    write('browser_runtime',{event_loop_delay_ms:lag,visibility:document.visibilityState,pending_log_records:pending.length,pending_log_bytes:pendingBytes,dropped_events:dropped,forward_failures:failures,js_heap_used_bytes:performance.memory?.usedJSHeapSize??null,active_stages:[...stages.values()].slice(0,12).map(stage=>({span_id:stage.span_id,stage:stage.stage,phase:stage.phase,id:stage.id,upload_id:stage.upload_id,offset:stage.offset,age_ms:now-stage.started}))});flush();
+  },1000);
+  globalThis.addEventListener?.('pagehide',()=>{write('browser_pagehide',{pending_log_records:pending.length});flush();});
+  document.addEventListener('visibilitychange',()=>{write('browser_visibility',{visibility:document.visibilityState});if(document.hidden)flush();});
+  write('browser_environment',{diagnostic_profile:'transport-detail',secure_context:globalThis.isSecureContext,user_agent:navigator.userAgent,hardware_concurrency:navigator.hardwareConcurrency,device_memory_gib:navigator.deviceMemory??null,save_file_picker:typeof globalThis.showSaveFilePicker==='function',directory_picker:typeof globalThis.showDirectoryPicker==='function',connection_effective_type:navigator.connection?.effectiveType??null,connection_downlink_estimate_mbps:navigator.connection?.downlink??null,connection_rtt_estimate_ms:navigator.connection?.rtt??null});
+  return {write,span,observe,flush,reset,setForwarder(value){sink=value;},async drain(){for(let i=0;i<128&&pending.length;i++)if(!await flush())break;},stop(){clearInterval(timer);return flush();}};
 }
