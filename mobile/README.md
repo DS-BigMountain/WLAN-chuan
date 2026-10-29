@@ -1,5 +1,7 @@
 # 传 · Android 应用
 
+简体中文 | [English](README.en.md)
+
 Android 应用用于局域网文件与文件夹收发，可独立提供设备发现和 Web 服务。当前版本：**V2.3.0**。
 
 安装包及通用使用方法见[项目 README](../README.md)。运行需要 Android 8.0 及以上，以及可用的系统 WebView。
