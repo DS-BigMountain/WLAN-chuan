@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$AndroidSdk = $(if ($env:ANDROID_SDK_ROOT) { $env:ANDROID_SDK_ROOT } else { $env:ANDROID_HOME }),
-    [string]$DesktopExe = '../build/v2.2.0/Release/Chuan.exe'
+    [string]$DesktopExe = '../build/v2.3.0/Release/Chuan.exe'
 )
 $ErrorActionPreference = 'Stop'
 $taskMobileRoot = $PSScriptRoot

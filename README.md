@@ -2,7 +2,7 @@
 
 传用于同一局域网内的文件与文件夹传输，提供 Windows 客户端、Android 应用和浏览器访问入口，无需部署独立服务器。
 
-当前版本：**V2.2.0**。安装包与便携包见 [GitHub Releases](https://github.com/DS-BigMountain/WLAN-chuan/releases)。
+当前版本：**V2.3.0**。安装包与便携包见 [GitHub Releases](https://github.com/DS-BigMountain/WLAN-chuan/releases)。
 
 ## 主要功能
 
@@ -12,6 +12,7 @@
 - 自动接收或按项目审批，支持暂停、继续、失败重试及原生客户端断点续传。
 - 查看传输进度、速率和逐项结果；Windows 支持增量导出及清除服务端诊断日志。
 - Windows 与 Android 均可提供 Web 服务，供其他设备通过浏览器收发文件；Windows 支持显示访问地址二维码。
+- Windows 与 Android 可在设置中检查并下载 GitHub 正式版本；Windows 重启后替换程序，Android 通过系统安装界面完成更新。
 
 ## 运行条件
 

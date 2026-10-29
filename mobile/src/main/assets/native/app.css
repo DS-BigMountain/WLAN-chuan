@@ -19,3 +19,6 @@ body{max-width:600px;margin:auto;background:#f5f6f8;color:#252b35}.app-header{he
 .utility-copy>span{display:block;font-size:12px;color:var(--ink);margin-bottom:4px}
 .utility-copy strong,.utility-copy p{font-size:11px;font-weight:400;color:var(--muted);line-height:1.6;white-space:pre-line}
 .utility-actions{display:flex;flex-shrink:0;gap:2px}.utility-actions .text-button{font-size:11px;color:var(--blue);min-height:36px;padding:5px 6px}
+/* Update status remains visible while the settings form is open. */
+.update-panel{border-top:1px solid #dce2ea;margin-top:16px;padding-top:12px}.update-panel h3{font-size:16px;margin:0 0 8px}.update-panel p{font-size:13px;line-height:1.6;color:#6b7485}.update-panel progress{width:100%}.update-panel pre{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;font-size:13px;max-height:180px;overflow:auto}.update-panel .dialog-actions{flex-wrap:wrap;justify-content:flex-start}
+.update-unread{position:relative}.update-unread::after{content:'';position:absolute;right:3px;top:3px;width:7px;height:7px;border-radius:50%;background:#e5484d;pointer-events:none}#update-dialog .update-panel{border:0;margin:0;padding-top:0}
