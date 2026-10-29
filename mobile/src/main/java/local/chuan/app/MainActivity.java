@@ -17,6 +17,17 @@ import java.util.concurrent.*;
 import local.chuan.core.*;
 
 public final class MainActivity extends Activity {
+    boolean pendingUpdatePermission=false;
+    void installUpdate(){
+        try {
+            Engine active=ChuanService.active;if(active!=null)for(Object item:(List<?>)active.snapshot().get("jobs"))if(((Number)((Map<?,?>)item).get("state")).intValue()<3)throw new IOException("当前存在未结束的传输，请结束任务后安装更新");
+            if(!getPackageManager().canRequestPackageInstalls()){pendingUpdatePermission=true;startActivityForResult(new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,Uri.parse("package:"+getPackageName())),701);return;}
+            AppUpdater.get(this).prepareInstall(()->runOnUiThread(()->{if(isFinishing()||isDestroyed())return;try{
+                Engine value=ChuanService.active;if(value!=null)for(Object item:(List<?>)value.snapshot().get("jobs"))if(((Number)((Map<?,?>)item).get("state")).intValue()<3)throw new IOException("当前存在未结束的传输，请结束任务后安装更新");
+                Uri uri=ChuanProvider.updateUri();Intent intent=new Intent(Intent.ACTION_VIEW).setDataAndType(uri,"application/vnd.android.package-archive").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);intent.setClipData(ClipData.newUri(getContentResolver(),"传更新包",uri));startActivity(intent);
+            }catch(Exception error){message(error.getMessage());}}),this::message);
+        }catch(Exception error){message(error.getMessage());}
+    }
     WebView web;final ExecutorService files=Executors.newSingleThreadExecutor();String pickerTarget="";final List<Uri> shared=Collections.synchronizedList(new ArrayList<>());
     void message(String value){runOnUiThread(()->Toast.makeText(this,value,Toast.LENGTH_LONG).show());}
     Engine engine(){Engine value=ChuanService.active;if(value==null)throw new IllegalStateException(ChuanService.status);return value;}
@@ -28,10 +39,13 @@ public final class MainActivity extends Activity {
             @Override public WebResourceResponse shouldInterceptRequest(WebView view,WebResourceRequest request){Uri uri=request.getUrl();try{if(!uri.getScheme().equals("https")||!uri.getHost().equals("app.chuan.local")||uri.getPath().contains(".."))return new WebResourceResponse("text/plain","UTF-8",403,"Forbidden",Collections.emptyMap(),new ByteArrayInputStream(new byte[0]));String name=uri.getPath().substring(1);return new WebResourceResponse(Protocol.mime(name).split(";")[0],"UTF-8",getAssets().open(name));}catch(Exception error){return new WebResourceResponse("text/plain","UTF-8",404,"Not Found",Collections.emptyMap(),new ByteArrayInputStream(new byte[0]));}}
             @Override public boolean shouldOverrideUrlLoading(WebView view,WebResourceRequest request){return !"app.chuan.local".equals(request.getUrl().getHost());}
         });
+        AppUpdater.get(this);if(state!=null)pendingUpdatePermission=state.getBoolean("pendingUpdatePermission",false);
         collectShared(getIntent());startHost();web.loadUrl("https://app.chuan.local/native/app.html");
         if(Build.VERSION.SDK_INT>=33&&checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)!=android.content.pm.PackageManager.PERMISSION_GRANTED)requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS},41);
     }
     @Override protected void onNewIntent(Intent intent){super.onNewIntent(intent);setIntent(intent);collectShared(intent);}
+    @Override protected void onStart(){super.onStart();AppUpdater.get(this).checkOnEntry();}
+    @Override protected void onSaveInstanceState(Bundle state){state.putBoolean("pendingUpdatePermission",pendingUpdatePermission);super.onSaveInstanceState(state);}
     void collectShared(Intent intent){if(intent==null)return;String action=intent.getAction();if(Intent.ACTION_SEND.equals(action)){Uri uri=intent.getParcelableExtra(Intent.EXTRA_STREAM);if(uri!=null)shared.add(uri);}else if(Intent.ACTION_SEND_MULTIPLE.equals(action)){ArrayList<Uri> uris=intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM);if(uris!=null)shared.addAll(uris);}}
     String name(Uri uri)throws IOException {try(Cursor row=getContentResolver().query(uri,new String[]{OpenableColumns.DISPLAY_NAME},null,null,null)){if(row!=null&&row.moveToFirst()&&!row.isNull(0))return row.getString(0);}String path=uri.getLastPathSegment();if(path==null)throw new IOException("无法读取文件名");return path;}
     void persist(Uri uri,int flags){try{getContentResolver().takePersistableUriPermission(uri,flags&(Intent.FLAG_GRANT_READ_URI_PERMISSION|Intent.FLAG_GRANT_WRITE_URI_PERMISSION));}catch(SecurityException ignored){}}
@@ -48,7 +62,7 @@ public final class MainActivity extends Activity {
             if(rows==null)throw new IOException("无法读取文件夹");while(rows.moveToNext()){Uri child=DocumentsContract.buildDocumentUriUsingTree(tree,rows.getString(0));String path=Protocol.safePath(relative+"/"+rows.getString(1));if(rows.getString(2).equals(DocumentsContract.Document.MIME_TYPE_DIR))walk(tree,child,path,out,depth+1);else{out.add(source(child,path));long limit=engine().config.maxFiles;if(limit>0&&out.size()>limit)throw new IOException("超过单批文件数量上限");}}
         }
     }
-    @Override protected void onActivityResult(int request,int result,Intent data){super.onActivityResult(request,result,data);if(result!=RESULT_OK||data==null)return;
+    @Override protected void onActivityResult(int request,int result,Intent data){super.onActivityResult(request,result,data);if(request==701){boolean resume=pendingUpdatePermission;pendingUpdatePermission=false;if(resume&&getPackageManager().canRequestPackageInstalls())installUpdate();else message("安装授权未开启，已保留下载的更新包");return;}if(result!=RESULT_OK||data==null)return;
         if(request==6){Uri target=data.getData();if(target!=null)files.execute(()->{File log=null;try{log=engine().exportDiagnostics();try(InputStream input=new FileInputStream(log);OutputStream output=getContentResolver().openOutputStream(target,"wt")){if(output==null)throw new IOException("无法写入日志文件");byte[] buffer=new byte[65536];int count;while((count=input.read(buffer))!=-1)output.write(buffer,0,count);}message("诊断日志已导出");}catch(Exception error){message("日志导出失败："+error.getMessage());}finally{if(log!=null)log.delete();}});return;}
         if(request==3){Uri tree=data.getData();if(tree==null)return;try{getContentResolver().takePersistableUriPermission(tree,Intent.FLAG_GRANT_READ_URI_PERMISSION|Intent.FLAG_GRANT_WRITE_URI_PERMISSION);ChuanService.prefs(this).edit().putString("receiveTree",tree.toString()).apply();message("接收目录已保存");}catch(Exception error){message("无法保存目录授权："+error.getMessage());}return;}
         String target=pickerTarget;
@@ -61,7 +75,13 @@ public final class MainActivity extends Activity {
     void showFile(Uri uri,String label,boolean share){runOnUiThread(()->{try{String mime=getContentResolver().getType(uri);Intent intent=share?new Intent(Intent.ACTION_SEND).setType(mime==null?"application/octet-stream":mime).putExtra(Intent.EXTRA_STREAM,uri):new Intent(Intent.ACTION_VIEW).setDataAndType(uri,mime==null?"application/octet-stream":mime);intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);intent.setClipData(ClipData.newUri(getContentResolver(),label,uri));startActivity(Intent.createChooser(intent,share?"分享接收文件":"打开接收文件"));}catch(Exception error){message(error.getMessage());}});}
     void open(long id,boolean share){try{Engine.Job job=engine().find(id);if(job==null||job.publicUri.isEmpty())throw new IOException("当前记录没有可打开的接收文件");showFile(Uri.parse(job.publicUri),job.name,share);}catch(Exception error){message(error.getMessage());}}
     final class Bridge {
-        @JavascriptInterface public String state(){try{Engine value=ChuanService.active;Map<String,Object> state=value==null?Json.map("running",false,"notice",ChuanService.status,"name",ChuanService.prefs(MainActivity.this).getString("name",Build.MODEL),"version",Engine.VERSION,"peers",Collections.emptyList(),"jobs",Collections.emptyList(),"requests",Collections.emptyList(),"addresses",Collections.emptyList()):value.snapshot();state.put("sharedCount",shared.size());state.put("receiveTree",ChuanService.prefs(MainActivity.this).getString("receiveTree","").isEmpty()?"应用接收目录":"已授权的系统目录");return Json.stringify(state);}catch(Exception error){return Json.stringify(Json.map("error",error.getMessage()));}}
+        @JavascriptInterface public void checkUpdate(){AppUpdater.get(MainActivity.this).check();}
+        @JavascriptInterface public void readUpdateNotice(boolean detail){AppUpdater.get(MainActivity.this).readNotice(detail);}
+        @JavascriptInterface public void downloadUpdate(){AppUpdater.get(MainActivity.this).download();}
+        @JavascriptInterface public void cancelUpdate(){AppUpdater.get(MainActivity.this).cancel();}
+        @JavascriptInterface public void installUpdate(){runOnUiThread(()->MainActivity.this.installUpdate());}
+        @JavascriptInterface public void updatePage(){runOnUiThread(()->{try{startActivity(new Intent(Intent.ACTION_VIEW,Uri.parse(UpdateRelease.PAGE)));}catch(Exception error){message(error.getMessage());}});}
+        @JavascriptInterface public String state(){try{Engine value=ChuanService.active;Map<String,Object> state=value==null?Json.map("running",false,"notice",ChuanService.status,"name",ChuanService.prefs(MainActivity.this).getString("name",Build.MODEL),"version",Engine.VERSION,"peers",Collections.emptyList(),"jobs",Collections.emptyList(),"requests",Collections.emptyList(),"addresses",Collections.emptyList()):value.snapshot();state.put("update",AppUpdater.get(MainActivity.this).state());state.put("sharedCount",shared.size());state.put("receiveTree",ChuanService.prefs(MainActivity.this).getString("receiveTree","").isEmpty()?"应用接收目录":"已授权的系统目录");return Json.stringify(state);}catch(Exception error){return Json.stringify(Json.map("error",error.getMessage()));}}
         @JavascriptInterface public void pickFiles(String target){runOnUiThread(()->{pickerTarget=target;Intent intent=new Intent(Intent.ACTION_OPEN_DOCUMENT).setType("*/*").addCategory(Intent.CATEGORY_OPENABLE).putExtra(Intent.EXTRA_ALLOW_MULTIPLE,true);startActivityForResult(intent,1);});}
         @JavascriptInterface public void pickFolder(String target){runOnUiThread(()->{pickerTarget=target;startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION|Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION),2);});}
         @JavascriptInterface public void sendShared(String target){List<Uri> pending;synchronized(shared){pending=new ArrayList<>(shared);shared.clear();}files.execute(()->{try{List<Engine.Source> selected=new ArrayList<>();for(Uri uri:pending)selected.add(source(uri,name(uri)));engine().send(target,selected);}catch(Exception error){message(error.getMessage());}});}

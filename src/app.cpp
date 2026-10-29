@@ -3,6 +3,7 @@
 #include "ui.h"
 #include "transfer_view.h"
 #include "approval_view.h"
+#include "updater.h"
 #include <algorithm>
 #include <cmath>
 #include <commctrl.h>
@@ -50,6 +51,8 @@ RECT DefaultWindowBounds(const RECT &workArea) {
 }
 struct App {
     Engine &engine;
+    update::Manager updater;
+    bool settingsUpdateDot = false;
     HWND window = nullptr, devices = nullptr, tasks = nullptr, drop = nullptr, request = nullptr,
          status = nullptr, accept = nullptr, reject = nullptr, cancel = nullptr, partial = nullptr;
     HWND settingsButton = nullptr, refreshButton = nullptr, connectButton = nullptr, clearButton = nullptr,
@@ -411,6 +414,8 @@ struct App {
         RedrawWindow(window,nullptr,nullptr,RDW_INVALIDATE|RDW_ALLCHILDREN);
     }
     void Update(const Snapshot *sample=nullptr) {
+        const bool unread = updater.Get().settingsUnread;
+        if (unread != settingsUpdateDot) { settingsUpdateDot = unread; InvalidateRect(settingsButton, nullptr, FALSE); }
         auto oldName = snapshot.config.name;
         const bool oldAutoReceive = snapshot.config.autoReceive;
         snapshot = sample?*sample:engine.GetSnapshot();
@@ -917,6 +922,10 @@ struct App {
             const float labelX = navigation ? 46.f : d.CtlID == NotePeer ? 38.f : 42.f;
             if (d.CtlID != Refresh) c.TextColor(text, labelX, 0, w - labelX - 4, h, normal, color);
         } else c.TextColor(text, 0, 0, w, h, normal, color, DWRITE_TEXT_ALIGNMENT_CENTER);
+        const auto updateState = updater.Get();
+        if ((d.hwndItem == settingsButton && updateState.settingsUnread) ||
+            (modal && d.CtlID == 17 && updateState.updateUnread))
+            c.BoxColor(w - 11, 4, 7, 7, 3.5f, D2D1::ColorF(0xE5484D));
     }
 
     void SendPaths(const std::vector<fs::path> &files) {
@@ -1210,6 +1219,42 @@ struct Modal {
          port = nullptr, help = nullptr, maxFiles = nullptr, maxBytes = nullptr, itemList = nullptr;
     bool qr = false;std::unique_ptr<qrcodegen::QrCode> qrCode;
     bool settings = false, done = false, web = false, note = false, approval = false, directory = false;
+    bool updating = false, openUpdater = false;
+    HWND updateAction = nullptr, updateProgress = nullptr, updateNotes = nullptr, updateCancel = nullptr;
+    bool updateEntryDot = false;
+    void UpdateStatus(const update::Status *sample = nullptr) {
+        if (settings || updating) app.updater.SettingsRead();
+        if (updating) app.updater.UpdateRead();
+        const auto state = sample ? *sample : app.updater.Get();
+        if (settings && state.updateUnread != updateEntryDot) { updateEntryDot = state.updateUnread; InvalidateRect(GetDlgItem(window, 17), nullptr, FALSE); }
+        if (!updating) return;
+        const bool busy = state.phase == update::Phase::Checking || state.phase == update::Phase::Downloading;
+        auto message = state.message;
+        if (state.phase == update::Phase::Downloading && state.total)
+            message += L"  " + FormatBytes(state.done) + L" / " + FormatBytes(state.total);
+        SetWindowTextW(help, message.c_str());
+        EnableWindow(updateAction, !busy);
+        SetWindowTextW(updateAction, state.phase == update::Phase::Ready ? L"立即重启" : state.phase == update::Phase::Available ? L"下载更新" : L"检查更新");
+        EnableWindow(updateCancel, busy);
+        ShowWindow(updateProgress, state.phase == update::Phase::Downloading ? SW_SHOW : SW_HIDE);
+        ShowWindow(updateCancel, busy ? SW_SHOW : SW_HIDE);
+        SetWindowTextW(updateCancel, state.phase == update::Phase::Checking ? L"取消检查" : L"取消下载");
+        ShowWindow(updateNotes, state.notes.empty() ? SW_HIDE : SW_SHOW);
+        SendMessageW(updateProgress, PBM_SETPOS, state.total ? static_cast<WPARAM>(state.done * 100 / state.total) : 0, 0);
+        if (Value(updateNotes) != state.notes) SetWindowTextW(updateNotes, state.notes.c_str());
+    }
+    void UpdateAction() {
+        const auto state = app.updater.Get();
+        if (state.phase == update::Phase::Ready) {
+            if (app.engine.HasActiveTransfers()) { MessageBoxW(window, L"当前存在未结束的传输，请结束任务后重启更新。", L"在线更新", MB_OK | MB_ICONINFORMATION); return; }
+            std::wstring error;
+            if (!app.updater.Restart(window, app.engine.GetSnapshot().config.dataDir, error)) { MessageBoxW(window, error.c_str(), L"在线更新", MB_OK | MB_ICONERROR); return; }
+            done = true;
+            PostMessageW(app.window, WM_CLOSE, 0, 0);
+        } else if (state.phase == update::Phase::Available) app.updater.Download();
+        else app.updater.Check();
+        UpdateStatus();
+    }
     uint64_t approvalId = 0;
     std::vector<OfferItem> approvalItems;
     std::string noteIp;
@@ -1242,7 +1287,7 @@ struct Modal {
         RECT r{};
         GetClientRect(window, &r);
         app.Buffered(ps.hdc, r, 1, [&](ui::Canvas &c, float w, float) {
-            if(qr)return;
+            if(qr || updating)return;
             for (auto &r : editFrames)
                 c.Box(r.left, r.top, r.right - r.left, r.bottom - r.top, 7, 1, .84f);
             c.Line(24,
@@ -1275,7 +1320,18 @@ struct Modal {
     }
     void Create() {
         auto &cfg = app.snapshot.config;
-        if(qr){
+        if (updating) {
+            app.updater.UpdateRead();
+            Control(L"STATIC", (L"当前版本 V" + std::wstring(Version) + L" · Windows x64").c_str(), 0, 24, 20, 512, 24, 0);
+            help = Control(L"STATIC", L"", SS_LEFT, 24, 54, 512, 54, 0);
+            updateProgress = Control(PROGRESS_CLASSW, L"", 0, 24, 112, 512, 16, 0);
+            updateNotes = Control(L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, 24, 148, 512, 164, 0);
+            Control(L"BUTTON", L"发布页", WS_TABSTOP, 24, 350, 88, 34, 19);
+            updateCancel = Control(L"BUTTON", L"取消下载", WS_TABSTOP, 124, 350, 104, 34, 18);
+            Control(L"BUTTON", L"关闭", WS_TABSTOP, 328, 350, 88, 34, 8);
+            updateAction = Control(L"BUTTON", L"检查更新", WS_TABSTOP, 428, 350, 108, 34, 17);
+            SetTimer(window, 2, 200, nullptr); UpdateStatus();
+        } else if(qr){
             Control(L"STATIC",L"扫描二维码访问 Web 服务",0,24,18,352,24,0);
             name=Control(L"COMBOBOX",L"",WS_TABSTOP|CBS_DROPDOWNLIST|CBS_HASSTRINGS|WS_VSCROLL,24,52,352,140,1);
             auto addresses=app.snapshot.interfaces;
@@ -1371,6 +1427,11 @@ struct Modal {
             Control(L"BUTTON", L"清除日志", WS_TABSTOP | BS_PUSHBUTTON, 174, 457, 84, 33, 16);
             Control(L"BUTTON", L"取消", WS_TABSTOP | BS_PUSHBUTTON, 268, 457, 81, 33, 8);
             Control(L"BUTTON", L"保存", WS_TABSTOP | BS_DEFPUSHBUTTON, 360, 457, 84, 33, 9);
+            Control(L"STATIC", (L"当前版本 V" + std::wstring(Version)).c_str(), 0, 24, 510, 260, 24, 0);
+            Control(L"BUTTON", L"检查更新", WS_TABSTOP, 336, 505, 108, 33, 17);
+            app.updater.SettingsRead();
+            InvalidateRect(app.settingsButton, nullptr, FALSE);
+            SetTimer(window, 2, 200, nullptr); UpdateStatus();
         } else {
             Control(L"STATIC", L"目标设备地址", 0, 24, 20, 350, 24, 0);
             name = Control(L"EDIT", L"192.168.1.12:45871", WS_TABSTOP | ES_AUTOHSCROLL, 24, 51, 420, 31, 1);
@@ -1504,6 +1565,13 @@ struct Modal {
             self->Paint();
             return 0;
         case WM_COMMAND:
+            if (HIWORD(w) == BN_CLICKED && LOWORD(w) == 17) {
+                if (self->updating) self->UpdateAction();
+                else if (self->settings) { self->openUpdater = true; self->done = true; }
+                return 0;
+            }
+            if (self->updating && LOWORD(w) == 18) { self->app.updater.Cancel(); return 0; }
+            if (self->updating && LOWORD(w) == 19) { ShellExecuteW(h, L"open", update::ReleasePage, nullptr, nullptr, SW_SHOWNORMAL); return 0; }
             if(self->qr&&LOWORD(w)==1&&HIWORD(w)==CBN_SELCHANGE)self->UpdateQr();
             if(self->settings&&LOWORD(w)==16&&HIWORD(w)==BN_CLICKED){const bool cleared=self->app.engine.ClearDiagnostics();MessageBoxW(h,cleared?L"服务端日志已清除。":L"日志清除失败，请检查文件权限。",L"诊断日志",MB_OK|(cleared?MB_ICONINFORMATION:MB_ICONERROR));}
             if(self->settings&&LOWORD(w)==15&&HIWORD(w)==BN_CLICKED){
@@ -1528,6 +1596,9 @@ struct Modal {
         case WM_DRAWITEM:
             self->app.DrawItem(*reinterpret_cast<DRAWITEMSTRUCT *>(l));
             return TRUE;
+        case WM_TIMER:
+            self->UpdateStatus();
+            return 0;
         case WM_CLOSE:
             self->done = true;
             return 0;
@@ -1549,14 +1620,14 @@ struct Modal {
         cls.hCursor = LoadCursorW(nullptr, IDC_ARROW);
         cls.hbrBackground = app.white;
         RegisterClassW(&cls);
-        int h = qr ? 468 : web || directory ? 254 : settings ? 522 : approval ? 496 : 232;
-        RECT r{0, 0, app.Px(qr ? 400.f : approval ? 608.f : web || directory ? 590.f : 470.f), app.Px(static_cast<float>(h))};
+        int h = updating ? 410 : qr ? 468 : web || directory ? 254 : settings ? 562 : approval ? 496 : 232;
+        RECT r{0, 0, app.Px(updating ? 560.f : qr ? 400.f : approval ? 608.f : web || directory ? 590.f : 470.f), app.Px(static_cast<float>(h))};
         AdjustWindowRectExForDpi(&r, WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN, FALSE, WS_EX_DLGMODALFRAME,
                                  GetDpiForWindow(app.window));
         RECT owner{};
         GetWindowRect(app.window, &owner);
         window = CreateWindowExW(WS_EX_DLGMODALFRAME, L"ChuanModal",
-                                 qr ? L"Web 服务二维码" : directory  ? L"接收目录"
+                                 updating ? L"在线更新" : qr ? L"Web 服务二维码" : directory  ? L"接收目录"
                                  : web      ? L"Web 服务"
                                  : settings ? L"设置"
                                  : approval ? L"接受部分文件" : note ? L"IP 临时备注" : L"手动连接",
@@ -1579,8 +1650,10 @@ struct Modal {
             }
             if (message.message == WM_KEYDOWN && message.wParam == VK_RETURN) {
                 const auto focusedId = GetDlgCtrlID(GetFocus());
-                if (directory && (focusedId == 3 || focusedId == 8 || focusedId == 12))
+                wchar_t focusedClass[32]{}; GetClassNameW(GetFocus(), focusedClass, 32);
+                if (wcscmp(focusedClass, L"Button") == 0)
                     SendMessageW(window, WM_COMMAND, MAKEWPARAM(focusedId, BN_CLICKED), reinterpret_cast<LPARAM>(GetFocus()));
+                else if (updating) UpdateAction();
                 else Save();
                 continue;
             }
@@ -1593,6 +1666,7 @@ struct Modal {
         EnableWindow(app.window, TRUE);
         SetForegroundWindow(app.window);
         app.Update();
+        if (openUpdater) { Modal dialog(app, false); dialog.updating = true; dialog.Run(); }
     }
 };
 void App::PartialDialog() {
@@ -1743,6 +1817,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int show) {
         }
     }
     LocalFree(argv);
+    if (const auto helper = update::RunHelper(options); helper >= 0) { CoUninitialize(); return helper; }
     Config cfg = LoadConfig(options.contains(L"--data-dir") ? fs::path(options[L"--data-dir"]) : fs::path{});
     unsigned short p;
     if (options.contains(L"--port")) {
@@ -1836,7 +1911,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int show) {
         CoUninitialize();
         return code;
     }
-    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_STANDARD_CLASSES | ICC_LISTVIEW_CLASSES | ICC_TREEVIEW_CLASSES};
+    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_STANDARD_CLASSES | ICC_LISTVIEW_CLASSES | ICC_TREEVIEW_CLASSES | ICC_PROGRESS_CLASS};
     InitCommonControlsEx(&controls);
     App app(engine);
     WNDCLASSEXW cls{sizeof(cls)};
@@ -1870,6 +1945,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int show) {
     DwmSetWindowAttribute(window, 34, &border, sizeof(border));
     ShowWindow(window, show);
     UpdateWindow(window);
+    app.updater.Check();
+    if (options.contains(L"--update-event")) {
+        const auto &name = options[L"--update-event"];
+        if (name.starts_with(L"Local\\ChuanUpdate-")) {
+            HANDLE ready = OpenEventW(EVENT_MODIFY_STATE, FALSE, name.c_str());
+            if (ready) { SetEvent(ready); CloseHandle(ready); }
+        }
+    }
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
         if (!IsDialogMessageW(window, &msg)) {

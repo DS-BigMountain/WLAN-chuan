@@ -18,8 +18,8 @@ LANGUAGE LANG_CHINESE, SUBLANG_CHINESE_SIMPLIFIED
 213 RCDATA "web/zip_stream_worker.js"
 214 RCDATA "third_party/qrcodegen/THIRD-PARTY-NOTICES.txt"
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 2,2,0,0
- PRODUCTVERSION 2,2,0,0
+ FILEVERSION 2,3,0,0
+ PRODUCTVERSION 2,3,0,0
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0
  FILEOS VOS_NT_WINDOWS32
@@ -30,9 +30,9 @@ BEGIN
   BLOCK "080404b0"
   BEGIN
    VALUE "FileDescription", "传 · 局域网文件传输\0"
-   VALUE "FileVersion", "2.2.0\0"
+   VALUE "FileVersion", "2.3.0\0"
    VALUE "ProductName", "传\0"
-   VALUE "ProductVersion", "2.2.0\0"
+   VALUE "ProductVersion", "2.3.0\0"
    VALUE "OriginalFilename", "Chuan.exe\0"
   END
  END
