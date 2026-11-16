@@ -52,7 +52,7 @@ try{
       assert.equal(uploaded.status,201,uploaded.body);const id=JSON.parse(uploaded.body).id;
       const saved=createHash('sha256');for await(const chunk of createReadStream(path.join(root,'received',name)))saved.update(chunk);
       assert.equal(saved.digest('hex'),expected,'saved payload');
-      const downloadAt=performance.now(),download=await request('/web/files/'+id+'?client='+client,{},null,true).result;
+      const downloadAt=performance.now(),download=await request('/web/files/'+id+'?client='+client+'&ticket='+token,{},null,true).result;
       const downloadMs=performance.now()-downloadAt;assert.equal(download.status,200);assert.equal(download.bytes,size);assert.equal(download.body,expected,'downloaded payload');
       const sample={chunkBytes,repeat,id,bytes:size,uploadMs,downloadMs,uploadMiBs:size/1048576/(uploadMs/1000),downloadMiBs:size/1048576/(downloadMs/1000)};
       samples.push(sample);console.log(JSON.stringify(sample));

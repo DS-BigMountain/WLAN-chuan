@@ -4,7 +4,7 @@
             struct Segment{std::filesystem::path path;std::string name;uint64_t start,end;};std::vector<Segment> files;
             const auto owner=clientJson.empty()?std::string("native"):clientJson;auto cursor=exportCursors_.contains(owner)?exportCursors_.at(owner):exportCursors_["__initial__"];
             for(const auto &entry:std::filesystem::directory_iterator(directory_))if(entry.is_regular_file()&&entry.path().filename().wstring().starts_with(L"transfer-")&&entry.path().extension()==L".jsonl"){
-                const auto name=entry.path().filename().string();const auto size=entry.file_size();const auto previous=cursor.contains(name)?cursor.at(name):0;
+                const auto name=entry.path().filename().string();const auto size=SegmentSize(entry.path());const auto previous=cursor.contains(name)?cursor.at(name):0;
                 files.push_back({entry.path(),name,std::min<uint64_t>(previous,size),size});
             }
             std::sort(files.begin(),files.end(),[](const auto &a,const auto &b){return std::filesystem::last_write_time(a.path)>std::filesystem::last_write_time(b.path);});
@@ -16,7 +16,26 @@
             for(auto it=files.rbegin();it!=files.rend();++it){const auto &file=*it;if(!selectedNames.contains(file.name))continue;
                 std::ifstream input(file.path,std::ios::binary);if(!input)throw std::runtime_error("log read");input.seekg(static_cast<std::streamoff>(file.start));std::string line;
                 while(input&&static_cast<uint64_t>(input.tellg())<file.end&&std::getline(input,line)){
-                    if(clientJson.empty()||line.find("\"event\":\"session_start\"")!=std::string::npos||line.find("\"event\":\"resources\"")!=std::string::npos||line.find("\"client_id\":"+clientJson)!=std::string::npos||line.find("\"recipient_id\":"+clientJson)!=std::string::npos){out<<line<<'\n';++records;}
+                    if(clientJson.empty()||line.find("\"event\":\"session_start\"")!=std::string::npos||line.find("\"event\":\"resources\"")!=std::string::npos||line.find("\"client_id\":"+clientJson)!=std::string::npos||line.find("\"recipient_id\":"+clientJson)!=std::string::npos){
+                        std::string emitted=line;
+                        if(!clientJson.empty()){
+                            for(const std::string_view field:{std::string_view("\"client_id\":"),std::string_view("\"recipient_id\":")}){
+                                size_t pos=0;
+                                while((pos=emitted.find(field,pos))!=std::string::npos){
+                                    size_t valStart=pos+field.size();
+                                    while(valStart<emitted.size()&&(emitted[valStart]==' '||emitted[valStart]=='\t'))++valStart;
+                                    if(valStart<emitted.size()&&emitted[valStart]=='"'){
+                                        size_t valEnd=valStart+1;bool esc=false;
+                                        while(valEnd<emitted.size()){char c=emitted[valEnd++];if(esc){esc=false;continue;}if(c=='\\'){esc=true;continue;}if(c=='"')break;}
+                                        const std::string_view token(emitted.data()+valStart,valEnd-valStart);
+                                        if(token!="\"\""&&token!=clientJson){emitted.replace(valStart,valEnd-valStart,"\"[redacted]\"");valEnd=valStart+12;}
+                                        pos=valEnd;
+                                    }else{pos=valStart;}
+                                }
+                            }
+                        }
+                        out<<emitted<<'\n';++records;
+                    }
                 }
             }
             out<<"{\"event\":\"export_summary\",\"incremental\":true,\"exported_records\":"<<records<<",\"omitted_bytes\":"<<omitted<<"}\n";

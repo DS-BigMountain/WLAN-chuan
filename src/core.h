@@ -23,7 +23,7 @@ namespace chuan {
 class SegmentConnections;
 namespace diagnostic { class Log; }
 namespace archive { struct Artifact; struct Plan; }
-inline constexpr wchar_t Version[] = L"2.3.0";
+inline constexpr wchar_t Version[] = L"2.4.0";
 inline constexpr unsigned short DefaultPort = 45871;
 inline constexpr unsigned short DefaultDiscoveryPort = 45872;
 namespace fs = std::filesystem;
@@ -151,15 +151,15 @@ class Engine {
         Transfer view;
         std::atomic<bool> cancel{false};
         std::atomic<bool> paused{false};
-        bool remotePaused=false;
-        bool resumeReset=false;
+        std::atomic<bool> remotePaused{false};
+        std::atomic<bool> resumeReset{false};
         int decision = 0;
         std::condition_variable cv;
         std::string webClient, webUpload, webTab;
         bool browserPaused=false;
         std::wstring resumeActivity;
         std::string nativeOwner;
-        fs::path archiveSource;
+        fs::path archiveSource, partialPath;
         std::shared_ptr<archive::Artifact> archiveFile;
         std::shared_ptr<archive::Plan> archivePlan;
         std::string folderId, folderKey;
@@ -168,21 +168,22 @@ class Engine {
         std::string recipient;
         BY_HANDLE_FILE_INFORMATION fileIdentity{};
         bool hasIdentity = false;
-        bool verificationPending = false;
+        std::atomic<bool> verificationPending{false};
         bool staging = false;
         bool hidden = false;
         bool diagnosticReported = false;
         int traceState=-1;std::wstring tracePhase,traceError;
         uint64_t traceAt=0,traceCreated=0,traceSample=0,traceBytes=0;
         bool announced = false;
-        uint64_t finishedAt = 0,progressBase=0;
+        uint64_t finishedAt = 0;
+        std::atomic<uint64_t> progressBase{0};
         std::atomic<uint64_t> retryDeadline{0};
         std::atomic<bool> retryExpired{false};
         std::wstring targetId;
         std::wstring senderName;
         std::atomic<unsigned> segmentActive{0};
         std::atomic<uint64_t> segmentDone{0};
-        bool parallelDisabled = false;
+        std::atomic<bool> parallelDisabled{false};
         std::set<std::string> hiddenClients;
     };
     struct WebFile {
@@ -218,7 +219,7 @@ class Engine {
     std::map<std::string,std::shared_ptr<ParallelUpload>> parallelUploads_;
     struct FolderApproval {
         std::wstring name;
-        uint64_t count = 0, total = 0, reserved = 0, prompt = 0;
+        uint64_t count = 0, total = 0, reserved = 0, prompt = 0, touched = 0;
         int decision = 0;
         std::set<std::wstring> paths;
     };
@@ -251,7 +252,7 @@ class Engine {
     void ReceivePhase(SOCKET socket,const std::map<std::string,std::string> &headers,const std::string &ip,const std::string &upload,bool browser);
     void RetryUpload(SOCKET socket,const std::map<std::string,std::string> &headers,const std::string &ip,const std::string &upload,bool browser);
     void QueueRetry(const Peer &peer,const fs::path &path,const std::shared_ptr<Job> &job);
-    struct RetryItem {Peer peer;fs::path path;std::shared_ptr<Job> job;};
+    struct RetryItem {Peer peer;fs::path path;std::shared_ptr<Job> job;uint64_t nextAt=0;};
     std::vector<RetryItem> retryQueue_;
     std::thread retryThread_,retryTimerThread_;
     std::condition_variable retryCv_;
@@ -270,7 +271,7 @@ class Engine {
         std::string token, ip;
         std::map<std::string, uint64_t> tabs;
         std::set<std::string> openTabs;
-        uint64_t ping = 0, ack = 0, pingAt = 0;
+        uint64_t ping = 0, ack = 0, pingAt = 0, lastSeen = 0;
         uint64_t maxFiles = 0, maxBytes = 0;
         std::map<std::string, std::wstring> notes;
     };
@@ -296,12 +297,15 @@ class Engine {
     std::atomic<unsigned> diagnosticPreparing_{0},diagnosticVerifying_{0},diagnosticTransferring_{0};
     std::map<SOCKET, std::weak_ptr<Job>> sockets_;
     std::vector<Network> networks_;
+    std::atomic<uint64_t> lastNetworkRefresh_{0};
     std::atomic<bool> running_{false};
     std::atomic<bool> refresh_{false};
     SOCKET listener_ = INVALID_SOCKET, discovery_ = INVALID_SOCKET;
     std::thread serverThread_, discoveryThread_;
     uint64_t nextJob_ = 1;
     bool winsock_ = false;
+    void RefreshNetworksLocked();
+    void RefreshNetworks();
     bool Launch(std::function<void()> fn);
     void CollectWorkers();
     void ServerLoop();
@@ -309,7 +313,7 @@ class Engine {
     void HandleClient(SOCKET socket, const std::string &ip);
     bool HandleWeb(SOCKET socket, const std::string &ip, const std::string &method, const std::string &path,
                    const std::map<std::string, std::string> &headers);
-    void WebDownload(SOCKET socket, const std::string &ip, uint64_t id, const std::string &client = {},bool checksum=false,uint64_t offset=0,const std::string &prefix={},bool range=false);
+    void WebDownload(SOCKET socket, const std::string &ip, uint64_t id, const std::string &client = {},bool checksum=false,uint64_t offset=0,const std::string &prefix={},bool range=false,uint64_t sliceEnd=UINT64_MAX);
     void ServeSegment(SOCKET socket,const WebFile &file,uint64_t offset,uint64_t length,bool web);
     std::vector<char> FetchSegment(const std::string &ip,unsigned short port,const std::string &token,uint64_t offset,uint64_t length,const std::shared_ptr<Job> &job,const std::shared_ptr<SegmentConnections> &connections);
     void WebParallelUpload(SOCKET socket,const std::string &path,const std::map<std::string,std::string> &headers);
@@ -327,7 +331,8 @@ class Engine {
     void Progress(const std::shared_ptr<Job> &job, uint64_t done);
     void TrackSocket(SOCKET socket, const std::shared_ptr<Job> &job = {});
     void ReleaseSocket(SOCKET socket);
-    bool IsLocal(const std::string &ip) const;
+    bool IsLocalLocked(const std::string &ip) const;
+    bool IsLocal(const std::string &ip);
     void Notice(const std::wstring &value);
     std::set<std::string> BusyFoldersLocked();
     std::string Advertisement();

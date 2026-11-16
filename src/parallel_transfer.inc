@@ -6,14 +6,13 @@ void Engine::ServeSegment(SOCKET s,const WebFile &source,uint64_t offset,uint64_
     const auto release=std::shared_ptr<void>(nullptr,[job](void*){--job->segmentActive;});
     {
         std::lock_guard lock(mutex_);
-        if(!running_||job->cancel||job->paused||(web&&!config_.shareSoftware)){Reply(s,409,"Conflict");return;}
+        if(!running_||job->cancel||job->paused||job->view.state>=State::Completed||(web&&!config_.shareSoftware)){Reply(s,409,"Conflict");return;}
         if(web&&job->view.state!=State::Running){
-            if(job->segmentActive.load()!=1){Reply(s,409,"Conflict");return;}
             job->segmentDone=0;job->view.done=0;job->progressBase=0;job->view.started=Now();
             job->view.state=State::Running;job->view.activity=L"多连接并行发送";TraceJobLocked(job);
         }
     }
-    WinFile file(CreateFileW(source.path.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_FLAG_SEQUENTIAL_SCAN,nullptr));
+    WinFile file(CreateFileW(source.path.c_str(),GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,FILE_FLAG_SEQUENTIAL_SCAN,nullptr));
     BY_HANDLE_FILE_INFORMATION actual{};LARGE_INTEGER size{};
     if(file.value==INVALID_HANDLE_VALUE||!GetFileInformationByHandle(file.value,&actual)||!GetFileSizeEx(file.value,&size)||
         static_cast<uint64_t>(size.QuadPart)!=source.size||actual.dwVolumeSerialNumber!=source.identity.dwVolumeSerialNumber||

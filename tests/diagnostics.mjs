@@ -30,7 +30,7 @@ try {
  const headers={'X-Chuan-Path':hex('sample.bin'),'X-Chuan-Sender':hex('Audit'),'X-Chuan-Size':String(data.length),'X-Chuan-Upload':key,'X-Chuan-Hash-Ms':'1234'};
  const upload=await post('/web/api/upload',Buffer.concat([data,digest]),headers);assert.equal(upload.status,201);const id=JSON.parse(upload.body).id;
  assert.deepEqual(await readFile(path.join(work,'received/sample.bin')),data);
- const download=await request('/web/files/'+id+'?client='+client);assert.equal(download.status,200);assert.deepEqual(download.body,data);
+ const download=await request('/web/files/'+id+'?client='+client+'&ticket='+token);assert.equal(download.status,200);assert.deepEqual(download.body,data);
  const report={'X-Chuan-Upload':key,'X-Chuan-Hash-Ms':'1234','X-Chuan-Upload-Ms':'1500','X-Chuan-Body-Ms':'1400','X-Chuan-Status':'201'};
  assert.equal((await post('/web/api/diagnostic',Buffer.alloc(0),{...report,'X-Chuan-Token':'wrong'})).status,403);
  const otherState=JSON.parse((await state(other)).body);

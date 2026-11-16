@@ -1,14 +1,22 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$AndroidSdk = $(if ($env:ANDROID_SDK_ROOT) { $env:ANDROID_SDK_ROOT } else { $env:ANDROID_HOME }),
-    [string]$DesktopExe = '../build/v2.3.0/Release/Chuan.exe'
+    [string]$DesktopExe = '../build/v2.4.0/Release/Chuan.exe'
 )
 $ErrorActionPreference = 'Stop'
 $taskMobileRoot = $PSScriptRoot
 $taskRoot = Split-Path -Parent $taskMobileRoot
 if (-not $AndroidSdk -or -not (Test-Path -LiteralPath $AndroidSdk)) { throw '请通过 -AndroidSdk 指定含 Android 35 与 Build Tools 35.0.0 的 SDK。' }
 $taskSdk = [IO.Path]::GetFullPath($AndroidSdk)
-$taskTools = Join-Path $taskSdk 'build-tools/35.0.0'
+$taskToolsRoot = Join-Path $taskSdk 'build-tools'
+$taskTools = Join-Path $taskToolsRoot '35.0.0'
+if (-not (Test-Path -LiteralPath $taskTools)) {
+    $taskTools = Get-ChildItem -LiteralPath $taskToolsRoot -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^\d+\.\d+\.\d+$' -and [version]$_.Name -ge [version]'35.0.0' } |
+        Sort-Object { [version]$_.Name } -Descending |
+        Select-Object -First 1 -ExpandProperty FullName
+}
+if (-not $taskTools -or -not (Test-Path -LiteralPath $taskTools)) { throw '请通过 -AndroidSdk 指定含 Build Tools >= 35.0.0 的 SDK。' }
 $taskAndroidJar = Join-Path $taskSdk 'platforms/android-35/android.jar'
 foreach ($taskTool in @('aapt2.exe','d8.bat','zipalign.exe','apksigner.bat')) { if (-not (Test-Path -LiteralPath (Join-Path $taskTools $taskTool))) { throw ('缺少 Android 构建工具：' + $taskTool) } }
 if (-not [IO.Path]::IsPathRooted($DesktopExe)) { $DesktopExe = Join-Path $taskMobileRoot $DesktopExe }
@@ -44,12 +52,12 @@ $taskHtml = (Get-Content -LiteralPath (Join-Path $taskMobileRoot 'src/main/asset
 function Invoke-MobileTool([string]$Executable,[string[]]$Arguments) { & $Executable @Arguments; if ($LASTEXITCODE -ne 0) { throw ('Android 构建失败：' + [IO.Path]::GetFileName($Executable)) } }
 Invoke-MobileTool (Join-Path $taskTools 'aapt2.exe') @('compile','--dir',(Join-Path $taskWork 'res'),'-o',(Join-Path $taskWork 'resources.zip'))
 Invoke-MobileTool (Join-Path $taskTools 'aapt2.exe') @('link','-I',$taskAndroidJar,'--manifest',(Join-Path $taskWork 'AndroidManifest.xml'),'-A',(Join-Path $taskWork 'assets'),(Join-Path $taskWork 'resources.zip'),'--java',(Join-Path $taskWork 'generated'),'-o',(Join-Path $taskWork 'resources.apk'),'--min-sdk-version','26','--target-sdk-version','35')
-$taskJavaFiles = @(& rg --files (Join-Path $taskMobileRoot 'src/main/java') (Join-Path $taskWork 'generated') -g '*.java')
+$taskJavaFiles = @(Get-ChildItem -Path (Join-Path $taskMobileRoot 'src/main/java'),(Join-Path $taskWork 'generated') -Recurse -Filter '*.java' -File | ForEach-Object { $_.FullName })
 $taskJavaArgs = @('-encoding','UTF-8','--release','8','-Xlint:-options','-classpath',$taskAndroidJar,'-d',(Join-Path $taskWork 'classes')) + $taskJavaFiles
 $taskArgsFile = Join-Path $taskWork 'javac.args'
 [IO.File]::WriteAllLines($taskArgsFile,($taskJavaArgs | ForEach-Object { '"' + $_.Replace('\','/') + '"' }),[Text.UTF8Encoding]::new($false))
 Invoke-MobileTool 'javac.exe' @('@' + $taskArgsFile)
-$taskClassFiles = @(& rg --files (Join-Path $taskWork 'classes') -g '*.class')
+$taskClassFiles = @(Get-ChildItem -Path (Join-Path $taskWork 'classes') -Recurse -Filter '*.class' -File | ForEach-Object { $_.FullName })
 $taskDexArgs = @('--lib',$taskAndroidJar,'--min-api','26','--output',(Join-Path $taskWork 'dex')) + $taskClassFiles
 $taskDexArgsFile = Join-Path $taskWork 'd8.args'
 [IO.File]::WriteAllLines($taskDexArgsFile,($taskDexArgs | ForEach-Object { $_.Replace('\','/') }),[Text.UTF8Encoding]::new($false))

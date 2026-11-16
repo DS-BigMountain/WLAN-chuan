@@ -6,10 +6,16 @@ std::wstring Engine::AutoNameLocked(const std::string &key) {
 }
 void Engine::ExpireLocked() {
     const auto now = Now();
-    for (auto &[key, session] : browsers_) {
+    for (auto it = browsers_.begin(); it != browsers_.end();) {
+        auto &session = it->second;
         std::erase_if(session.tabs, [&](auto &tab) { return now - tab.second >= BrowserPresenceGrace; });
         if (session.tabs.empty())
             std::erase_if(peers_, [&](auto &p) { return p.id == session.id; });
+        const bool idle = session.tabs.empty() && now - session.lastSeen > 60ull * 60 * 1000 &&
+            std::none_of(jobs_.begin(), jobs_.end(), [&](const auto &j) { return j->webClient == it->first || j->recipient == it->first; }) &&
+            std::none_of(webFiles_.begin(), webFiles_.end(), [&](const auto &w) { return w.second.owner == it->first || w.second.recipient == it->first; });
+        if (idle) it = browsers_.erase(it);
+        else ++it;
     }
     std::erase_if(peers_, [&](auto &p) { return !PeerSeenRecently(p,now); });
     const auto pause=[&](const auto &job,bool paused,const wchar_t *message){
@@ -19,7 +25,7 @@ void Engine::ExpireLocked() {
     for (auto &job : jobs_) if (job->announced && job->view.state==State::Queued) {
         if(!job->nativeOwner.empty()){
             uint64_t touched=job->view.started;for(const auto &[key,batch]:batchApprovals_)if(key.ends_with(":"+job->nativeOwner+":"+job->batchId))touched=std::max(touched,batch.touched);
-            const bool active=std::any_of(jobs_.begin(),jobs_.end(),[&](const auto &item){return item!=job&&item->nativeOwner==job->nativeOwner&&item->batchId==job->batchId&&!item->announced&&item->view.state<State::Completed;});
+            const bool active=std::any_of(jobs_.begin(),jobs_.end(),[&](const auto &item){return item!=job&&item->nativeOwner==job->nativeOwner&&item->batchId==job->batchId&&(item->paused||(!item->announced&&item->view.state<State::Completed));});
             if(now-touched>45000&&!active){job->announced=false;job->view.state=State::Failed;job->view.error=L"发送端已离线或停止，未收到剩余文件";job->finishedAt=now;job->cv.notify_all();}
             continue;
         }
@@ -35,7 +41,7 @@ void Engine::ExpireLocked() {
             const auto batch=batchApprovals_.find(job->asyncOfferKey);
             const auto id=Wide(Unhex(job->nativeOwner));
             const bool live=std::any_of(peers_.begin(),peers_.end(),[&](const auto &peer){return peer.id==id;}) ||
-                std::any_of(jobs_.begin(),jobs_.end(),[&](const auto &item){return !item->view.requestOnly&&item->nativeOwner==job->nativeOwner&&item->batchId==job->batchId&&item->view.state==State::Running;});
+                std::any_of(jobs_.begin(),jobs_.end(),[&](const auto &item){return !item->view.requestOnly&&item->nativeOwner==job->nativeOwner&&item->batchId==job->batchId&&(item->paused||item->view.state==State::Running);});
             if (!live && batch!=batchApprovals_.end() && now-batch->second.touched>45000) {
                 job->cancel=true;CompleteOfferLocked(job,std::string(job->view.offerItems.size(),'0'));job->view.error=L"发送端已离线，接收请求已取消";
             }
@@ -140,7 +146,7 @@ void Engine::SyncMesh(const Peer &peer) {
             auto key = Unhex(id); if (key.empty() || key.size() > 128) continue;
             if (authority || !aliases_.contains(key)) aliases_[key] = number;
             nextAlias_ = std::max(nextAlias_, number + 1);
-        } else if (type == "B" && fields >> name >> ip && IsLocal(ip)) {
+        } else if (type == "B" && fields >> name >> ip && IsLocalLocked(ip)) {
             Peer browser{Wide(Unhex(id)), Wide(Unhex(name)), ip, peer.port, Now(), false, true};
             std::string platform;fields>>platform;browser.platform=platform=="mobile-web"||platform=="desktop-web"?platform:"web";std::string capability;fields>>capability;browser.directoryReceive=capability=="D";
             if (!browser.id.starts_with(L"web:") || browser.name.size() > 64) continue;
@@ -183,8 +189,10 @@ void Engine::Ping(const Peer &peer) {
 }
 void Engine::CleanRelay() {
     std::vector<uint64_t> expired;
+    Config cfg;
     {
         std::lock_guard lock(mutex_);
+        cfg = config_;
         for (auto &j : jobs_) if (j->staging && (!running_ ||
             (j->view.state >= State::Completed && j->finishedAt && Now() - j->finishedAt > 600000))) {
             if (!running_) j->view.state = State::Cancelled;
@@ -192,4 +200,43 @@ void Engine::CleanRelay() {
         }
     }
     for (auto id : expired) { std::wstring error; DeleteTransfer(id, true, error); }
+    const auto now = Now();
+    std::vector<fs::path> staleParts;
+    std::set<fs::path> activeParts;
+    {
+        std::lock_guard lock(mutex_);
+        if (jobs_.size() > 500) {
+            size_t excess = jobs_.size() - 500;
+            std::erase_if(jobs_, [&](const auto &j) {
+                if (!excess) return false;
+                const bool drop = (j->hidden || j->view.removed) && j->view.state >= State::Completed &&
+                    !j->paused && !j->retryDeadline && j->asyncOfferKey.empty() && j->finishedAt &&
+                    now - j->finishedAt > 30ull * 60 * 1000 &&
+                    std::none_of(webFiles_.begin(), webFiles_.end(), [&](const auto &w) { return w.second.delivery == j; });
+                if (drop) --excess;
+                return drop;
+            });
+        }
+        for (const auto &j : jobs_) if (!j->partialPath.empty() && (j->paused || j->view.state < State::Completed || j->retryDeadline)) activeParts.insert(j->partialPath);
+    }
+    auto scanStaleParts = [&](const fs::path &dir) {
+        std::error_code ec;
+        if (dir.empty() || !fs::is_directory(dir, ec)) return;
+        FILETIME ftNow{}; GetSystemTimeAsFileTime(&ftNow);
+        const ULARGE_INTEGER now100ns{{ftNow.dwLowDateTime, ftNow.dwHighDateTime}};
+        for (const auto &entry : fs::directory_iterator(dir, ec)) {
+            if (ec || !entry.is_regular_file(ec)) continue;
+            const auto fname = entry.path().filename().wstring();
+            if (!fname.starts_with(L".chuan-") || !fname.ends_with(L".part")) continue;
+            if (activeParts.contains(entry.path())) continue;
+            WIN32_FILE_ATTRIBUTE_DATA data{};
+            if (!GetFileAttributesExW(entry.path().c_str(), GetFileExInfoStandard, &data)) continue;
+            const ULARGE_INTEGER mtime{{data.ftLastWriteTime.dwLowDateTime, data.ftLastWriteTime.dwHighDateTime}};
+            if (now100ns.QuadPart > mtime.QuadPart && (now100ns.QuadPart - mtime.QuadPart) > 7ull * 24 * 60 * 60 * 10000000ull)
+                staleParts.push_back(entry.path());
+        }
+    };
+    scanStaleParts(cfg.receiveDir);
+    scanStaleParts(cfg.dataDir / L"relay");
+    for (const auto &p : staleParts) { std::error_code ec; fs::remove(p, ec); }
 }

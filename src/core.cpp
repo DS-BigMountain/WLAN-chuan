@@ -40,6 +40,15 @@ struct WinFile {
             CloseHandle(value);
     }
 };
+std::wstring Win32Path(const fs::path &path) {
+    auto raw = path.wstring();
+    if (raw.empty() || raw.starts_with(L"\\\\?\\") || raw.size() < 240)
+        return raw;
+    auto norm = (path.is_absolute() ? path : fs::absolute(path)).lexically_normal().wstring();
+    if (norm.starts_with(L"\\\\?\\"))
+        return norm;
+    return norm.starts_with(L"\\\\") ? L"\\\\?\\UNC\\" + norm.substr(2) : L"\\\\?\\" + norm;
+}
 struct ProcessSecurity {
     bool restrictedToken = false, appContainer = false;
     DWORD integrityLevel = 0;
@@ -325,7 +334,8 @@ SOCKET Connect(const std::string &ip, unsigned short port) {
 }
 bool SafeParents(const fs::path &root, const fs::path &parent) {
     fs::path current = root;
-    if (GetFileAttributesW(current.c_str()) & FILE_ATTRIBUTE_REPARSE_POINT)
+    const DWORD rootAttrs = GetFileAttributesW(Win32Path(current).c_str());
+    if (rootAttrs == INVALID_FILE_ATTRIBUTES || (rootAttrs & FILE_ATTRIBUTE_REPARSE_POINT))
         return false;
     auto rel = parent.lexically_relative(root);
     for (const auto &part : rel) {
@@ -335,8 +345,8 @@ bool SafeParents(const fs::path &root, const fs::path &parent) {
             return false;
         current /= part;
         std::error_code ec;
-        fs::create_directory(current, ec);
-        DWORD attrs = GetFileAttributesW(current.c_str());
+        fs::create_directory(Win32Path(current), ec);
+        DWORD attrs = GetFileAttributesW(Win32Path(current).c_str());
         if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_REPARSE_POINT) ||
             !(attrs & FILE_ATTRIBUTE_DIRECTORY))
             return false;
@@ -378,7 +388,7 @@ bool SafeWebPath(const fs::path &path, const fs::path &root) {
     fs::path current = path.root_path();
     for (auto &part : path.relative_path()) {
         current /= part;
-        DWORD attrs = GetFileAttributesW(current.c_str());
+        DWORD attrs = GetFileAttributesW(Win32Path(current).c_str());
         if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_REPARSE_POINT))
             return false;
     }
@@ -691,13 +701,8 @@ void Engine::Notice(const std::wstring &text) {
     std::lock_guard lock(mutex_);
     notice_ = text;
 }
-bool Engine::Start(std::wstring &error) {
-    WSADATA data{};
-    if (WSAStartup(MAKEWORD(2, 2), &data)) {
-        error = L"网络初始化失败";
-        return false;
-    }
-    winsock_ = true;
+void Engine::RefreshNetworksLocked() {
+    std::vector<Network> next;
     ULONG bytes = 16384;
     std::vector<unsigned char> storage(bytes);
     ULONG result =
@@ -736,15 +741,33 @@ bool Engine::Start(std::wstring &error) {
                 unsigned priority = physical ? (a->FirstGatewayAddress ? 0 : 1) : 2;
                 if ((host >> 16) == 0xa9fe || (host >> 16) == 0xc612)
                     priority = 3;
-                networks_.push_back(
+                next.push_back(
                     {host, mask, (host & mask) | ~mask, text, name, virtualAdapter, priority});
             }
         }
-    std::stable_sort(networks_.begin(), networks_.end(), [](const auto &a, const auto &b) {
+    std::stable_sort(next.begin(), next.end(), [](const auto &a, const auto &b) {
         if (a.virtualAdapter != b.virtualAdapter)
             return !a.virtualAdapter;
         return a.priority < b.priority;
     });
+    networks_ = std::move(next);
+    lastNetworkRefresh_.store(Now());
+}
+void Engine::RefreshNetworks() {
+    std::lock_guard lock(mutex_);
+    RefreshNetworksLocked();
+}
+bool Engine::Start(std::wstring &error) {
+    WSADATA data{};
+    if (WSAStartup(MAKEWORD(2, 2), &data)) {
+        error = L"网络初始化失败";
+        return false;
+    }
+    winsock_ = true;
+    {
+        std::lock_guard lock(mutex_);
+        RefreshNetworksLocked();
+    }
     listener_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (listener_ == INVALID_SOCKET) {
         error = L"无法创建网络服务";
@@ -859,6 +882,21 @@ bool Engine::Start(std::wstring &error) {
         ",\"automatic_storage_fallback\":" + (config_.automaticStorageFallback ? "true" : "false") +
         ",\"config_dir\":" + Json(Utf8(config_.dataDir.wstring())) +
         ",\"receive_dir\":" + Json(Utf8(config_.receiveDir.wstring())));
+    ULONG bytes = 16384;
+    std::vector<unsigned char> storage(bytes);
+    ULONG result =
+        GetAdaptersAddresses(AF_INET,
+                             GAA_FLAG_INCLUDE_GATEWAYS | GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+                                 GAA_FLAG_SKIP_DNS_SERVER,
+                             nullptr, reinterpret_cast<IP_ADAPTER_ADDRESSES *>(storage.data()), &bytes);
+    if (result == ERROR_BUFFER_OVERFLOW) {
+        storage.resize(bytes);
+        result =
+            GetAdaptersAddresses(AF_INET,
+                                 GAA_FLAG_INCLUDE_GATEWAYS | GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+                                     GAA_FLAG_SKIP_DNS_SERVER,
+                                 nullptr, reinterpret_cast<IP_ADAPTER_ADDRESSES *>(storage.data()), &bytes);
+    }
     if (result == NO_ERROR) for (auto a = reinterpret_cast<IP_ADAPTER_ADDRESSES *>(storage.data()); a; a = a->Next) {
         if (a->OperStatus != IfOperStatusUp) continue;
         for (auto u = a->FirstUnicastAddress; u; u = u->Next) {
@@ -969,7 +1007,7 @@ void Engine::CollectWorkers() {
         return true;
     });
 }
-bool Engine::IsLocal(const std::string &ip) const {
+bool Engine::IsLocalLocked(const std::string &ip) const {
     in_addr addr{};
     if (InetPtonA(AF_INET, ip.c_str(), &addr) != 1)
         return false;
@@ -980,6 +1018,10 @@ bool Engine::IsLocal(const std::string &ip) const {
         if ((host & n.mask) == (n.address & n.mask))
             return true;
     return false;
+}
+bool Engine::IsLocal(const std::string &ip) {
+    std::lock_guard lock(mutex_);
+    return IsLocalLocked(ip);
 }
 Snapshot Engine::GetSnapshot(const std::string &browserClient) {
     std::lock_guard lock(mutex_);
@@ -1056,6 +1098,7 @@ bool Engine::UpdateConfig(const Config &c, std::wstring &error) {
     return true;
 }
 void Engine::Refresh() {
+    RefreshNetworks();
     refresh_ = true;
 }
 std::string Engine::Advertisement() {
@@ -1071,10 +1114,17 @@ void Engine::DiscoveryLoop() {
     }
     auto broadcast = [&] {
         auto message = Advertisement();
+        std::vector<Network> nets;
+        {
+            std::lock_guard lock(mutex_);
+            if (Now() - lastNetworkRefresh_.load() >= 10000)
+                RefreshNetworksLocked();
+            nets = networks_;
+        }
         sockaddr_in to{};
         to.sin_family = AF_INET;
         to.sin_port = htons(discoveryPort);
-        for (auto &n : networks_) {
+        for (auto &n : nets) {
             // Bind the announcement sender to each interface; VPN routes must not select its source IP.
             SOCKET sender = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
             if (sender == INVALID_SOCKET)
@@ -1102,7 +1152,9 @@ void Engine::DiscoveryLoop() {
                reinterpret_cast<sockaddr *>(&to), sizeof(to));
     };
     while (running_) {
-        if (Now() - last > 2000 || refresh_.exchange(false)) {
+        const bool forced = refresh_.exchange(false);
+        if (Now() - last > 2000 || forced) {
+            if (forced) RefreshNetworks();
             broadcast();
             last = Now();
         }
@@ -1158,6 +1210,8 @@ void Engine::DiscoveryLoop() {
             peer.seen = it->seen;
             peer.reachable = it->reachable;
             peer.platform = it->platform;
+            if (it->reachable && it->port == p && Now() - it->seen < 6000 && it->ip != ip)
+                peer.ip = it->ip;
             *it = peer;
         }
     }
@@ -1271,8 +1325,20 @@ void Engine::HandleClient(SOCKET s, const std::string &ip) {
             Reply(s, 409, "Conflict", Utf8(L"服务端身份已变化，请重新连接")); return;
         }
     }
-    if (path.starts_with("/api/"))
+    if (path.starts_with("/api/")) {
+        const auto origin = Get(headers, "origin"), referer = Get(headers, "referer"), secSite = Get(headers, "sec-fetch-site");
+        if (path == "/api/info" && method == "GET") {
+            const auto host = Get(headers, "host");
+            if (secSite == "cross-site" || (!origin.empty() && origin != "http://" + host)) {
+                Reply(s, 403, "Forbidden");
+                return;
+            }
+        } else if (!origin.empty() || !referer.empty() || secSite == "cross-site") {
+            Reply(s, 403, "Forbidden");
+            return;
+        }
         ObserveNative(headers, ip);
+    }
     if(method=="POST"&&path=="/api/parallel-support"){Reply(s,200,"OK","parallel-v1");return;}
     if(method=="GET"&&path.starts_with("/api/segments/")){
         WebFile source;bool allowed=false;
@@ -1304,12 +1370,21 @@ void Engine::HandleClient(SOCKET s, const std::string &ip) {
         return;
     }
     if (method == "POST" && path == "/api/leave") {
-        auto id = Wide(Unhex(Get(headers, "x-chuan-id")));
+        const auto rawId = Get(headers, "x-chuan-id");
+        auto id = Wide(Unhex(rawId));
         std::lock_guard lock(mutex_);
-        for (const auto &job:jobs_) if (job->nativeOwner==Get(headers,"x-chuan-id") && !job->asyncOfferKey.empty() && job->view.state<State::Completed) {
+        if (rawId.empty() || id.empty() || id == config_.id || id.starts_with(L"web:")) {
+            Reply(s, 400, "Bad Request"); return;
+        }
+        const bool sameHost = ip.starts_with("127.");
+        const bool ownedPeer = sameHost || std::any_of(peers_.begin(), peers_.end(), [&](const auto &p) {
+            return (p.id == id || p.owner == id) && (p.ip == ip || p.gateway == ip);
+        });
+        if (!ownedPeer) { Reply(s, 403, "Forbidden"); return; }
+        for (const auto &job:jobs_) if (job->nativeOwner==rawId && !job->asyncOfferKey.empty() && job->view.state<State::Completed) {
             job->cancel=true;CompleteOfferLocked(job,std::string(job->view.offerItems.size(),'0'));job->view.error=L"发送端已关闭，接收请求已取消";
         }
-        std::erase_if(peers_, [&](auto &p) { return p.id == id || p.owner == id; });
+        std::erase_if(peers_, [&](auto &p) { return (p.id == id || p.owner == id) && (sameHost || p.ip == ip || p.gateway == ip); });
         Reply(s, 200, "OK"); return;
     }
     if (method == "POST" && path == "/api/ping") {
@@ -1346,7 +1421,9 @@ void Engine::HandleClient(SOCKET s, const std::string &ip) {
         cfg = config_;
     }
     if (path == "/api/mesh") {
-        Reply(s, 200, "OK", Mesh(Unhex(Get(headers, "x-chuan-ledger")))); return;
+        const auto encoded = Get(headers, "x-chuan-ledger");
+        if (encoded.size() > 2 * 1024 * 1024) { Reply(s, 413, "Content Too Large"); return; }
+        Reply(s, 200, "OK", Mesh(Unhex(encoded))); return;
     }
     if (path == "/api/info") {
         Reply(s, 200, "OK",
@@ -1400,9 +1477,11 @@ void Engine::ObserveNative(const std::map<std::string, std::string> &h, const st
     Peer peer{id, name.empty() ? AutoNameLocked(Utf8(id)) : name, ip, port, Now(), true};
     auto found = std::find_if(peers_.begin(), peers_.end(), [&](auto &p) { return p.id == id; });
     auto platform=Get(h,"x-chuan-platform");peer.platform=platform=="windows"||platform=="android"?platform:found!=peers_.end()?found->platform:"";
-    if (found != peers_.end())
+    if (found != peers_.end()) {
+        if (found->reachable && found->port == port && Now() - found->seen < 6000 && found->ip != ip)
+            peer.ip = found->ip;
         *found = peer;
-    else if (peers_.size() < 128)
+    } else if (peers_.size() < 128)
         peers_.push_back(peer);
 }
 bool Engine::HandleWeb(SOCKET s, const std::string &ip, const std::string &method, const std::string &path,
@@ -1420,9 +1499,11 @@ bool Engine::HandleWeb(SOCKET s, const std::string &ip, const std::string &metho
     std::string hostIp;
     unsigned short hostPort = 0;
     bool validHost = host == "localhost:" + std::to_string(boundPort_);
-    if (Endpoint(host, hostIp, hostPort) && hostPort == boundPort_)
+    if (Endpoint(host, hostIp, hostPort) && hostPort == boundPort_) {
+        std::lock_guard lock(mutex_);
         validHost = hostIp == "127.0.0.1" || std::any_of(networks_.begin(), networks_.end(),
                                                          [&](auto &n) { return n.text == hostIp; });
+    }
     if (!validHost || (!origin.empty() && origin != "http://" + host)) {
         Reply(s, 403, "Forbidden", Utf8(L"请使用本机 IP 地址和端口访问 Web服务"));
         return true;
@@ -1531,7 +1612,7 @@ bool Engine::HandleWeb(SOCKET s, const std::string &ip, const std::string &metho
                 std::string digest;
                 if(!job->view.directory){
                     if(!SafeWebPath(file.path,file.root))throw std::runtime_error("path");
-                    WinFile input(CreateFileW(file.path.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr));
+                    WinFile input(CreateFileW(Win32Path(file.path).c_str(),GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr));
                     if(input.value==INVALID_HANDLE_VALUE||!WebHandleMatches(input.value,file.path))throw std::runtime_error("file");
                     Hash hash;std::vector<char> bytes(256*1024);DWORD count;uint64_t tick=Now();
                     for(;;){if(job->cancel||!ReadFile(input.value,bytes.data(),static_cast<DWORD>(bytes.size()),&count,nullptr))throw std::runtime_error("read");if(!count)break;hash.Add(bytes.data(),count);if(Now()-tick>2000){if(!SendAll(s,"HTTP/1.1 102 Processing\r\n\r\n"))throw std::runtime_error("connection");tick=Now();}}
@@ -1590,6 +1671,7 @@ bool Engine::HandleWeb(SOCKET s, const std::string &ip, const std::string &metho
         }
         if (path == "/web/api/note") {
             auto address = Get(h, "x-chuan-address");
+            if (address == "localhost") address = "127.0.0.1";
             auto note = Wide(Unhex(Get(h, "x-chuan-note")));
             if (!IsLocal(address) || note.size() > 48 || note.find_first_of(L"\r\n|") != std::wstring::npos) {
                 Reply(s, 400, "Bad Request"); return true;
@@ -1693,7 +1775,7 @@ bool Engine::HandleWeb(SOCKET s, const std::string &ip, const std::string &metho
                     return true;
                 }
             }
-            WinFile source(CreateFileW(file.path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+            WinFile source(CreateFileW(Win32Path(file.path).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                 OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
             BY_HANDLE_FILE_INFORMATION info{};
             const auto &old = file.identity;
@@ -1796,18 +1878,35 @@ bool Engine::HandleWeb(SOCKET s, const std::string &ip, const std::string &metho
               leader = p.id; coordinator = p;
           } }
         if (newSession && !coordinator.id.empty()) SyncMesh(coordinator);
+        auto name = Wide(Unhex(Get(h, "x-chuan-name")));
+        if (name.size() > 48 || name.find_first_of(L"\r\n|") != std::wstring::npos) {
+            Reply(s, 400, "Bad Request"); return true;
+        }
         BrowserSession session;
         {
             std::lock_guard lock(mutex_);
+            if (!browsers_.contains(client) && browsers_.size() >= 128) {
+                ExpireLocked();
+                if (browsers_.size() >= 128) {
+                    auto oldest = browsers_.end();
+                    for (auto it = browsers_.begin(); it != browsers_.end(); ++it) {
+                        if (!it->second.tabs.empty()) continue;
+                        const bool busy = std::any_of(jobs_.begin(), jobs_.end(), [&](const auto &j) { return j->webClient == it->first || j->recipient == it->first; });
+                        if (!busy && (oldest == browsers_.end() || it->second.lastSeen < oldest->second.lastSeen)) oldest = it;
+                    }
+                    if (oldest != browsers_.end()) {
+                        std::erase_if(peers_, [&](auto &p) { return p.id == oldest->second.id; });
+                        browsers_.erase(oldest);
+                    }
+                }
+                if (browsers_.size() >= 128) { Reply(s, 503, "Service Unavailable"); return true; }
+            }
             auto &current = browsers_[client];
             if (current.id.empty()) { current.id = L"web:" + Guid(); current.token = Hex(Utf8(Guid())); }
-            auto name = Wide(Unhex(Get(h, "x-chuan-name")));
-            if (name.size() > 48 || name.find_first_of(L"\r\n|") != std::wstring::npos) {
-                Reply(s, 400, "Bad Request"); return true;
-            }
             current.name = name;
             if (name.empty()) name = AutoNameLocked(Utf8(current.id));
             current.ip = ip;
+            current.lastSeen = Now();
             const auto device=Get(h,"x-chuan-device");auto agent=Get(h,"user-agent");std::transform(agent.begin(),agent.end(),agent.begin(),[](unsigned char ch){return static_cast<char>(std::tolower(ch));});
             if(device=="mobile-web"||device=="desktop-web")current.platform=device;
             else if(!agent.empty())current.platform=agent.find("android")!=std::string::npos||agent.find("iphone")!=std::string::npos||agent.find("ipad")!=std::string::npos||agent.find("mobile")!=std::string::npos?"mobile-web":"desktop-web";
@@ -1978,15 +2077,19 @@ bool Engine::HandleWeb(SOCKET s, const std::string &ip, const std::string &metho
                 }
                 parameters[field.substr(0, equal)] = value;
             }
-            client = parameters["client"];
+            if (!parameters["client"].empty()) {
+                if (!WebKey(parameters["client"])) { Reply(s, 400, "Bad Request"); return true; }
+                client = parameters["client"];
+            }
         }
         if ((!parameters["server"].empty() && parameters["server"] != Utf8(cfg.id)) ||
             (!parameters["instance"].empty() && parameters["instance"] != webToken_)) {
             Reply(s, 409, "Conflict", Utf8(L"下载链接不属于当前服务端运行会话")); return true;
         }
-        if (!parameters["server"].empty()) {
+        const auto suppliedTicket = !parameters["ticket"].empty() ? parameters["ticket"] : Get(h, "x-chuan-token");
+        if (!client.empty() || !parameters["server"].empty() || !suppliedTicket.empty()) {
             std::lock_guard lock(mutex_); const auto session = browsers_.find(client);
-            if (session == browsers_.end() || parameters["ticket"] != session->second.token) {
+            if (session == browsers_.end() || suppliedTicket.empty() || suppliedTicket != session->second.token) {
                 Reply(s, 401, "Unauthorized"); return true;
             }
         }
@@ -2000,14 +2103,23 @@ bool Engine::HandleWeb(SOCKET s, const std::string &ip, const std::string &metho
                 if(!Number(Get(h,"x-chuan-offset"),offset)||!Number(Get(h,"x-chuan-length"),length)){Reply(s,400,"Bad Request");return true;}
                 ServeSegment(s,source,offset,length,true);return true;
             }
-            uint64_t offset=0;auto start=Get(h,"x-chuan-offset");bool range=false;if(start.empty()&&!Get(h,"range").empty()){const auto value=Get(h,"range");if(!value.starts_with("bytes=")||!value.ends_with("-")){Reply(s,416,"Range Not Satisfiable");return true;}start=value.substr(6,value.size()-7);range=true;}if(!start.empty()&&!Number(start,offset)){Reply(s,416,"Range Not Satisfiable");return true;}WebDownload(s, ip, id, client,parameters["checksum"]=="trailer",offset,Get(h,"x-chuan-prefix"),range);
+            uint64_t offset=0,sliceEnd=UINT64_MAX;auto start=Get(h,"x-chuan-offset");bool range=false;
+            if(start.empty()&&!Get(h,"range").empty()){
+                const auto value=Get(h,"range");const auto dash=value.starts_with("bytes=")?value.find('-',6):std::string::npos;
+                if(dash==std::string::npos){Reply(s,416,"Range Not Satisfiable");return true;}
+                start=value.substr(6,dash-6);const auto tail=value.substr(dash+1);
+                if(start.empty()||(!tail.empty()&&!Number(tail,sliceEnd))){Reply(s,416,"Range Not Satisfiable");return true;}
+                range=true;
+            }
+            if((!start.empty()&&!Number(start,offset))||(sliceEnd!=UINT64_MAX&&sliceEnd<offset)){Reply(s,416,"Range Not Satisfiable");return true;}
+            WebDownload(s, ip, id, client,parameters["checksum"]=="trailer",offset,Get(h,"x-chuan-prefix"),range,sliceEnd);
         }
         return true;
     }
     Reply(s, 404, "Not Found");
     return true;
 }
-void Engine::WebDownload(SOCKET s, const std::string &ip, uint64_t id, const std::string &client,bool checksum,uint64_t offset,const std::string &prefix,bool range) {
+void Engine::WebDownload(SOCKET s, const std::string &ip, uint64_t id, const std::string &client,bool checksum,uint64_t offset,const std::string &prefix,bool range,uint64_t sliceEnd) {
     WebFile entry;
     {
         std::lock_guard lock(mutex_);
@@ -2022,10 +2134,12 @@ void Engine::WebDownload(SOCKET s, const std::string &ip, uint64_t id, const std
             return;
         }
     }
-    if(offset>entry.size||(offset&&!prefix.empty()&&!ResumeKeyValid(prefix))||(range&&(checksum||offset>=entry.size))){Reply(s,416,"Range Not Satisfiable");return;}
+    if(offset>entry.size||(offset&&!prefix.empty()&&!ResumeKeyValid(prefix))||(range&&(checksum||!entry.size||offset>=entry.size||(sliceEnd!=UINT64_MAX&&sliceEnd<offset)))){Reply(s,416,"Range Not Satisfiable");return;}
+    const uint64_t endLimit=(range&&sliceEnd!=UINT64_MAX)?std::min(entry.size,sliceEnd+1):entry.size;
     const auto responseStatus=range?"HTTP/1.1 206 Partial Content\r\n":"HTTP/1.1 200 OK\r\n";
-    const auto contentRange=range?"Content-Range: bytes "+std::to_string(offset)+"-"+std::to_string(entry.size?entry.size-1:0)+"/"+std::to_string(entry.size)+"\r\n":std::string{};
+    const auto contentRange=range?"Content-Range: bytes "+std::to_string(offset)+"-"+std::to_string(endLimit-1)+"/"+std::to_string(entry.size)+"\r\n":std::string{};
     if(entry.delivery&&entry.delivery->archivePlan){
+        if(endLimit<entry.size){Reply(s,416,"Range Not Satisfiable");return;}
         const auto job=entry.delivery;
         {std::lock_guard lock(mutex_);if(job->paused||job->cancel||job->view.state==State::Running||!config_.shareSoftware){Reply(s,409,"Conflict");return;}}
         TrackSocket(s,job);SetState(job,State::Running);{std::lock_guard lock(mutex_);job->view.activity=L"边打包边发送 ZIP";TraceJobLocked(job);}
@@ -2041,7 +2155,7 @@ void Engine::WebDownload(SOCKET s, const std::string &ip, uint64_t id, const std
         Reply(s, 404, "Not Found");
         return;
     }
-    WinFile file(CreateFileW(entry.path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+    WinFile file(CreateFileW(Win32Path(entry.path).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
                              FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
     LARGE_INTEGER size{};
     BY_HANDLE_FILE_INFORMATION info{};
@@ -2092,19 +2206,19 @@ void Engine::WebDownload(SOCKET s, const std::string &ip, uint64_t id, const std
                    "Content-Disposition: attachment; filename=\"download\"; filename*=UTF-8''" +
                        PercentEncode(Utf8(entry.path.filename().wstring())) +
                        "\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\nContent-Length: " +
-                       std::to_string(entry.size-offset+(checksum?32:0)) + "\r\n\r\n");
+                       std::to_string(endLimit-offset+(checksum?32:0)) + "\r\n\r\n");
     uint64_t done = offset;
     try {
-        SocketSendQueue sends(s, entry.size-offset, [&]{return running_&&!job->paused&&!job->cancel;},
+        SocketSendQueue sends(s, endLimit-offset, [&]{return running_&&!job->paused&&!job->cancel;},
             [&](size_t bytes){done+=bytes;Progress(job,done);trace.done=done;trace.Sample();}, trace.socketError);
         sends.SetObserver([&](size_t pending,uint64_t bytes,uint64_t oldest){trace.Gauge("send_pending_operations",pending);trace.Gauge("send_pending_bytes",bytes);trace.Gauge("send_oldest_operation_ms",oldest);});
         uint64_t loaded = offset;
-        while (ok && loaded < entry.size) {
+        while (ok && loaded < endLimit) {
             std::vector<char> *buffer;
             { auto time=trace.Stage("send_queue_wait",trace.networkMs); buffer=&sends.Buffer(); }
             DWORD read = 0;
             { auto time=trace.Stage("disk_io",trace.diskMs);
-              ok=ReadFile(file.value,buffer->data(),static_cast<DWORD>(std::min<uint64_t>(buffer->size(),entry.size-loaded)),&read,nullptr)&&read;
+              ok=ReadFile(file.value,buffer->data(),static_cast<DWORD>(std::min<uint64_t>(buffer->size(),endLimit-loaded)),&read,nullptr)&&read;
               if(!ok){trace.fileError=GetLastError();trace.failureStage="read";} }
             if(!ok)break;
             if(hash){auto time=trace.Stage("checksum",trace.hashMs);hash->Add(buffer->data(),read);}
@@ -2115,11 +2229,13 @@ void Engine::WebDownload(SOCKET s, const std::string &ip, uint64_t id, const std
     } catch(const std::exception &error) {
         ok=false;trace.failureStage=error.what();
     }
-    if(ok&&done==entry.size&&hash&&!job->cancel){const auto digest=hash->Finish();ok=SendAll(s,digest.data(),digest.size());}
-    trace.result = job->cancel || !running_ ? "cancelled" : ok && done == entry.size ? "sent_to_socket" : "failed";
-    if(ok&&done==entry.size&&running_&&!job->cancel&&entry.delivery&&!job->view.folderId.empty()){
+    if(ok&&done==endLimit&&hash&&!job->cancel){const auto digest=hash->Finish();ok=SendAll(s,digest.data(),digest.size());}
+    trace.result = job->cancel || !running_ ? "cancelled" : ok && done == endLimit ? "sent_to_socket" : "failed";
+    if(ok&&done==endLimit&&endLimit<entry.size&&running_&&!job->cancel){
+        std::lock_guard lock(mutex_);if(job->view.state<State::Completed){job->view.state=State::Waiting;job->view.activity.clear();TraceJobLocked(job);}
+    } else if(ok&&done==entry.size&&running_&&!job->cancel&&entry.delivery&&!job->view.folderId.empty()){
         std::lock_guard lock(mutex_);if(job->view.state<State::Completed){job->view.state=State::Waiting;job->view.activity=L"等待浏览器保存确认";TraceJobLocked(job);}
-    } else SetState(job,job->cancel||!running_?State::Cancelled:ok&&done==entry.size?State::Completed:State::Failed);
+    } else SetState(job,job->cancel||!running_?State::Cancelled:ok&&done==endLimit?State::Completed:State::Failed);
 }
 std::shared_ptr<Engine::Job> Engine::NewJob(const std::wstring &name, const std::wstring &peer,
                                             uint64_t total, bool receiving) {
@@ -2176,7 +2292,7 @@ void Engine::Progress(const std::shared_ptr<Job> &j, uint64_t done) {
         j->view.speed = static_cast<double>(done>=j->progressBase?done-j->progressBase:0) * 1000 / static_cast<double>(ms);
 }
 void Engine::RememberFile(const std::shared_ptr<Job> &job, const fs::path &path) {
-    WinFile file(CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES,
+    WinFile file(CreateFileW(Win32Path(path).c_str(), FILE_READ_ATTRIBUTES,
                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
                              FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
     BY_HANDLE_FILE_INFORMATION info{};
@@ -2287,7 +2403,7 @@ void Engine::ReceiveUpload(SOCKET s, const std::map<std::string, std::string> &h
         cfg.receiveDir = cfg.dataDir / L"relay";
         std::error_code ec; fs::create_directories(cfg.receiveDir, ec);
     }
-    bool matched = false;std::wstring copyError;
+    bool matched = false, copyTransient = false;std::wstring copyError;
     if (copying || probe || directory) {
         // A probe is authorized by the accepted item, but does not consume it when data is needed.
         const auto key = std::string(browser ? "web:" : "native:") + ip + ":" + Get(h, browser ? "x-chuan-client" : "x-chuan-id") + ":" + Get(h, "x-chuan-batch");
@@ -2307,13 +2423,14 @@ void Engine::ReceiveUpload(SOCKET s, const std::map<std::string, std::string> &h
         const bool metadata=probe&&Get(h,"x-chuan-metadata")=="1"&&!directory;
         if(metadata){
             const auto destination=cfg.receiveDir/name;
-            const auto attributes=GetFileAttributesW(destination.c_str());
+            const auto destNative=Win32Path(destination);
+            const auto attributes=GetFileAttributesW(destNative.c_str());
             if(!SafeParents(cfg.receiveDir,destination.parent_path()) ||
                 (attributes!=INVALID_FILE_ATTRIBUTES&&((attributes&FILE_ATTRIBUTE_REPARSE_POINT)||(!staging&&recipientId.empty()&&(attributes&FILE_ATTRIBUTE_DIRECTORY))))){
                 Reply(s,409,"Conflict",Utf8(L"目标路径类型冲突，原文件已保留"));return;
             }
             const bool exists=!staging&&recipientId.empty()&&attributes!=INVALID_FILE_ATTRIBUTES;
-            if(exists){WIN32_FILE_ATTRIBUTE_DATA info{};if(!GetFileAttributesExW(destination.c_str(),GetFileExInfoStandard,&info)||
+            if(exists){WIN32_FILE_ATTRIBUTE_DATA info{};if(!GetFileAttributesExW(destNative.c_str(),GetFileExInfoStandard,&info)||
                 ((static_cast<uint64_t>(info.nFileSizeHigh)<<32)|info.nFileSizeLow)!=total){Reply(s,409,"Conflict",Utf8(L"同名文件大小不同，原文件已保留"));return;}}
             {
                 std::lock_guard lock(mutex_);
@@ -2330,15 +2447,16 @@ void Engine::ReceiveUpload(SOCKET s, const std::map<std::string, std::string> &h
         std::shared_ptr<Job> probing;
         try {
             const auto destination = cfg.receiveDir / name;
+            const auto destNative = Win32Path(destination);
             if (!SafeParents(cfg.receiveDir, destination.parent_path())) throw std::runtime_error("unsafe parent");
-            const auto attributes = GetFileAttributesW(destination.c_str());
+            const auto attributes = GetFileAttributesW(destNative.c_str());
             if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_REPARSE_POINT)) throw std::runtime_error("unsafe target");
             if (probe && directory) {
                 if (attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY)) throw std::runtime_error("type conflict");
                 matched = true;
             } else if (probe && !staging && recipientId.empty() && attributes != INVALID_FILE_ATTRIBUTES) {
                 if (attributes & FILE_ATTRIBUTE_DIRECTORY) throw std::runtime_error("type conflict");
-                WinFile existing(CreateFileW(destination.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr));
+                WinFile existing(CreateFileW(destNative.c_str(),GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr));
                 LARGE_INTEGER size{};
                 if (existing.value==INVALID_HANDLE_VALUE || !GetFileSizeEx(existing.value,&size) || static_cast<uint64_t>(size.QuadPart)!=total) throw std::runtime_error("content conflict");
                 {
@@ -2360,6 +2478,9 @@ void Engine::ReceiveUpload(SOCKET s, const std::map<std::string, std::string> &h
                 if (!matched) throw std::runtime_error("content conflict");
             }
             if (probe && !matched) { Reply(s,200,"OK","{\"upload\":true}","application/json"); return; }
+        } catch (const std::exception &ex) {
+            if (std::string(ex.what()) == "connection") { copyTransient = true; copyError = L"连接中断"; }
+            else copyError=L"同名文件内容不同、类型冲突或无法安全核对；原文件已保留";
         } catch (...) { copyError=L"同名文件内容不同、类型冲突或无法安全核对；原文件已保留"; }
         if (probing) {
             std::lock_guard lock(mutex_);
@@ -2383,20 +2504,23 @@ void Engine::ReceiveUpload(SOCKET s, const std::map<std::string, std::string> &h
         if (!j && approved != batchApprovals_.end() && approved->second.announcedItems.contains(static_cast<size_t>(item))) { Reply(s, 409, "Conflict", Utf8(L"文件与已登记的批次清单不一致")); return; }
     }
     if (!j) j = NewJob(name, sender + L" (" + Wide(ip) + L")", total, true);
-    j->view.directory = directory;
-    if (!browser) { j->nativeOwner=Get(h,"x-chuan-id");j->webUpload=Get(h,"x-chuan-upload"); }
-    j->staging = staging || !recipientId.empty();
-    j->targetId = target; j->senderName = sender;
-    if (browser) {
+    {
         std::lock_guard lock(mutex_);
-        j->staging = staging;
-        j->webClient = Get(h, "x-chuan-client");
-        j->webTab = Get(h, "x-chuan-tab");
-        j->webUpload = Get(h, "x-chuan-upload");
-        if (!config_.shareSoftware)
-            j->cancel = true;
+        j->view.directory = directory;
+        if (!browser) { j->nativeOwner=Get(h,"x-chuan-id");j->webUpload=Get(h,"x-chuan-upload"); }
+        j->staging = staging || !recipientId.empty();
+        j->targetId = target; j->senderName = sender;
+        if (browser) {
+            j->staging = staging;
+            j->webClient = Get(h, "x-chuan-client");
+            j->webTab = Get(h, "x-chuan-tab");
+            j->webUpload = Get(h, "x-chuan-upload");
+            if (!config_.shareSoftware)
+                j->cancel = true;
+        }
     }
     TrackSocket(s, j);
+    if(!copyError.empty()){SetState(j,State::Failed,copyError);Reply(s,copyTransient?503:409,copyTransient?"Service Unavailable":"Conflict",Utf8(copyError));return;}
     const auto batchId = Get(h, "x-chuan-batch");
     if (!batchId.empty()) {
         uint64_t index = 0; bool valid = false;
@@ -2442,11 +2566,21 @@ void Engine::ReceiveUpload(SOCKET s, const std::map<std::string, std::string> &h
         {
             std::lock_guard lock(mutex_);
             auto found = folderApprovals_.find(key);
+            if (found == folderApprovals_.end() && folderApprovals_.size() >= 4096) {
+                std::erase_if(folderApprovals_, [&](const auto &item) {
+                    return Now() - item.second.touched > 6ull * 60 * 60 * 1000 &&
+                        std::none_of(jobs_.begin(), jobs_.end(), [&](const auto &job) {
+                            return job->folderKey == item.first && (job->paused || job->view.state < State::Completed);
+                        });
+                });
+                found = folderApprovals_.find(key);
+            }
             if (found == folderApprovals_.end() && folderApprovals_.size() >= 4096) valid = false;
             if (valid) {
                 auto [entry, inserted] = folderApprovals_.try_emplace(key);
                 auto &batch = entry->second;
                 if (inserted) { batch.name = folderName; batch.count = count; batch.total = bytes; }
+                batch.touched = Now();
                 valid = batch.name == folderName && batch.count == count && batch.total == bytes &&
                     batch.paths.size() < count && total <= bytes - batch.reserved && !batch.paths.contains(name);
                 if (valid) {
@@ -2462,7 +2596,6 @@ void Engine::ReceiveUpload(SOCKET s, const std::map<std::string, std::string> &h
         if (!valid) { SetState(j, State::Failed, L"文件夹批次范围不一致或已结束"); Reply(s, 409, "Conflict"); return; }
         if (rejected) { SetState(j, State::Rejected, L"文件夹接收已拒绝"); Reply(s, 417, "Expectation Failed"); return; }
     }
-    if(!copyError.empty()){SetState(j,State::Failed,copyError);Reply(s,409,"Conflict",Utf8(copyError));return;}
     SetState(j, State::Waiting);
     if (!cfg.autoReceive && !staging && recipientId.empty()) {
         std::unique_lock lock(mutex_);
@@ -2535,6 +2668,7 @@ void Engine::ReceiveUpload(SOCKET s, const std::map<std::string, std::string> &h
     diagnostic_->Write("\"event\":\"receive_space\",\"id\":"+std::to_string(j->view.id)+",\"available_bytes\":"+std::to_string(available.QuadPart)+",\"remaining_bytes\":"+std::to_string(total-resumeOffset)+",\"resume_offset\":"+std::to_string(resumeOffset));
     fs::path destination = cfg.receiveDir / fs::path(name),
              partial = resumeKey.empty()?cfg.receiveDir / (L".chuan-" + Guid() + L".part"):ResumePath(cfg.receiveDir,Get(h,browser?"x-chuan-client":"x-chuan-id"),name,total,resumeKey);
+    {std::lock_guard lock(mutex_);j->partialPath=partial;}
     uint64_t browserHashMs = 0;
     bool hashTimingValid = Number(Get(h, "x-chuan-hash-ms"), browserHashMs) && browserHashMs <= 604800000;
     diagnostic::Transfer trace(*diagnostic_, s, j->view.id, total, browser ? "web_upload" : "native_upload",
@@ -2547,13 +2681,13 @@ void Engine::ReceiveUpload(SOCKET s, const std::map<std::string, std::string> &h
             throw std::runtime_error("unsafe path");
         {
             WinFile file(CreateFileW(
-                partial.c_str(), GENERIC_READ|GENERIC_WRITE, 0, nullptr, resumeKey.empty()?CREATE_NEW:OPEN_ALWAYS,
+                Win32Path(partial).c_str(), GENERIC_READ|GENERIC_WRITE, 0, nullptr, resumeKey.empty()?CREATE_NEW:OPEN_ALWAYS,
                 FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
             if (file.value == INVALID_HANDLE_VALUE)
                 throw std::runtime_error("create file");
             BY_HANDLE_FILE_INFORMATION partialInfo{};LARGE_INTEGER existingSize{};
             if(!GetFileInformationByHandle(file.value,&partialInfo)||(partialInfo.dwFileAttributes&FILE_ATTRIBUTE_REPARSE_POINT)||partialInfo.nNumberOfLinks!=1||!GetFileSizeEx(file.value,&existingSize)||static_cast<uint64_t>(existingSize.QuadPart)!=resumeOffset)throw std::runtime_error("resume_offset");
-            if(!resumeOffset&&(partialInfo.dwFileAttributes&FILE_ATTRIBUTE_COMPRESSED)){USHORT compression=COMPRESSION_FORMAT_NONE;DWORD returned=0;if(!DeviceIoControl(file.value,FSCTL_SET_COMPRESSION,&compression,sizeof(compression),nullptr,0,&returned,nullptr)){trace.fileError=GetLastError();throw std::runtime_error("disable_compression");}}
+            if(!resumeOffset&&(partialInfo.dwFileAttributes&FILE_ATTRIBUTE_COMPRESSED)){USHORT compression=COMPRESSION_FORMAT_NONE;DWORD returned=0;if(!DeviceIoControl(file.value,FSCTL_SET_COMPRESSION,&compression,sizeof(compression),nullptr,0,&returned,nullptr))diagnostic_->Write("\"event\":\"compression_keep\",\"id\":"+std::to_string(j->view.id)+",\"win_error\":"+std::to_string(GetLastError()));}
             std::unique_ptr<Hash> hash;
             if (verifyChecksum||resumeOffset) hash = std::make_unique<Hash>();
             if(resumeOffset){
@@ -2617,7 +2751,7 @@ void Engine::ReceiveUpload(SOCKET s, const std::map<std::string, std::string> &h
         fs::path chosen;
         for (unsigned i = 0; i < 10000; ++i) {
             chosen = copying && !staging && recipientId.empty() ? destination : UniquePath(destination, i);
-            if (MoveFileExW(partial.c_str(), chosen.c_str(), MOVEFILE_WRITE_THROUGH))
+            if (MoveFileExW(Win32Path(partial).c_str(), Win32Path(chosen).c_str(), MOVEFILE_WRITE_THROUGH))
                 break;
             DWORD error = GetLastError();
             if ((copying && !staging && recipientId.empty()) || (error != ERROR_ALREADY_EXISTS && error != ERROR_FILE_EXISTS))
@@ -2630,6 +2764,7 @@ void Engine::ReceiveUpload(SOCKET s, const std::map<std::string, std::string> &h
         trace.result = verifyChecksum ? "verified_and_saved" : "length_checked_and_saved";
         {
             std::lock_guard lock(mutex_);
+            j->partialPath.clear();
             j->view.savedPath = chosen;
             if (browser) webFiles_[j->view.id] = {chosen, cfg.receiveDir, total, {}, {}, Get(h, "x-chuan-client"), j->fileIdentity, j->hasIdentity, name};
         }
@@ -2658,7 +2793,7 @@ void Engine::ReceiveUpload(SOCKET s, const std::map<std::string, std::string> &h
     } catch (const std::exception &ex) {
         trace.result = j->cancel || !running_ ? "cancelled" : "failed";
         trace.failureStage = ex.what();
-        if(resumeKey.empty()||std::string(ex.what())=="checksum")DeleteFileW(partial.c_str());
+        if(resumeKey.empty()||std::string(ex.what())=="checksum"){DeleteFileW(Win32Path(partial).c_str());std::lock_guard lock(mutex_);j->partialPath.clear();}
         diagnostic_->Write("\"event\":\"resume_retained\",\"id\":"+std::to_string(j->view.id)+",\"path\":"+Json(Utf8(partial.wstring()))+",\"offset\":"+std::to_string(j->view.done));
         std::wstring reason = j->cancel ? L"接收端已取消本次传输" : std::string(ex.what()) == "checksum" ? L"完整性校验失败"
                               : std::string(ex.what()) == "disk"   ? L"写入接收目录失败"
@@ -2686,7 +2821,7 @@ void Engine::SendOne(const Peer &peer, const fs::path &path, const std::wstring 
         return;
     }
     if(preparation&&j->folderId.empty())return;
-    WinFile file(preparation||archiveStream?INVALID_HANDLE_VALUE:CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+    WinFile file(preparation||archiveStream?INVALID_HANDLE_VALUE:CreateFileW(Win32Path(path).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
                              FILE_FLAG_SEQUENTIAL_SCAN | (j->view.directory ? FILE_FLAG_BACKUP_SEMANTICS : 0), nullptr));
     LARGE_INTEGER size{};
     if (!preparation&&!archiveStream&&(file.value == INVALID_HANDLE_VALUE || (!j->view.directory && !GetFileSizeEx(file.value, &size)))) {
@@ -2741,7 +2876,7 @@ void Engine::SendOne(const Peer &peer, const fs::path &path, const std::wstring 
             "\r\nX-Chuan-Folder: " + j->folderId + "\r\nX-Chuan-Folder-Name: " + Hex(Utf8(j->view.folderName)) +
             "\r\nX-Chuan-Folder-Count: " + std::to_string(j->view.folderCount) + "\r\nX-Chuan-Folder-Size: " + std::to_string(j->view.folderTotal) +
             "\r\nContent-Length: " + std::to_string(total + 32) + "\r\n\r\n";
-        if (!j->folderId.empty() && stage != SendStage::Transfer) {
+        if (!j->folderId.empty() && !j->batchId.empty() && stage != SendStage::Transfer) {
             const auto reconnect=[&]{ReleaseSocket(s);s=Connect(peer.gateway.empty()?peer.ip:peer.gateway,peer.port);if(s==INVALID_SOCKET)throw std::runtime_error("connect");TrackSocket(s,j);SetTimeout(s,150000,30000);};
             const auto probe=[&](const std::string &endpoint,std::string &body){
                 auto query=request;query.replace(query.find("/api/upload"),11,endpoint);query.erase(query.find("Expect: 100-continue\r\n"),22);
@@ -2761,7 +2896,7 @@ void Engine::SendOne(const Peer &peer, const fs::path &path, const std::wstring 
                 if(!j->view.directory){
                     {std::lock_guard lock(mutex_);j->view.activity=L"核对同名文件";TraceJobLocked(j);}
                     if(preparation){
-                        file.value=CreateFileW(path.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_FLAG_SEQUENTIAL_SCAN,nullptr);
+                        file.value=CreateFileW(Win32Path(path).c_str(),GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,FILE_FLAG_SEQUENTIAL_SCAN,nullptr);
                         LARGE_INTEGER actual{};
                         if(file.value==INVALID_HANDLE_VALUE||!GetFileSizeEx(file.value,&actual)||static_cast<uint64_t>(actual.QuadPart)!=total)throw std::runtime_error("source changed");
                     }
@@ -2787,9 +2922,9 @@ void Engine::SendOne(const Peer &peer, const fs::path &path, const std::wstring 
             request.insert(request.find("Content-Length:"),"X-Chuan-Copy: 1\r\n");
             {std::lock_guard lock(mutex_);j->view.activity.clear();}
         }
-        if(stage==SendStage::Transfer&&!j->folderId.empty())request.insert(request.find("Content-Length:"),"X-Chuan-Copy: 1\r\n");
+        if(stage==SendStage::Transfer&&!j->folderId.empty()&&!j->batchId.empty())request.insert(request.find("Content-Length:"),"X-Chuan-Copy: 1\r\n");
         uint64_t resumeOffset=0;std::unique_ptr<Hash> contentHash=std::make_unique<Hash>();
-        if(!j->view.directory){
+        if(!j->view.directory&&!j->batchId.empty()){
             std::string key;if(archiveStream){Hash metadata;for(const auto &entry:j->archivePlan->entries){const auto data=entry.name+":"+std::to_string(entry.size)+"\n";metadata.Add(data.data(),data.size());}key=metadata.Snapshot();}else key=ResumeKey(file.value,total);
             auto query=request;query.replace(query.find("/api/upload"),11,"/api/resume");query.erase(query.find("Expect: 100-continue\r\n"),22);query.replace(query.find("Content-Length:"),std::string::npos,"X-Chuan-Resume-Key: "+key+"\r\nX-Chuan-Resume-Reset: "+std::string(j->resumeReset?"1":"0")+"\r\nContent-Length: 0\r\n\r\n");
             std::string reply,body;std::map<std::string,std::string> fields;if(!SendAll(s,query)||!ReadHeader(s,reply,fields))throw std::runtime_error("resume_probe");uint64_t bytes=0;if(Number(Get(fields,"content-length"),bytes)&&bytes<=4096){body.resize(static_cast<size_t>(bytes));if(!ReadExact(s,body.data(),body.size()))throw std::runtime_error("resume_probe");}
@@ -2945,7 +3080,7 @@ void Engine::SendFiles(const Peer &peer, const std::vector<fs::path> &input,bool
                 for(const auto &entry:fs::recursive_directory_iterator(source)) entries.push_back(entry.path());
                 uint64_t bytes=0; const auto start=files.size();
                 for(const auto &entry:entries){
-                    if(GetFileAttributesW(entry.c_str())&FILE_ATTRIBUTE_REPARSE_POINT)throw std::runtime_error("link");
+                    if(GetFileAttributesW(Win32Path(entry).c_str())&FILE_ATTRIBUTE_REPARSE_POINT)throw std::runtime_error("link");
                     const bool dir=fs::is_directory(entry); if(!dir&&!fs::is_regular_file(entry))throw std::runtime_error("type");
                     const auto rel=entry==source?root:SanitizeRelative((fs::path(root)/entry.lexically_relative(source)).wstring());
                     const auto size=dir?0:fs::file_size(entry); if(size>UINT64_MAX-bytes)throw std::runtime_error("overflow");bytes+=size;
@@ -3077,11 +3212,16 @@ void Engine::SendFiles(const Peer &peer, const std::vector<fs::path> &input,bool
     }
 }
 void Engine::QueueRetry(const Peer &peer,const fs::path &path,const std::shared_ptr<Job> &job){
+    if(peer.browser&&peer.owner.empty()){
+        {std::lock_guard lock(mutex_);if(job->cancel||!running_)return;job->retryDeadline=0;job->retryExpired=false;job->view.error.clear();}
+        if(!Launch([this,peer,path,job]{QueueBrowser(peer,path,job,path.parent_path());}))SetState(job,State::Failed,L"当前任务较多，请稍后重试");
+        return;
+    }
     std::wstring terminal;{std::lock_guard lock(mutex_);if(PermanentTransferFailure(job->view.error))terminal=job->view.error;}
     if(!terminal.empty()){std::string response;BatchCommand(peer,"/api/batch-status",job->batchId,job->webUpload+"\t5\t"+Hex(Utf8(terminal))+"\n",response,{});return;}
     std::lock_guard lock(mutex_);if(job->cancel||job->retryDeadline||!running_)return;
     job->retryDeadline=Now()+30000;job->retryExpired=false;job->view.state=State::Waiting;job->view.activity=L"独立通道自动重试中";TraceJobLocked(job);job->view.error.clear();
-    retryQueue_.push_back({peer,path,job});
+    retryQueue_.push_back({peer,path,job,0});
     if(!retryThread_.joinable()){
         retryThread_=std::thread([this]{RetryLoop();});
         retryTimerThread_=std::thread([this]{while(running_){
@@ -3094,21 +3234,41 @@ void Engine::QueueRetry(const Peer &peer,const fs::path &path,const std::shared_
 }
 void Engine::RetryLoop(){
     while(running_){
-        RetryItem item;{std::unique_lock lock(mutex_);retryCv_.wait(lock,[&]{return !running_||!retryQueue_.empty();});if(!running_)break;item=retryQueue_.front();retryQueue_.erase(retryQueue_.begin());}
+        RetryItem item;
+        {
+            std::unique_lock lock(mutex_);
+            for(;;){
+                if(!running_)return;
+                const auto now=Now();
+                for(auto &queued:retryQueue_)if(queued.job->paused&&!queued.job->remotePaused)queued.job->retryDeadline=now+30000;
+                auto ready=std::find_if(retryQueue_.begin(),retryQueue_.end(),[&](const auto &queued){
+                    const bool runnable=!queued.job->paused||queued.job->remotePaused||queued.job->cancel;
+                    return runnable&&now>=queued.nextAt;
+                });
+                if(ready!=retryQueue_.end()){item=*ready;retryQueue_.erase(ready);break;}
+                uint64_t waitMs=250;
+                for(const auto &queued:retryQueue_){
+                    if(!queued.job->paused||queued.job->remotePaused||queued.job->cancel){
+                        waitMs=std::min(waitMs,queued.nextAt>now?queued.nextAt-now:0);
+                    }
+                }
+                retryCv_.wait_for(lock,std::chrono::milliseconds(std::max<uint64_t>(waitMs,1)));
+            }
+        }
         auto job=item.job;
-        if(job->paused&&!job->remotePaused){job->retryDeadline=Now()+30000;std::unique_lock lock(mutex_);retryQueue_.push_back(item);if(std::all_of(retryQueue_.begin(),retryQueue_.end(),[](const auto &queued){return queued.job->paused&&!queued.job->remotePaused;}))retryCv_.wait_for(lock,std::chrono::milliseconds(250));continue;}
         if(job->remotePaused)job->retryDeadline=Now()+30000;
         if(job->cancel){job->retryDeadline=0;SetState(job,State::Cancelled);continue;}
+        if(item.peer.browser&&item.peer.owner.empty()){job->retryDeadline=0;QueueBrowser(item.peer,item.path,job,item.path.parent_path());continue;}
         if(Now()>=job->retryDeadline){job->retryExpired=true;SetState(job,State::Failed);job->retryDeadline=0;std::string ignored;BatchCommand(item.peer,"/api/batch-status",job->batchId,job->webUpload+"\t5\t"+Hex(Utf8(L"传输失败超时（自动重试已达 30 秒）"))+"\n",ignored,{});continue;}
         std::string response;int status=BatchCommand(item.peer,"/api/retry-upload/"+job->webUpload,job->batchId,"",response,job);
         if(status==200&&response=="7"){job->paused=true;job->remotePaused=true;job->retryDeadline=Now()+30000;}
         else if(status==200&&response=="3"){Progress(job,job->view.total);SetState(job,State::Completed);}
-        else if(status==200&&response=="8"){job->remotePaused=false;job->paused=false;job->retryDeadline=Now()+30000;job->view.activity=L"等待浏览器继续保存";}
+        else if(status==200&&response=="8"){job->remotePaused=false;job->paused=false;job->retryDeadline=Now()+30000;std::lock_guard lock(mutex_);job->view.activity=L"等待浏览器继续保存";}
         else if(status==410){job->cancel=true;SetState(job,State::Cancelled,L"接收端已取消本次传输");}
         else if(status==200){if(job->remotePaused){job->remotePaused=false;job->paused=false;job->retryDeadline=Now()+30000;}SendOne(item.peer,item.path,job->view.name,job);}
         bool retry=false;{std::lock_guard lock(mutex_);if(job->view.state!=State::Completed&&!job->cancel){if(job->retryExpired){job->view.state=State::Failed;job->view.error=L"传输失败超时（自动重试已达 30 秒）";job->view.activity.clear();}else if(!PermanentTransferFailure(job->view.error)){job->view.state=State::Waiting;job->view.activity=L"独立通道自动重试中";TraceJobLocked(job);retry=true;}}if(!retry){job->retryDeadline=0;job->view.activity.clear();}}
-        if(retry){std::unique_lock lock(mutex_);retryCv_.wait_for(lock,std::chrono::milliseconds(400));retryQueue_.push_back(item);}
-        else if(job->retryExpired||PermanentTransferFailure(job->view.error)){std::string ignored;BatchCommand(item.peer,"/api/batch-status",job->batchId,job->webUpload+"\t5\t"+Hex(Utf8(job->view.error))+"\n",ignored,{});}
+        if(retry){item.nextAt=Now()+400;std::lock_guard lock(mutex_);retryQueue_.push_back(item);retryCv_.notify_one();}
+        else if(job->retryExpired||PermanentTransferFailure(job->view.error)){std::wstring reason;{std::lock_guard lock(mutex_);reason=job->view.error;}std::string ignored;BatchCommand(item.peer,"/api/batch-status",job->batchId,job->webUpload+"\t5\t"+Hex(Utf8(reason))+"\n",ignored,{});}
     }
 }
 bool Engine::RetryTransfer(uint64_t id, std::wstring &error) {
@@ -3148,10 +3308,21 @@ void Engine::Pause(uint64_t id,bool paused){
     std::vector<std::shared_ptr<Job>> changed;
     {std::lock_guard lock(mutex_);auto selected=std::find_if(jobs_.begin(),jobs_.end(),[&](const auto &j){return j->view.id==id;});if(selected==jobs_.end())return;const auto first=*selected;
      for(const auto &job:jobs_)if(job==first||(!first->view.folderId.empty()&&job->view.folderId==first->view.folderId&&job->batchId==first->batchId&&job->view.receiving==first->view.receiving)){
-       if(job->cancel||job->view.state==State::Completed||job->view.state==State::Rejected)continue;job->paused=paused;job->remotePaused=false;job->view.paused=paused;job->view.speed=0;if(!paused&&!job->recipient.empty()&&(job->hasIdentity||job->archivePlan))job->view.state=State::Waiting;if(!paused){job->retryExpired=false;if(job->retryDeadline)job->retryDeadline=Now()+30000;}job->cv.notify_all();changed.push_back(job);TraceJobLocked(job);}}
+       if(job->cancel||job->view.state==State::Completed||job->view.state==State::Rejected)continue;job->paused=paused;job->remotePaused=false;job->view.paused=paused;job->view.speed=0;if(!paused&&!job->recipient.empty()&&(job->hasIdentity||job->archivePlan))job->view.state=State::Waiting;if(!paused){job->retryExpired=false;if(job->retryDeadline)job->retryDeadline=Now()+30000;for(auto &queued:retryQueue_)if(queued.job==job)queued.nextAt=0;}job->cv.notify_all();changed.push_back(job);TraceJobLocked(job);}}
     if(paused){std::lock_guard lock(socketsMutex_);for(auto &[socket,weak]:sockets_)if(std::find(changed.begin(),changed.end(),weak.lock())!=changed.end())shutdown(socket,SD_BOTH);}
-    for(const auto &job:changed)if(!job->view.receiving&&!job->targetId.empty())Launch([this,job,paused]{Peer target;bool found=false;{std::lock_guard lock(mutex_);for(const auto &peer:peers_)if(peer.id==job->targetId){target=peer;found=true;break;}}if(!found||target.browser)return;
-      Config cfg;{std::lock_guard lock(mutex_);cfg=config_;}SOCKET socket=Connect(target.gateway.empty()?target.ip:target.gateway,target.port);if(socket==INVALID_SOCKET)return;TrackSocket(socket);std::string query="POST /api/pause-upload/"+job->webUpload+" HTTP/1.1\r\nHost: "+target.ip+":"+std::to_string(target.port)+"\r\nConnection: close\r\nX-Chuan-Id: "+Hex(Utf8(cfg.id))+"\r\nX-Chuan-Server: "+Utf8(target.owner.empty()?target.id:target.owner)+"\r\nX-Chuan-Batch: "+job->batchId+"\r\nX-Chuan-Paused: "+(paused?"1":"0")+"\r\nContent-Length: 0\r\n\r\n";SendAll(socket,query);ReleaseSocket(socket);});
+    std::vector<std::shared_ptr<Job>> notify;
+    for(const auto &job:changed)if(!job->view.receiving&&!job->targetId.empty())notify.push_back(job);
+    if(!notify.empty())Launch([this,notify=std::move(notify),paused]{
+        for(const auto &job:notify){
+            if(!running_)break;
+            Peer target;bool found=false;Config cfg;{std::lock_guard lock(mutex_);cfg=config_;for(const auto &peer:peers_)if(peer.id==job->targetId){target=peer;found=true;break;}}
+            if(!found||target.browser)continue;
+            SOCKET socket=Connect(target.gateway.empty()?target.ip:target.gateway,target.port);if(socket==INVALID_SOCKET)continue;
+            TrackSocket(socket);SetTimeout(socket,3000,3000);
+            std::string query="POST /api/pause-upload/"+job->webUpload+" HTTP/1.1\r\nHost: "+target.ip+":"+std::to_string(target.port)+"\r\nConnection: close\r\nX-Chuan-Id: "+Hex(Utf8(cfg.id))+"\r\nX-Chuan-Server: "+Utf8(target.owner.empty()?target.id:target.owner)+"\r\nX-Chuan-Batch: "+job->batchId+"\r\nX-Chuan-Paused: "+(paused?"1":"0")+"\r\nContent-Length: 0\r\n\r\n";
+            SendAll(socket,query);ReleaseSocket(socket);
+        }
+    });
     retryCv_.notify_all();
 }
 void Engine::Cancel(uint64_t id) {
@@ -3202,7 +3373,9 @@ void Engine::Decide(uint64_t id, bool accept) {
             j->view.awaitingApproval = false;
             if (!j->asyncOfferKey.empty()) CompleteOfferLocked(j, j->selection);
             if (!j->folderKey.empty()) {
-                folderApprovals_.at(j->folderKey).decision = j->decision;
+                auto &folder = folderApprovals_.at(j->folderKey);
+                folder.decision = j->decision;
+                folder.touched = Now();
                 for (auto &other : jobs_) if (other->folderKey == j->folderKey) {
                     other->decision = j->decision; other->view.awaitingApproval = false; other->cv.notify_all();
                 }
@@ -3257,12 +3430,13 @@ bool Engine::DeleteTransfer(uint64_t id, bool removeFile, std::wstring &error) {
             error = L"文件仍有未结束的传输";
             return false;
         }
-        if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        const auto nativePath = Win32Path(path);
+        if (GetFileAttributesW(nativePath.c_str()) != INVALID_FILE_ATTRIBUTES) {
             if (!job->hasIdentity || !SafeWebPath(path, path.parent_path())) {
                 error = L"文件路径已变更，未删除文件";
                 return false;
             }
-            WinFile file(CreateFileW(path.c_str(), DELETE | FILE_READ_ATTRIBUTES, FILE_SHARE_READ, nullptr,
+            WinFile file(CreateFileW(nativePath.c_str(), DELETE | FILE_READ_ATTRIBUTES, FILE_SHARE_READ, nullptr,
                                      OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
             BY_HANDLE_FILE_INFORMATION info{};
             const auto &old = job->fileIdentity;
@@ -3287,9 +3461,16 @@ bool Engine::DeleteTransfer(uint64_t id, bool removeFile, std::wstring &error) {
         }
         std::erase_if(webFiles_, [&](auto &entry) { return entry.second.path == path; });
     }
+    if (removeFile && job->view.state >= State::Cancelled && !job->partialPath.empty()) {
+        const auto partial = job->partialPath;
+        const bool sharedPartial = std::any_of(jobs_.begin(), jobs_.end(), [&](const auto &other) {
+            return other != job && other->partialPath == partial && (active(other) || other->retryDeadline);
+        });
+        if (!sharedPartial) DeleteFileW(Win32Path(partial).c_str());
+    }
     webFiles_.erase(id);
     if (job->view.folderId.empty()) jobs_.erase(found);
-    else { job->view.removed = true; job->view.savedPath.clear(); }
+    else { job->view.removed = true; job->view.savedPath.clear(); job->partialPath.clear(); }
     return true;
 }
 bool Engine::WaitForIdle(std::chrono::seconds timeout) {

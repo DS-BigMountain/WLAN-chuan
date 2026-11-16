@@ -25,6 +25,7 @@ class Manager {
     Release release_;
     fs::path stage_;
     std::atomic<bool> cancel_{false};
+    std::function<void()> abortHttp_;
     std::thread worker_;
     void Set(Phase phase, const std::wstring &message);
     void Join();

@@ -35,7 +35,7 @@ final class Transfers {
         }
     }
     static boolean permanent(String message){return message!=null&&(message.contains("同名文件")||message.contains("类型冲突")||message.contains("原文件已保留")||message.contains("源文件")||message.contains("文件长度发生变化")||message.contains("文件路径已变更"));}
-    void queueRetry(Peer peer,Job job){if(permanent(job.error)){try{e.request(peer,"POST","/api/batch-status",Collections.singletonMap("X-Chuan-Batch",job.batchId),job.upload+"\t5\t"+hex(job.error)+"\n",4000);}catch(IOException ignored){}return;}synchronized(e.lock){if(job.cancelled||job.retryDeadline!=0||!e.running)return;job.retryDeadline=now()+30000;job.retryExpired=false;job.retryPending=true;job.state=1;job.error="";job.activity="独立通道自动重试中";e.trace(job);}
+    void queueRetry(Peer peer,Job job){if(peer.browser&&peer.owner.isEmpty()){synchronized(e.lock){if(job.cancelled||!e.running)return;job.retryDeadline=0;job.retryExpired=false;job.retryPending=false;job.error="";}try{job.recipient=recipient(peer.id);e.state(job,1,"");synchronized(e.lock){job.activity="等待浏览器接收";e.trace(job);}}catch(IOException error){e.state(job,5,error.getMessage());}return;}if(permanent(job.error)){try{e.request(peer,"POST","/api/batch-status",Collections.singletonMap("X-Chuan-Batch",job.batchId),job.upload+"\t5\t"+hex(job.error)+"\n",4000);}catch(IOException ignored){}return;}synchronized(e.lock){if(job.cancelled||job.retryDeadline!=0||!e.running)return;job.retryDeadline=now()+30000;job.retryExpired=false;job.retryPending=true;job.state=1;job.error="";job.activity="独立通道自动重试中";e.trace(job);}
         e.scheduler.schedule(()->{synchronized(e.lock){if(job.retryDeadline!=0&&now()>=job.retryDeadline&&job.state!=3&&!job.cancelled&&!job.paused){job.retryExpired=true;for(Socket socket:job.sockets)try{socket.close();}catch(IOException ignored){}e.state(job,5,"传输失败超时（自动重试已达 30 秒）");}}},30,java.util.concurrent.TimeUnit.SECONDS);
         e.retries.execute(()->retryAttempt(peer,job));
     }
@@ -127,7 +127,7 @@ final class Transfers {
     void offer(Socket socket,InputStream input,OutputStream output,Header h,String ip,boolean browser)throws IOException {
         String batchId=h.get("x-chuan-batch"),owner=h.get(browser?"x-chuan-client":"x-chuan-id"),sender=sender(h);
         boolean asynchronous=h.get("x-chuan-offer-async").equals("1");
-        if(!key(batchId)||owner.isEmpty()||sender.isEmpty()||sender.length()>64||sender.matches(".*[\\r\\n].*"))throw new IOException("批次身份无效");
+        if(!key(batchId)||owner.isEmpty()||sender.isEmpty()||sender.length()>64||Engine.badText(sender))throw new IOException("批次身份无效");
         List<Item> items=parseManifest(new String(read(input,h.length(),1048576),StandardCharsets.UTF_8));
         String target=unhex(h.get("x-chuan-target")),recipientId=unhex(h.get("x-chuan-recipient"));if(browser&&!recipientId.isEmpty())throw new IOException("浏览器不能指定代理接收身份");
         Peer route=browser&&!target.isEmpty()&&!target.equals(e.config.id)?e.peer(target):null;
@@ -169,13 +169,13 @@ final class Transfers {
         boolean checksum=!(browser&&h.get("x-chuan-checksum").equals("none"));
         String resumeKey=h.get("x-chuan-resume-key");long resumeOffset=h.get("x-chuan-offset").isEmpty()?0:number(h.get("x-chuan-offset"));
         if((!resumeKey.isEmpty()&&!Resume.keyValid(resumeKey))||resumeOffset>total||resumeOffset>0&&resumeKey.isEmpty())throw new IOException("续传参数无效");
-        if(sender.isEmpty()||sender.length()>64||sender.matches(".*[\\r\\n].*")||total>Long.MAX_VALUE-32||h.length()!=(probe?0:total-resumeOffset+(checksum?32:0))||(!browser&&!probe&&!h.get("expect").equals("100-continue"))||(browser&&(!key(h.get("x-chuan-upload"))||!h.get("expect").isEmpty()))||(!h.get("x-chuan-checksum").isEmpty()&&!h.get("x-chuan-checksum").equals(checksum?"sha256":"none")))throw new IOException("文件请求参数无效");
+        if(sender.isEmpty()||sender.length()>64||Engine.badText(sender)||total>Long.MAX_VALUE-32||h.length()!=(probe?0:total-resumeOffset+(checksum?32:0))||(!browser&&!probe&&!h.get("expect").equals("100-continue"))||(browser&&(!key(h.get("x-chuan-upload"))||!h.get("expect").isEmpty()))||(!h.get("x-chuan-checksum").isEmpty()&&!h.get("x-chuan-checksum").equals(checksum?"sha256":"none")))throw new IOException("文件请求参数无效");
         String target=unhex(h.get("x-chuan-target")),recipientId=unhex(h.get("x-chuan-recipient")),recipient=recipient(recipientId);if(browser&&!recipientId.isEmpty())throw new IOException("接收身份无效");
         boolean staging=browser&&!target.isEmpty()&&!target.equals(e.config.id);if(staging)e.peer(target);
         String folder=h.get("x-chuan-folder"),folderName=unhex(h.get("x-chuan-folder-name"));long folderCount=folder.isEmpty()?0:number(h.get("x-chuan-folder-count")),folderTotal=folder.isEmpty()?0:number(h.get("x-chuan-folder-size"));
         if(!folder.isEmpty()&&(!key(folder)||!(name.startsWith(safePath(folderName)+"/")||directory&&name.equals(folderName))||folderName.contains("/")||folderCount<1||folderTotal<total))throw new IOException("文件夹批次无效");
         limits(folder.isEmpty()?1:folderCount,folder.isEmpty()?total:folderTotal,e.config.maxFiles,e.config.maxBytes);
-        File base=staging||!recipient.isEmpty()?e.config.relayDirectory:e.config.receiveDirectory;base.mkdirs();
+        File base=staging||!recipient.isEmpty()||(!directory&&e.platform.externalStorage())?e.config.relayDirectory:e.config.receiveDirectory;base.mkdirs();
         boolean matched=false;String existingUri=null,copyError="";
         if(copying||probe||directory){
             synchronized(e.lock){Batch approved=e.batches.get(batchKey(h,ip,browser));int index=(int)number(h.get("x-chuan-item"));
@@ -208,6 +208,12 @@ final class Transfers {
             }
             }catch(IOException error){copyError=error.getMessage()==null?"无法核对目标文件":error.getMessage();}
         }
+        if(!copyError.isEmpty()){
+            Job failed=null;
+            if(!h.get("x-chuan-batch").isEmpty())synchronized(e.lock){for(Job candidate:e.jobs.values())if(candidate.announced&&candidate.state==0&&(browser?candidate.owner:candidate.nativeOwner).equals(h.get(browser?"x-chuan-client":"x-chuan-id"))&&candidate.batchId.equals(h.get("x-chuan-batch"))&&candidate.upload.equals(h.get("x-chuan-upload"))&&candidate.name.equals(name)&&candidate.total==total){failed=candidate;candidate.announced=false;break;}}
+            if(failed==null)failed=e.job(name,sender,total,true);
+            e.state(failed,5,copyError);response(output,409,"Conflict",copyError,"text/plain; charset=utf-8");return;
+        }
         Batch batch=null;int item=0;File folderRoot=null;
         if(!h.get("x-chuan-batch").isEmpty()){
             synchronized(e.lock){batch=e.batches.get(batchKey(h,ip,browser));item=(int)number(h.get("x-chuan-item"));
@@ -216,13 +222,12 @@ final class Transfers {
                 Item authorized=batch.items.get(item);String pathKey=item+":"+name.toLowerCase(Locale.ROOT);long nextCount=batch.counts[item]+1,nextBytes=Math.addExact(batch.bytes[item],total);
                 if((authorized.folder?!(name.startsWith(authorized.name+"/")||directory&&name.equals(authorized.name)):!name.equals(authorized.name))||nextCount>authorized.count||nextBytes>authorized.total||(nextCount==authorized.count&&nextBytes!=authorized.total)||batch.paths.contains(pathKey)||authorized.folder!=!folder.isEmpty()||(authorized.folder&&(!authorized.name.equals(folderName)||authorized.count!=folderCount||authorized.total!=folderTotal)))throw new IOException("文件超出已批准项目的范围");
                 batch.counts[item]=nextCount;batch.bytes[item]=nextBytes;batch.paths.add(pathKey);batch.touched=now();
-                if(authorized.folder&&copyError.isEmpty()){folderRoot=batch.roots.get(item);if(folderRoot==null){folderRoot=copying?new File(base,authorized.name):unique(base,authorized.name,true);if(!folderRoot.isDirectory()&&!folderRoot.mkdirs())throw new IOException("无法创建接收目录");batch.roots.put(item,folderRoot);}}
+                if(authorized.folder){folderRoot=batch.roots.get(item);if(folderRoot==null){folderRoot=copying?new File(base,authorized.name):unique(base,authorized.name,true);if(!folderRoot.isDirectory()&&!folderRoot.mkdirs())throw new IOException("无法创建接收目录");batch.roots.put(item,folderRoot);}}
             }
         }
         if(!recipient.isEmpty()&&batch==null)throw new IOException("浏览器接收文件需要批次审批");
         Job announced=null;synchronized(e.lock){Batch declared=e.batches.get(batchKey(h,ip,browser));if(declared!=null){for(Job candidate:e.jobs.values())if(candidate.announced&&candidate.state==0&&(browser?candidate.owner:candidate.nativeOwner).equals(h.get(browser?"x-chuan-client":"x-chuan-id"))&&candidate.batchId.equals(h.get("x-chuan-batch"))&&candidate.upload.equals(h.get("x-chuan-upload"))&&candidate.name.equals(name)&&candidate.total==total){announced=candidate;candidate.announced=false;candidate.activity="";e.trace(candidate);candidate.browserPaused=false;candidate.resumeActivity="";break;}if(announced==null&&declared.announcedItems.contains(item))throw new IOException("文件与已登记清单不一致");}}
         Job job=announced!=null?announced:e.job(name,sender,total,true);job.directory=directory;job.nativeOwner=browser?"":h.get("x-chuan-id");job.owner=browser?h.get("x-chuan-client"):"";job.webTab=h.get("x-chuan-tab").isEmpty()?job.owner:h.get("x-chuan-tab");job.upload=h.get("x-chuan-upload");job.recipient=recipient;job.target=target;job.displaySender=sender;job.staging=staging||!recipient.isEmpty();job.stage=browser?(staging?"staging":"upload"):"";job.batchId=h.get("x-chuan-batch");job.storageKey=batchKey(h,ip,browser)+":"+recipient;job.item=item;job.folderId=folder;job.folderName=folderName;job.folderCount=folderCount;job.folderTotal=folderTotal;job.sockets.add(socket);
-        if(!copyError.isEmpty()){e.state(job,5,copyError);job.sockets.remove(socket);response(output,409,"Conflict",copyError,"text/plain; charset=utf-8");return;}
         if(batch==null&&!e.config.autoReceive&&!job.staging){job.state=1;job.awaitingApproval=true;job.offerItems=Collections.singletonList(new Item(name,false,1,total));awaitSelection(socket,input,job,null);if(!"1".equals(job.selection)||job.cancelled){e.state(job,job.cancelled?4:6,"");response(output,417,"Expectation Failed","接收请求已拒绝","text/plain; charset=utf-8");job.sockets.remove(socket);return;}}
         if(probe&&matched){
             File destination=new File(base,name);
@@ -249,7 +254,7 @@ final class Transfers {
             }
             boolean exact=copying&&!job.staging&&!e.platform.externalStorage();
             synchronized(e.lock){destination=exact?new File(parent,name.substring(name.lastIndexOf('/')+1)):unique(parent,name.substring(name.lastIndexOf('/')+1),false);if(exact&&destination.exists())throw new IOException("目标文件在核对后已变化，原文件已保留");if(job.cancelled||job.retryExpired||!e.running)throw new IOException("传输已取消");if(!temporary.renameTo(destination))throw new IOException("无法提交接收文件");job.file=destination;job.source=Source.file(destination,name);}
-            if(!job.staging)job.publicUri=e.publish(job);
+            if(!job.staging){job.publicUri=e.publish(job);if(e.platform.externalStorage()&&!job.publicUri.isEmpty()){Source published=e.platform.publishedSource(job,job.publicUri,name);if(published!=null)job.source=published;if(destination.delete())job.file=null;}}
             if(!recipient.isEmpty()){job.state=1;waitBrowser(job,output);return;}
             e.state(job,3,"");response(output,201,"Created",browser?Json.stringify(Json.map("id",String.valueOf(job.id))):destination.getName(),browser?"application/json; charset=utf-8":"text/plain; charset=utf-8");
         }catch(Exception error){if(resumeKey.isEmpty()||String.valueOf(error.getMessage()).contains("SHA-256"))temporary.delete();e.state(job,job.paused?5:job.cancelled?4:5,job.cancelled?"接收端已取消本次传输":error.getMessage()==null?"传输中断":error.getMessage());response(output,422,"Unprocessable Content",job.error,"text/plain; charset=utf-8");}finally{job.sockets.remove(socket);}
@@ -365,14 +370,16 @@ final class Transfers {
             if(job.verificationPending)e.fileVerification.execute(()->{if(prepareOne(peer,job))ready.run();else if(job.state==5)queueRetry(peer,job);});else ready.run();
         });return job;
     }
-    void download(Session session,Job job,OutputStream output,boolean checksum,long offset,String prefix,boolean range)throws IOException {
+    void download(Session session,Job job,OutputStream output,boolean checksum,long offset,String prefix,boolean range,long sliceEnd,boolean[] committed)throws IOException {
         if(job==null||job.removed||job.source==null||(!job.owner.equals(session.client)&&!job.recipient.equals(session.client)))throw new FileNotFoundException("文件不属于当前浏览器会话");
-        boolean delivery=job.recipient.equals(session.client);if(job.paused||delivery&&job.state==4)throw new IOException("传输已暂停或取消");if(offset<0||offset>job.total||range&&(checksum||offset>=job.total)||!prefix.isEmpty()&&!Resume.keyValid(prefix))throw new IOException("续传范围无效");
+        boolean delivery=job.recipient.equals(session.client);if(job.paused||delivery&&job.state==4)throw new IOException("传输已暂停或取消");if(offset<0||offset>job.total||range&&(checksum||job.total==0||offset>=job.total||(sliceEnd>=0&&sliceEnd<offset))||!prefix.isEmpty()&&!Resume.keyValid(prefix))throw new IOException("续传范围无效");
+        long endLimit=(range&&sliceEnd>=0)?Math.min(job.total,sliceEnd+1):job.total;
         try(InputStream input=job.source.opener.open()){
             MessageDigest hash=sha();if(offset>0){if(checksum||!prefix.isEmpty()){String actual=Resume.prefix(input,offset,hash,()->{if(job.paused||job.cancelled||!e.running)throw new IOException("传输已暂停或取消");});if(!prefix.isEmpty()&&!actual.equals(prefix))throw new IOException("续传内容不一致");}else Resume.skip(input,offset);}
             if(delivery){e.state(job,2,"");job.progressBytes=offset;job.progressAt=now();e.progress(job,offset);synchronized(e.lock){job.activity=job.archiveSources.isEmpty()?"正在发送文件":"边打包边发送 ZIP";e.trace(job);}}
-            ascii(output,(range?"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes "+offset+"-"+(job.total-1)+"/"+job.total+"\r\n":"HTTP/1.1 200 OK\r\n")+"Connection: close\r\nCache-Control: no-store\r\nAccept-Ranges: bytes\r\nX-Content-Type-Options: nosniff\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"download\"; filename*=UTF-8''"+encodeName(job.name.substring(job.name.lastIndexOf('/')+1))+"\r\nContent-Length: "+Math.addExact(job.total-offset,checksum?32:0)+"\r\n\r\n");
-            e.diagnostics.copy(job,"disk_to_browser",input,output,job.total-offset,checksum?hash:null,bytes->{if(job.paused)throw new IOException("传输已暂停");if(delivery)e.progress(job,offset+bytes);});if(checksum)output.write(hash.digest());output.flush();if(delivery){if(job.folderId.isEmpty())e.state(job,3,"");else synchronized(e.lock){job.state=1;job.activity="等待浏览器保存确认";e.trace(job);}}
+            committed[0]=true;
+            ascii(output,(range?"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes "+offset+"-"+(endLimit-1)+"/"+job.total+"\r\n":"HTTP/1.1 200 OK\r\n")+"Connection: close\r\nCache-Control: no-store\r\nAccept-Ranges: bytes\r\nX-Content-Type-Options: nosniff\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"download\"; filename*=UTF-8''"+encodeName(job.name.substring(job.name.lastIndexOf('/')+1))+"\r\nContent-Length: "+Math.addExact(endLimit-offset,checksum?32:0)+"\r\n\r\n");
+            e.diagnostics.copy(job,"disk_to_browser",input,output,endLimit-offset,checksum?hash:null,bytes->{if(job.paused)throw new IOException("传输已暂停");if(delivery)e.progress(job,offset+bytes);});if(checksum)output.write(hash.digest());output.flush();if(delivery){if(endLimit<job.total)synchronized(e.lock){job.state=1;job.activity="";e.trace(job);}else if(job.folderId.isEmpty())e.state(job,3,"");else synchronized(e.lock){job.state=1;job.activity="等待浏览器保存确认";e.trace(job);}}
         }catch(IOException error){if(delivery)e.state(job,job.cancelled?4:5,error.getMessage());throw error;}
     }
     static void safeDestination(File base,File path)throws IOException {

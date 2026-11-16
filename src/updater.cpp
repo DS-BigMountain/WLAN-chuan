@@ -1,4 +1,5 @@
 #include "updater.h"
+#include <algorithm>
 #include <bcrypt.h>
 #include <fstream>
 #include <iomanip>
@@ -11,10 +12,15 @@
 namespace chuan::update {
 namespace {
 struct Internet {
+    std::mutex mutex;
     HINTERNET value = nullptr;
     explicit Internet(HINTERNET h) : value(h) { if (!h) throw std::runtime_error("无法连接 GitHub，请检查网络后重试"); }
-    ~Internet() { WinHttpCloseHandle(value); }
-    operator HINTERNET() const { return value; }
+    void Close() noexcept {
+        std::lock_guard lock(mutex);
+        if (value) { auto h = value; value = nullptr; WinHttpCloseHandle(h); }
+    }
+    ~Internet() { Close(); }
+    operator HINTERNET() { std::lock_guard lock(mutex); return value; }
 };
 void Require(bool value, const char *message) { if (!value) throw std::runtime_error(message); }
 std::wstring Quote(const std::wstring &value) {
@@ -58,11 +64,13 @@ std::wstring Header(HINTERNET request, DWORD header) {
     Require(WinHttpQueryHeaders(request, header, nullptr, value.data(), &size, nullptr) != FALSE, "无法读取下载响应");
     value.resize(size / sizeof(wchar_t)); return value;
 }
-void Request(std::wstring url, uint64_t limit, std::atomic<bool> &cancel,
-             const std::function<void(const char *, size_t)> &consume) {
-    Internet session(WinHttpOpen(L"Chuan-Updater/2", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-                                WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
-    WinHttpSetTimeouts(session, 10000, 15000, 15000, 15000);
+void RequestImpl(std::wstring url, uint64_t limit, std::atomic<bool> &cancel,
+                 const std::function<void(const char *, size_t)> &consume,
+                 const std::function<void(std::function<void()>)> &registerAbort = {}) {
+    auto session = std::make_shared<Internet>(WinHttpOpen(L"Chuan-Updater/2", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                                                          WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
+    if (registerAbort) registerAbort([session] { session->Close(); });
+    WinHttpSetTimeouts(*session, 10000, 15000, 15000, 15000);
     for (int redirect = 0; redirect < 6; ++redirect) {
         if (cancel) throw std::runtime_error("更新操作已取消");
         URL_COMPONENTS parts{}; parts.dwStructSize = sizeof(parts); parts.dwHostNameLength = parts.dwUrlPathLength = parts.dwExtraInfoLength = static_cast<DWORD>(-1);
@@ -70,13 +78,13 @@ void Request(std::wstring url, uint64_t limit, std::atomic<bool> &cancel,
         const std::wstring host(parts.lpszHostName, parts.dwHostNameLength);
         Require(host == L"api.github.com" || host == L"github.com" || host == L"release-assets.githubusercontent.com" || host == L"objects.githubusercontent.com", "更新下载重定向地址无效");
         std::wstring path(parts.lpszUrlPath, parts.dwUrlPathLength); if (parts.dwExtraInfoLength) path.append(parts.lpszExtraInfo, parts.dwExtraInfoLength);
-        Internet connection(WinHttpConnect(session, host.c_str(), parts.nPort, 0));
+        Internet connection(WinHttpConnect(*session, host.c_str(), parts.nPort, 0));
         Internet request(WinHttpOpenRequest(connection, L"GET", path.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE));
         DWORD policy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER; WinHttpSetOption(request, WINHTTP_OPTION_REDIRECT_POLICY, &policy, sizeof(policy));
         const wchar_t *headers = L"Accept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\n";
         if (host != L"api.github.com") headers = L"Accept: application/octet-stream\r\n";
         Require(WinHttpSendRequest(request, headers, static_cast<DWORD>(-1), WINHTTP_NO_REQUEST_DATA, 0, 0, 0) != FALSE && WinHttpReceiveResponse(request, nullptr) != FALSE,
-                "GitHub 连接失败或超时，请检查网络后重试");
+                cancel ? "更新操作已取消" : "GitHub 连接失败或超时，请检查网络后重试");
         DWORD status = 0, bytes = sizeof(status); WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, nullptr, &status, &bytes, nullptr);
         if (status == 301 || status == 302 || status == 303 || status == 307 || status == 308) { url = Header(request, WINHTTP_QUERY_LOCATION); continue; }
         Require(status != 403 && status != 429, "GitHub 请求受限，请稍后重试或打开发布页");
@@ -84,10 +92,44 @@ void Request(std::wstring url, uint64_t limit, std::atomic<bool> &cancel,
         const auto length = Header(request, WINHTTP_QUERY_CONTENT_LENGTH);
         if (!length.empty()) Require(std::stoull(length) <= limit, "更新响应超出大小限制");
         std::array<char, 128 * 1024> buffer{}; uint64_t total = 0;
-        for (;;) { if (cancel) throw std::runtime_error("更新操作已取消"); DWORD count = 0; Require(WinHttpReadData(request, buffer.data(), static_cast<DWORD>(buffer.size()), &count) != FALSE, "更新下载中断，请重试"); if (!count) break; total += count; Require(total <= limit, "更新响应超出大小限制"); consume(buffer.data(), count); }
+        for (;;) { if (cancel) throw std::runtime_error("更新操作已取消"); DWORD count = 0; Require(WinHttpReadData(request, buffer.data(), static_cast<DWORD>(buffer.size()), &count) != FALSE, cancel ? "更新操作已取消" : "更新下载中断，请重试"); if (!count) break; total += count; Require(total <= limit, "更新响应超出大小限制"); consume(buffer.data(), count); }
         return;
     }
     throw std::runtime_error("更新下载重定向次数过多");
+}
+void CleanupOldUpdates(const fs::path &activeStage) {
+    try {
+        std::error_code ec;
+        const auto now = fs::file_time_type::clock::now();
+        PWSTR raw = nullptr;
+        if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &raw))) {
+            fs::path root(raw); CoTaskMemFree(raw); root /= L"Chuan/Updates";
+            if (fs::is_directory(root, ec)) for (const auto &entry : fs::directory_iterator(root, ec)) {
+                if (ec || !entry.is_directory(ec) || entry.path() == activeStage) continue;
+                const auto age = now - entry.last_write_time(ec);
+                if (!ec && age > std::chrono::minutes(5)) fs::remove_all(entry.path(), ec);
+            }
+        }
+        const auto exeDir = ExePath().parent_path();
+        if (!exeDir.empty() && fs::is_directory(exeDir, ec)) {
+            struct Backup { fs::path path; fs::file_time_type mtime; };
+            std::vector<Backup> backups;
+            for (const auto &entry : fs::directory_iterator(exeDir, ec)) {
+                if (ec || !entry.is_regular_file(ec)) continue;
+                const auto name = entry.path().filename().wstring();
+                if (name.starts_with(L".Chuan-new-") && name.ends_with(L".exe")) {
+                    if (now - entry.last_write_time(ec) > std::chrono::hours(1)) fs::remove(entry.path(), ec);
+                } else if (name.starts_with(L".Chuan-backup-") && name.ends_with(L".exe")) {
+                    backups.push_back({entry.path(), entry.last_write_time(ec)});
+                }
+            }
+            if (backups.size() > 1) {
+                std::sort(backups.begin(), backups.end(), [](const auto &a, const auto &b) { return a.mtime > b.mtime; });
+                for (size_t i = 1; i < backups.size(); ++i) fs::remove(backups[i].path, ec);
+            }
+            if (!backups.empty() && now - backups.front().mtime > std::chrono::hours(24 * 7)) fs::remove(backups.front().path, ec);
+        }
+    } catch (...) {}
 }
 std::wstring PsLiteral(std::wstring value) { size_t at = 0; while ((at = value.find(L'\'', at)) != std::wstring::npos) { value.insert(at, 1, L'\''); at += 2; } return L"'" + value + L"'"; }
 std::wstring Base64(const std::wstring &value) {
@@ -196,7 +238,7 @@ void FetchPackage(const Release &release, const fs::path &file, std::atomic<bool
                   const std::function<void(uint64_t)> &progress) {
     try {
         std::ofstream out(file, std::ios::binary); Require(out.is_open(), "无法创建更新缓存文件"); uint64_t done = 0;
-        Request(Wide(release.url), release.size, cancel, [&](const char *data, size_t n) { out.write(data, n); Require(out.good(), "更新下载写入失败，请检查可用空间"); done += n; progress(done); });
+        RequestImpl(Wide(release.url), release.size, cancel, [&](const char *data, size_t n) { out.write(data, n); Require(out.good(), "更新下载写入失败，请检查可用空间"); done += n; progress(done); });
         out.close(); Require(!out.fail() && done == release.size, "更新包下载不完整，请重试");
     } catch (...) { std::error_code ec; fs::remove(file, ec); throw; }
 }
@@ -232,12 +274,21 @@ Status Manager::Get() const { std::lock_guard lock(mutex_); auto state = status_
 void Manager::SettingsRead() { std::lock_guard lock(mutex_); notices_.SettingsRead(); }
 void Manager::UpdateRead() { std::lock_guard lock(mutex_); notices_.UpdateRead(); }
 void Manager::Set(Phase phase, const std::wstring &message) { std::lock_guard lock(mutex_); status_.phase = phase; status_.message = message; }
-void Manager::Cancel() { cancel_ = true; }
+void Manager::Cancel() {
+    cancel_ = true;
+    std::function<void()> abortFn;
+    { std::lock_guard lock(mutex_); abortFn = std::move(abortHttp_); }
+    if (abortFn) abortFn();
+}
 void Manager::Check() {
     auto s = Get(); if (s.phase == Phase::Checking || s.phase == Phase::Downloading) return;
     Join(); cancel_ = false; Set(Phase::Checking, L"正在检查 GitHub 更新…");
     worker_ = std::thread([this] { try {
-        std::string body; Request(Wide(ReleaseApi), 1048576, cancel_, [&](const char *data, size_t n) { body.append(data, n); });
+        CleanupOldUpdates(stage_);
+        std::string body;
+        RequestImpl(Wide(ReleaseApi), 1048576, cancel_, [&](const char *data, size_t n) { body.append(data, n); },
+            [this](std::function<void()> fn) { std::lock_guard lock(mutex_); abortHttp_ = std::move(fn); if (cancel_ && abortHttp_) { auto f = std::move(abortHttp_); f(); } });
+        { std::lock_guard lock(mutex_); abortHttp_ = nullptr; }
         // Compare first so older releases without modern asset digests still report current correctly.
         const auto root = JsonReader(body).Read(); auto latest = root.At("tag_name").StringValue();
         Require(root.kind == JsonValue::Object && !root.At("draft").True() && !root.At("prerelease").True() && latest.starts_with("V"), "未找到有效的正式发行版本");
@@ -245,17 +296,24 @@ void Manager::Check() {
         auto release = ParseRelease(body, "windows-x64.zip");
         { std::lock_guard lock(mutex_); release_ = release; status_.version = Wide(release.version); notices_.Found(status_.version); status_.notes = Wide(release.notes); status_.done = 0; status_.total = release.size; }
         Set(Phase::Available, L"发现新版本 " + Wide(release.version));
-    } catch (const std::exception &e) { Set(Phase::Error, Wide(e.what())); } });
+    } catch (const std::exception &e) { std::lock_guard lock(mutex_); abortHttp_ = nullptr; status_.phase = Phase::Error; status_.message = Wide(e.what()); } });
 }
 void Manager::Download() {
     if (Get().phase != Phase::Available) return; Join(); cancel_ = false; Set(Phase::Downloading, L"正在下载更新…");
     worker_ = std::thread([this] { try {
         std::error_code ec; if (!stage_.empty()) fs::remove_all(stage_, ec); stage_ = NewStage();
         const auto archive = stage_ / L"package.zip";
-        FetchPackage(release_, archive, cancel_, [&](uint64_t done) { std::lock_guard lock(mutex_); status_.done = done; });
+        try {
+            std::ofstream out(archive, std::ios::binary); Require(out.is_open(), "无法创建更新缓存文件"); uint64_t done = 0;
+            RequestImpl(Wide(release_.url), release_.size, cancel_,
+                [&](const char *data, size_t n) { out.write(data, n); Require(out.good(), "更新下载写入失败，请检查可用空间"); done += n; std::lock_guard lock(mutex_); status_.done = done; },
+                [this](std::function<void()> fn) { std::lock_guard lock(mutex_); abortHttp_ = std::move(fn); if (cancel_ && abortHttp_) { auto f = std::move(abortHttp_); f(); } });
+            out.close(); Require(!out.fail() && done == release_.size, "更新包下载不完整，请重试");
+        } catch (...) { std::error_code ec2; fs::remove(archive, ec2); throw; }
+        { std::lock_guard lock(mutex_); abortHttp_ = nullptr; }
         Set(Phase::Downloading, L"正在校验更新包…"); Require(!cancel_, "更新操作已取消"); PreparePackage(release_, archive, stage_);
         Require(!cancel_, "更新操作已取消"); Set(Phase::Ready, L"下载完成，需要重启软件以应用更新。");
-    } catch (const std::exception &e) { Set(Phase::Error, Wide(e.what())); } });
+    } catch (const std::exception &e) { std::lock_guard lock(mutex_); abortHttp_ = nullptr; status_.phase = Phase::Error; status_.message = Wide(e.what()); } });
 }
 bool Manager::Restart(HWND, const fs::path &dataDir, std::wstring &error) {
     if (Get().phase != Phase::Ready) return false; Join();

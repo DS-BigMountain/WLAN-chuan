@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$BuildDirectory = 'build',
     [ValidateSet('Release', 'RelWithDebInfo', 'MinSizeRel')]
@@ -29,7 +29,15 @@ if ($AndroidApk) {
     $AndroidApk = [IO.Path]::GetFullPath($AndroidApk)
     if (-not (Test-Path -LiteralPath $AndroidApk -PathType Leaf)) { throw 'Android 安装包不存在。' }
     if (-not $AndroidSdk) { throw '验证 Android 安装包需要通过 -AndroidSdk 指定 Android SDK。' }
-    $taskAndroidTools = Join-Path ([IO.Path]::GetFullPath($AndroidSdk)) 'build-tools/35.0.0'
+    $taskAndroidToolsRoot = Join-Path ([IO.Path]::GetFullPath($AndroidSdk)) 'build-tools'
+    $taskAndroidTools = Join-Path $taskAndroidToolsRoot '35.0.0'
+    if (-not (Test-Path -LiteralPath $taskAndroidTools)) {
+        $taskAndroidTools = Get-ChildItem -LiteralPath $taskAndroidToolsRoot -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^\d+\.\d+\.\d+$' -and [version]$_.Name -ge [version]'35.0.0' } |
+            Sort-Object { [version]$_.Name } -Descending |
+            Select-Object -First 1 -ExpandProperty FullName
+    }
+    if (-not $taskAndroidTools -or -not (Test-Path -LiteralPath $taskAndroidTools)) { throw 'Android SDK 缺少 >= 35.0.0 的 Build Tools。' }
     # Native Android tools use an ASCII temporary path, including when the project folder contains Chinese characters.
     $taskApkCheckPath = Join-Path ([IO.Path]::GetTempPath()) ('chuan-package-' + [Guid]::NewGuid().ToString('N') + '.apk')
     Copy-Item -LiteralPath $AndroidApk -Destination $taskApkCheckPath

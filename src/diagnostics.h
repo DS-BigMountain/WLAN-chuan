@@ -29,11 +29,45 @@ class Log {
     std::filesystem::path directory_,path_;std::ofstream stream_;std::thread writer_;
     struct Entry{uint64_t epoch;std::string text;};
     std::deque<Entry> queue_;std::atomic<uint64_t> epoch_{0};bool stopping_=false,busy_=false;uint64_t bytes_=0,segment_=0,submitted_=0,completed_=0;
-    std::atomic<uint64_t> dropped_{0},ioErrors_{0};std::string prefix_;uint64_t resourceAt_=0;
+    std::atomic<uint64_t> dropped_{0},ioErrors_{0},lastActivity_{0};std::string prefix_;uint64_t resourceAt_=0;
     std::mutex exportMutex_;
     std::map<std::string,std::map<std::string,uint64_t>> exportCursors_;
     std::map<std::wstring,std::pair<std::string,std::map<std::string,uint64_t>>> pendingExports_;
     std::atomic<uint64_t> recordId_{0};
+    static uint64_t SegmentSize(const std::filesystem::path &p) noexcept {
+        std::ifstream probe(p, std::ios::binary | std::ios::ate);
+        if (probe) {
+            const auto pos = probe.tellg();
+            if (pos >= 0) return static_cast<uint64_t>(pos);
+        }
+        std::error_code ec;
+        const auto sz = std::filesystem::file_size(p, ec);
+        return ec ? 0 : sz;
+    }
+    void PruneLogsLocked(){
+        try{
+            struct LogFile{std::filesystem::path path;uint64_t size;std::filesystem::file_time_type mtime;};
+            std::vector<LogFile> files;uint64_t total=0;const auto currentName=path_.filename();
+            for(const auto &entry:std::filesystem::directory_iterator(directory_)){
+                if(!entry.is_regular_file())continue;const auto name=entry.path().filename().wstring();
+                if(!name.starts_with(L"transfer-")||entry.path().extension()!=L".jsonl")continue;
+                const auto size=SegmentSize(entry.path());total+=size;
+                if(entry.path().filename()!=currentName)files.push_back({entry.path(),size,entry.last_write_time()});
+            }
+            if(files.size()<16&&total<=256ull*1024*1024)return;
+            std::sort(files.begin(),files.end(),[](const auto &a,const auto &b){return a.mtime<b.mtime;});
+            size_t count=files.size()+1;bool cursorsChanged=false;
+            for(const auto &file:files){
+                if(count<=16&&total<=256ull*1024*1024)break;
+                std::error_code ec;if(std::filesystem::remove(file.path,ec)){
+                    total-=std::min(total,file.size);--count;
+                    const auto fname=file.path.filename().string();
+                    for(auto &[owner,map]:exportCursors_)if(map.erase(fname))cursorsChanged=true;
+                }
+            }
+            if(cursorsChanged)SaveCursors();
+        }catch(...){}
+    }
     void SaveCursors(){
         const auto temporary=directory_/L"export-cursors.tmp",target=directory_/L"export-cursors.state";
         std::ofstream output(temporary,std::ios::binary|std::ios::trunc);
@@ -49,12 +83,14 @@ class Log {
             try{std::lock_guard io(ioMutex_);
                 for(const auto &entry:batch){
                     if(entry.epoch!=epoch_.load())continue;const auto &line=entry.text;
-                    if(bytes_>=16*1024*1024){stream_.close();path_=directory_/(prefix_+"-"+std::to_string(++segment_)+".jsonl");stream_.open(path_,std::ios::binary);bytes_=0;}
+                    if(bytes_>=16*1024*1024){stream_.close();path_=directory_/(prefix_+"-"+std::to_string(++segment_)+".jsonl");stream_.open(path_,std::ios::binary);bytes_=0;PruneLogsLocked();}
                     if(stream_){stream_<<line;bytes_+=line.size();if(!stream_){dropped_++;ioErrors_++;}}else dropped_++;
                 }stream_.flush();if(!stream_)ioErrors_++;
             }catch(...){dropped_+=batch.size();ioErrors_++;}
-            if(GetTickCount64()-resourceAt_>=1000){
-                resourceAt_=GetTickCount64();FILETIME created{},ended{},kernel{},user{};PROCESS_MEMORY_COUNTERS memory{};MEMORYSTATUSEX available{};available.dwLength=sizeof(available);
+            const auto now=GetTickCount64();
+            const uint64_t interval=(now-lastActivity_.load()<=15000)?1000:30000;
+            if(now-resourceAt_>=interval){
+                resourceAt_=now;FILETIME created{},ended{},kernel{},user{};PROCESS_MEMORY_COUNTERS memory{};MEMORYSTATUSEX available{};available.dwLength=sizeof(available);
                 if(GetProcessTimes(GetCurrentProcess(),&created,&ended,&kernel,&user)&&GetProcessMemoryInfo(GetCurrentProcess(),&memory,sizeof(memory))){
                     const uint64_t cpu=((static_cast<uint64_t>(kernel.dwHighDateTime)<<32)|kernel.dwLowDateTime)+((static_cast<uint64_t>(user.dwHighDateTime)<<32)|user.dwLowDateTime);
                     GlobalMemoryStatusEx(&available);SYSTEM_INFO system{};GetSystemInfo(&system);
@@ -76,16 +112,18 @@ class Log {
             {std::ifstream state(directory_/L"export-cursors.state");std::string owner,file;uint64_t offset=0;while(state>>std::quoted(owner)>>std::quoted(file)>>offset){auto &cursor=exportCursors_[owner];if(!file.empty())cursor[file]=offset;}}
             if(!exportCursors_.contains("__initial__")){
                 auto &baseline=exportCursors_["__initial__"];
-                for(const auto &entry:std::filesystem::directory_iterator(directory_))if(entry.is_regular_file()&&entry.path().filename().wstring().starts_with(L"transfer-")&&entry.path().extension()==L".jsonl")baseline[entry.path().filename().string()]=entry.file_size();
+                for(const auto &entry:std::filesystem::directory_iterator(directory_))if(entry.is_regular_file()&&entry.path().filename().wstring().starts_with(L"transfer-")&&entry.path().extension()==L".jsonl")baseline[entry.path().filename().string()]=SegmentSize(entry.path());
                 try{SaveCursors();}catch(...){++ioErrors_;}
             }
             prefix_="transfer-"+std::to_string(GetCurrentProcessId())+"-"+std::to_string(GetTickCount64());
-            path_=directory_/(prefix_+"-0.jsonl");stream_.open(path_,std::ios::binary);if(!stream_)return false;
+            path_=directory_/(prefix_+"-0.jsonl");PruneLogsLocked();stream_.open(path_,std::ios::binary);if(!stream_)return false;
             writer_=std::thread([this]{Run();});return true;
         }catch(...){return false;}
     }
     void Write(const std::string &fields,uint64_t expectedEpoch=UINT64_MAX) noexcept {
-        try{const auto generation=epoch_.load();if(expectedEpoch!=UINT64_MAX&&generation!=expectedEpoch)return;SYSTEMTIME utc{};GetSystemTime(&utc);std::ostringstream line;
+        try{const auto generation=epoch_.load();if(expectedEpoch!=UINT64_MAX&&generation!=expectedEpoch)return;
+            if(!fields.starts_with("\"event\":\"resources\"")&&!fields.starts_with("\"event\":\"transport_")&&!fields.starts_with("\"event\":\"interface_"))lastActivity_.store(GetTickCount64());
+            SYSTEMTIME utc{};GetSystemTime(&utc);std::ostringstream line;
             line<<"{\"utc\":\""<<std::setfill('0')<<std::setw(4)<<utc.wYear<<'-'<<std::setw(2)<<utc.wMonth<<'-'<<std::setw(2)<<utc.wDay<<'T'<<std::setw(2)<<utc.wHour<<':'<<std::setw(2)<<utc.wMinute<<':'<<std::setw(2)<<utc.wSecond<<'.'<<std::setw(3)<<utc.wMilliseconds<<"Z\",\"diagnostic_session\":\""<<prefix_<<"\",\"mono_ms\":"<<std::fixed<<std::setprecision(3)<<Milliseconds()<<",\"platform\":\"windows\","<<"\"record_id\":"<<++recordId_<<",\"log_epoch\":"<<generation<<",\"thread_id\":"<<GetCurrentThreadId()<<","<<fields<<"}\n";
             {std::lock_guard lock(mutex_);if(!writer_.joinable()||stopping_||queue_.size()>=16384){dropped_++;return;}queue_.push_back({generation,line.str()});++submitted_;}
             changed_.notify_one();

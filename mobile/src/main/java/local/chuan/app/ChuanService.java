@@ -3,6 +3,7 @@ package local.chuan.app;
 import android.app.*;
 import android.content.*;
 import android.content.pm.ServiceInfo;
+import android.net.Uri;
 import android.net.wifi.WifiManager;
 import android.os.*;
 import java.io.*;
@@ -19,7 +20,9 @@ public final class ChuanService extends Service {
         Notification notification=new Notification.Builder(this,"transfer").setContentTitle("传 · 局域网服务已开启").setContentText("可接收文件并提供 Web 服务；点击返回应用。").setSmallIcon(R.drawable.notification).setContentIntent(pending).setOngoing(true).addAction(new Notification.Action.Builder(null,"停止服务",end).build()).build();
         if(Build.VERSION.SDK_INT>=29)startForeground(1,notification,ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE);else startForeground(1,notification);
         try{
-            android.content.SharedPreferences saved=prefs(this);Engine.Config config=new Engine.Config(root(this));config.relayDirectory=new File(getCacheDir(),"relay");config.id=saved.getString("id","");if(config.id.isEmpty()){config.id=Protocol.random();saved.edit().putString("id",config.id).apply();}config.name=saved.getString("name",Build.MANUFACTURER+" "+Build.MODEL);config.zipFolders=saved.getBoolean("zipFolders",false);config.autoReceive=saved.getBoolean("autoReceive",true);config.shareSoftware=saved.getBoolean("shareSoftware",true);config.maxFiles=saved.getLong("maxFiles",0);config.maxBytes=saved.getLong("maxBytes",0);config.port=saved.getInt("port",45871);
+            android.content.SharedPreferences saved=prefs(this);Engine.Config config=new Engine.Config(root(this));config.relayDirectory=new File(getCacheDir(),"relay");
+            File outgoingCache=new File(getCacheDir(),"outgoing");if(outgoingCache.isDirectory()){File[] leftovers=outgoingCache.listFiles();if(leftovers!=null)for(File f:leftovers)if(System.currentTimeMillis()-f.lastModified()>3600000L)f.delete();}
+            config.id=saved.getString("id","");if(config.id.isEmpty()){config.id=Protocol.random();saved.edit().putString("id",config.id).apply();}config.name=saved.getString("name",Build.MANUFACTURER+" "+Build.MODEL);config.zipFolders=saved.getBoolean("zipFolders",false);config.autoReceive=saved.getBoolean("autoReceive",true);config.shareSoftware=saved.getBoolean("shareSoftware",true);config.maxFiles=saved.getLong("maxFiles",0);config.maxBytes=saved.getLong("maxBytes",0);config.port=saved.getInt("port",45871);
             StoragePublisher storage=new StoragePublisher(this);Engine engine=new Engine(config,new Engine.Platform(){
                 public InputStream asset(String name)throws IOException{return getAssets().open("web/"+name);}
                 public File apk(){return new File(getApplicationInfo().sourceDir);}
@@ -28,6 +31,7 @@ public final class ChuanService extends Service {
                 public String existing(String path,boolean directory,long size,String digest,Engine.Check check)throws IOException{return storage.existing(path,directory,size,digest,check);}
                 public String saved(Engine.Job job)throws IOException{return storage.publish(job);}
                 public void deleted(Engine.Job job)throws IOException{storage.delete(job);}
+                public Engine.Source publishedSource(Engine.Job job,String publicUri,String name){Uri uri=Uri.parse(publicUri);return new Engine.Source(name,job.total,()->{InputStream stream=getContentResolver().openInputStream(uri);if(stream==null)throw new IOException("无法打开已保存文件");return stream;});}
                 public void settingsChanged(Engine.Config cfg){saved.edit().putString("name",cfg.name).putBoolean("zipFolders",cfg.zipFolders).putBoolean("autoReceive",cfg.autoReceive).putBoolean("shareSoftware",cfg.shareSoftware).putLong("maxFiles",cfg.maxFiles).putLong("maxBytes",cfg.maxBytes).apply();}
             });
             engine.start();active=engine;status="局域网服务已开启";

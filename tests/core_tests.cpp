@@ -99,7 +99,9 @@ int main() {
               "collapsed native folder aggregates bytes and live speed without stale completed speed");
         check(rows[0].savedPath==fs::path(L"C:\\received\\资料"), "folder parent locates its root directory");
         auto expanded=TransferRows({first,second},{rows[0].group});
-        check(expanded.size()==1 && expanded[0].folderRow, "native folder remains atomic even when expansion is requested");
+        check(expanded.size()==3 && expanded[0].folderRow && expanded[1].childRow && expanded[1].directoryRow &&
+                  expanded[1].name==L"子目录" && expanded[2].childRow && !expanded[2].directoryRow && expanded[2].name==L"a.txt",
+              "expanded folder renders top-level directory and file tree rows");
         check(TransferRows({first},{})[0].state==State::Waiting, "partially arrived folder is not completed");
         auto other=first; other.id=3; other.folderId="another-batch";
         check(TransferRows({first,other},{}).size()==2, "same-name native folders keep independent batch identities");
@@ -108,7 +110,7 @@ int main() {
         auto removedFirst=first; removedFirst.removed=true;
         auto completedSecond=second; completedSecond.state=State::Completed; completedSecond.done=60;
         auto remaining=TransferRows({removedFirst,completedSecond},{TransferGroup(first)});
-        check(remaining.size()==1 && remaining[0].state==State::Completed && remaining[0].done==100 && remaining[0].members.size()==1,
+        check(remaining.size()==2 && remaining[0].folderRow && remaining[0].state==State::Completed && remaining[0].done==100 && remaining[0].members.size()==1 && remaining[1].childRow && remaining[1].directoryRow && remaining[1].name==L"子目录",
               "deleting child retains complete folder accounting and hides only that child");
         WSADATA data{};
         WSAStartup(MAKEWORD(2, 2), &data);
@@ -258,7 +260,7 @@ int main() {
         sender.SendFiles(peer, {folder});
         check(Eventually([&] {
             for (auto &job : receiver.GetSnapshot().transfers)
-                if (job.awaitingApproval) return job.folderName == L"folder-approval" && job.folderCount == 2 && job.folderTotal == 6;
+                if (job.awaitingApproval) return job.folderName == L"folder-approval" && job.folderCount == 4 && job.folderTotal == 6;
             return false;
         }), "folder prompt describes complete batch before receiving bytes");
         receiver.Decide(pendingId(), true);
@@ -272,7 +274,7 @@ int main() {
         receiver.Decide(pendingId(), false);
         check(sender.WaitForIdle(std::chrono::seconds(5)), "rejected folder settles without another prompt");
         auto rejectedFolder = sender.GetSnapshot();
-        check(rejectedFolder.transfers.size() == 2 && std::all_of(rejectedFolder.transfers.begin(), rejectedFolder.transfers.end(), [](auto &job) { return job.state == State::Rejected || job.state == State::Cancelled; }), "folder rejection stops remaining files");
+        check(rejectedFolder.transfers.size() == 4 && std::all_of(rejectedFolder.transfers.begin(), rejectedFolder.transfers.end(), [](auto &job) { return job.state == State::Rejected || job.state == State::Cancelled; }), "folder rejection stops remaining files");
         sender.ClearFinished(); receiver.ClearFinished();
         std::vector<fs::path> loose;
         for (int i = 0; i < 50; ++i) { auto file = work / (L"batch-file-" + std::to_wstring(i) + L".txt"); std::ofstream(file) << i; loose.push_back(file); }
@@ -287,7 +289,7 @@ int main() {
         auto many = work / L"more-than-5000"; fs::create_directory(many);
         for (int i = 0; i < 5001; ++i) { std::ofstream file(many / (std::to_wstring(i) + L".txt")); }
         sender.SendFiles(peer, {many});
-        check(Eventually([&] { for (auto &job : receiver.GetSnapshot().transfers) if (job.awaitingApproval) return job.offerItems.size() == 1 && job.folderCount == 5001; return false; }), "default unlimited enumerates and offers a real 5001-file folder");
+        check(Eventually([&] { for (auto &job : receiver.GetSnapshot().transfers) if (job.awaitingApproval) return job.offerItems.size() == 1 && job.folderCount == 5002; return false; }), "default unlimited enumerates and offers a real 5001-file folder");
         receiver.Decide(pendingId(), false);
         check(sender.WaitForIdle(std::chrono::seconds(10)), "large folder can be rejected atomically");
         sender.ClearFinished(); receiver.ClearFinished();
@@ -307,7 +309,12 @@ int main() {
         const std::string browserKey = "33333333333333333333333333333333";
         const auto browserHeaders =
             "X-Chuan-Client: " + browserKey + "\r\nX-Chuan-Name: " + Hex(Utf8(L"测试浏览器")) + "\r\n";
-        TestGet(receiverConfig.port, "/web/api/state", browserHeaders);
+        const auto browserState = TestGet(receiverConfig.port, "/web/api/state", browserHeaders);
+        const auto browserTokenAt = browserState.find("\"token\":\"");
+        check(browserTokenAt != std::string::npos, "browser heartbeat returns session token");
+        const auto browserTokenStart = browserTokenAt + 9, browserTokenEnd = browserState.find('"', browserTokenStart);
+        const auto browserAuthHeaders =
+            browserHeaders + "X-Chuan-Token: " + browserState.substr(browserTokenStart, browserTokenEnd - browserTokenStart) + "\r\n";
         auto browserPeers = receiver.GetSnapshot().peers;
         auto browser =
             std::find_if(browserPeers.begin(), browserPeers.end(), [](auto &p) { return p.browser; });
@@ -319,10 +326,11 @@ int main() {
             file << "browser receipt";
         }
         receiver.SendFiles(*browser, {browserSource});
+        check(Eventually([&] { for (auto &j : receiver.GetSnapshot().transfers) if (j.requestOnly && j.name == browserSource.filename() && j.state == State::Waiting) { receiver.DecideItems(j.id, "1"); return true; } return false; }), "desktop offers approval request for online browser");
         uint64_t browserJob = 0;
         check(Eventually([&] {
                   for (auto &j : receiver.GetSnapshot().transfers)
-                      if (j.name == browserSource.filename() && j.state == State::Waiting) {
+                      if (!j.requestOnly && !j.receiving && j.name == browserSource.filename() && j.activity == L"等待浏览器接收") {
                           browserJob = j.id;
                           return true;
                       }
@@ -334,7 +342,7 @@ int main() {
         check(TestGet(receiverConfig.port, "/web/files/" + std::to_string(browserJob))
                   .starts_with("HTTP/1.1 404 "),
               "browser delivery is not exposed to other clients");
-        check(TestGet(receiverConfig.port, "/web/files/" + std::to_string(browserJob), browserHeaders)
+        check(TestGet(receiverConfig.port, "/web/files/" + std::to_string(browserJob), browserAuthHeaders)
                   .ends_with("browser receipt"),
               "browser receives desktop file through streaming download");
         check(TestGet(receiverConfig.port, "/web/api/state", browserHeaders).find("\"receiving\":true") !=
@@ -348,10 +356,11 @@ int main() {
             file << "original";
         }
         receiver.SendFiles(*browser, {changedSource});
+        check(Eventually([&] { for (auto &j : receiver.GetSnapshot().transfers) if (j.requestOnly && j.name == changedSource.filename() && j.state == State::Waiting) { receiver.DecideItems(j.id, "1"); return true; } return false; }), "changed source approval requested");
         uint64_t changedId = 0;
         check(Eventually([&] {
                   for (auto &j : receiver.GetSnapshot().transfers)
-                      if (j.name == changedSource.filename() && j.state == State::Waiting) {
+                      if (!j.requestOnly && !j.receiving && j.name == changedSource.filename() && j.activity == L"等待浏览器接收") {
                           changedId = j.id;
                           return true;
                       }

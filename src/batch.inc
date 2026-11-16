@@ -317,7 +317,15 @@ void Engine::ReceiveOffer(SOCKET socket, const std::map<std::string, std::string
     if (!valid || !line.empty() || items.empty()) { Reply(socket, 400, "Bad Request"); return; }
     const auto key = (browser ? "web:" : "native:") + ip + ":" + owner + ":" + batchId;
     { std::lock_guard lock(mutex_);
-      std::erase_if(batchApprovals_, [](const auto &entry) { const auto &batch = entry.second; bool complete = batch.selection.size() == batch.items.size() && batch.selection.find('-') == std::string::npos; for (size_t i = 0; i < batch.selection.size(); ++i) if (batch.selection[i] == '1' && batch.counts[i] < batch.items[i].count) complete = false; return complete && Now() - batch.touched > 24ull * 60 * 60 * 1000; });
+      std::erase_if(batchApprovals_, [&](const auto &entry) {
+          const auto &batch = entry.second;
+          if (Now() - batch.touched <= 24ull * 60 * 60 * 1000) return false;
+          const auto colon = entry.first.rfind(':');
+          const auto batchId = colon == std::string::npos ? entry.first : entry.first.substr(colon + 1);
+          return std::none_of(jobs_.begin(), jobs_.end(), [&](const auto &j) {
+              return j->batchId == batchId && (j->paused || j->view.state < State::Completed);
+          });
+      });
       if (batchApprovals_.contains(key)) { Reply(socket, 409, "Conflict", Utf8(L"批次标识已使用，请重新发送")); return; }
       // Reserve this identifier before exposing the prompt, preventing parallel replay.
       batchApprovals_[key].touched = Now();

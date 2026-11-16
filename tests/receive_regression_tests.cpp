@@ -141,7 +141,7 @@ int wmain(int argc, wchar_t **argv) {
                 Require(Request(config.port, "POST", "/web/api/cancel/" + std::to_string(delivery), localBrowserFields).starts_with("HTTP/1.1 200"),
                     "browser cancellation addresses the active delivery");
             } else {
-                Require(Request(config.port, "GET", "/web/files/" + std::to_string(delivery) + "?client=" + client).ends_with("\r\n\r\nlocal browser payload"),
+                Require(Request(config.port, "GET", "/web/files/" + std::to_string(delivery) + "?client=" + client, localBrowserFields).ends_with("\r\n\r\nlocal browser payload"),
                     "local browser receives exact contents");
             }
             const auto finalState = cancel ? State::Cancelled : State::Completed;
@@ -191,7 +191,7 @@ int wmain(int argc, wchar_t **argv) {
         uint64_t id = 0;
         Until([&] { for (const auto &item : engine.GetSnapshot().transfers)
             if (item.name == L"partial.bin" && !item.requestOnly && item.state == State::Waiting && !item.savedPath.empty()) { id = item.id; return true; } return false; });
-        const auto downloaded = Request(config.port, "GET", "/web/files/" + std::to_string(id) + "?client=" + client);
+        const auto downloaded = Request(config.port, "GET", "/web/files/" + std::to_string(id) + "?client=" + client, localBrowserFields);
         Require(downloaded.ends_with("\r\n\r\nabcdefghij"), "browser receives exact resumed contents");
         std::string response; do { response = resumed.Header(); } while (response.starts_with("HTTP/1.1 102"));
         Require(response.starts_with("HTTP/1.1 201"), "sender receives saved confirmation");

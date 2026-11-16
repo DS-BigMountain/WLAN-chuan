@@ -10,10 +10,11 @@ import java.util.concurrent.atomic.*;
 final class Diagnostics implements Closeable {
     final File directory;final Object io=new Object();final ArrayBlockingQueue<Object> queue=new ArrayBlockingQueue<>(16384);
     final AtomicLong dropped=new AtomicLong(),storageErrors=new AtomicLong();final String session=System.currentTimeMillis()+"-"+UUID.randomUUID();
-    volatile boolean closed;Thread writer;OutputStream output;long bytes;int segment;
+    volatile boolean closed;volatile long lastActivity=System.currentTimeMillis();Thread writer;OutputStream output;long bytes;int segment;
     Diagnostics(File directory){this.directory=directory;try{directory.mkdirs();open();writer=new Thread(this::run,"Chuan diagnostics");writer.setDaemon(true);writer.start();}catch(IOException error){dropped.incrementAndGet();storageErrors.incrementAndGet();}}
-    void open()throws IOException{output=new BufferedOutputStream(new FileOutputStream(new File(directory,"transfer-"+session+"-"+(segment++)+".jsonl")));bytes=0;}
-    void write(Map<String,Object> fields){try{fields.put("utc",Instant.now().toString());fields.put("mono_ms",System.nanoTime()/1000000.0);fields.put("platform","android");fields.put("diagnostic_session",session);if(writer==null||closed||!queue.offer(Json.stringify(fields)+"\n"))dropped.incrementAndGet();}catch(Exception error){dropped.incrementAndGet();}}
+    void open()throws IOException{File next=new File(directory,"transfer-"+session+"-"+(segment++)+".jsonl");output=new BufferedOutputStream(new FileOutputStream(next));bytes=0;pruneLogs(next);}
+    void pruneLogs(File active){try{File[] found=directory.listFiles(f->f.isFile()&&f.getName().startsWith("transfer-")&&f.getName().endsWith(".jsonl")&&!f.equals(active));if(found==null||found.length<15)return;Arrays.sort(found,Comparator.comparingLong(File::lastModified));long total=active.length();for(File f:found)total+=f.length();int remaining=found.length+1;for(File f:found){if(remaining<=16&&total<=256L*1024*1024)break;long len=f.length();if(f.delete()){total-=Math.min(total,len);remaining--;}}}catch(Exception ignored){}}
+    void write(Map<String,Object> fields){try{if(!"resources".equals(fields.get("event")))lastActivity=System.currentTimeMillis();fields.put("utc",Instant.now().toString());fields.put("mono_ms",System.nanoTime()/1000000.0);fields.put("platform","android");fields.put("diagnostic_session",session);if(writer==null||closed||!queue.offer(Json.stringify(fields)+"\n"))dropped.incrementAndGet();}catch(Exception error){dropped.incrementAndGet();}}
     void run(){try{while(!closed||!queue.isEmpty()){
         Object value=queue.poll(250,TimeUnit.MILLISECONDS);
         synchronized(io){try{
@@ -27,8 +28,9 @@ final class Diagnostics implements Closeable {
             files.sort(Comparator.comparingLong(File::lastModified).reversed().thenComparing(File::getName));long size=0;int selected=0;for(File file:files){if(size+file.length()>256L*1024*1024)break;size+=file.length();selected++;}
             try(Writer result=new BufferedWriter(new OutputStreamWriter(new FileOutputStream(target),StandardCharsets.UTF_8))){
                 result.write(Json.stringify(Json.map("event","export_manifest","diagnostic_schema",2,"platform","android","dropped_events",dropped.get(),"storage_errors",storageErrors.get(),"omitted_segments",files.size()-selected,"selected_segments",selected))+"\n");
-                String owner="\"client_id\":"+Json.stringify(client),recipient="\"recipient_id\":"+Json.stringify(client);
-                for(int i=selected-1;i>=0;i--)try(BufferedReader input=new BufferedReader(new InputStreamReader(new FileInputStream(files.get(i)),StandardCharsets.UTF_8))){String line;while((line=input.readLine())!=null)if(client.isEmpty()||line.contains("\"event\":\"session_start\"")||line.contains("\"event\":\"resources\"")||line.contains(owner)||line.contains(recipient)){result.write(line);result.write('\n');}}
+                String selfJson=Json.stringify(client),owner="\"client_id\":"+selfJson,recipient="\"recipient_id\":"+selfJson;
+                String[] clientFields=new String[]{"\"client_id\":","\"recipient_id\":"};
+                for(int i=selected-1;i>=0;i--)try(BufferedReader input=new BufferedReader(new InputStreamReader(new FileInputStream(files.get(i)),StandardCharsets.UTF_8))){String line;while((line=input.readLine())!=null)if(client.isEmpty()||line.contains("\"event\":\"session_start\"")||line.contains("\"event\":\"resources\"")||line.contains(owner)||line.contains(recipient)){String emitted=line;if(!client.isEmpty()){for(String field:clientFields){int pos=0;while((pos=emitted.indexOf(field,pos))>=0){int valStart=pos+field.length();while(valStart<emitted.length()&&(emitted.charAt(valStart)==' '||emitted.charAt(valStart)=='\t'))valStart++;if(valStart<emitted.length()&&emitted.charAt(valStart)=='"'){int valEnd=valStart+1;boolean esc=false;while(valEnd<emitted.length()){char c=emitted.charAt(valEnd++);if(esc){esc=false;continue;}if(c=='\\'){esc=true;continue;}if(c=='"')break;}String token=emitted.substring(valStart,valEnd);if(!token.equals("\"\"")&&!token.equals(selfJson)){emitted=emitted.substring(0,valStart)+"\"[redacted]\""+emitted.substring(valEnd);valEnd=valStart+12;}pos=valEnd;}else pos=valStart;}}}result.write(emitted);result.write('\n');}}
             }
         }
     }

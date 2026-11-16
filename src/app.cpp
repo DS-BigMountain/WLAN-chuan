@@ -200,13 +200,13 @@ struct App {
                 app->selectedTask = app->shownJobs[LOWORD(row)].id;
                 RECT bounds{}; GetClientRect(h, &bounds);
                 int x = GET_X_LPARAM(l);
-                if (app->shownJobs[LOWORD(row)].childRow) { app->ToggleTask();return result; }
+                auto &job = app->shownJobs[LOWORD(row)];
                 if (x >= bounds.right - app->Px(58)) {
-                    auto &job = app->shownJobs[LOWORD(row)];
                     if (job.state < State::Completed) app->CancelTask();
                     else app->DeleteTask();
                 } else if (x >= bounds.right - app->Px(154)) app->OpenOrRetryTask();
-                else app->ToggleTask();
+                else if (job.childRow || job.folderRow || job.directoryRow) app->ToggleTask();
+                return result;
             }
         }
         return result;
@@ -1487,6 +1487,7 @@ struct Modal {
         }
     }
     void Save() {
+        if (qr) { done = true; return; }
         if (approval) {
             std::string selected(approvalItems.size(), '0');
             for (size_t i = 0; i < selected.size(); ++i) if (ListView_GetCheckState(itemList, static_cast<int>(i))) selected[i] = '1';

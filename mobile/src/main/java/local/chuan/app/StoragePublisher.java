@@ -22,7 +22,19 @@ final class StoragePublisher {
     }
     Uri parent(Uri tree,String[] parts,boolean create)throws IOException {
         Uri current=DocumentsContract.buildDocumentUriUsingTree(tree,DocumentsContract.getTreeDocumentId(tree));
-        for(int i=0;i<parts.length-1;i++){Uri next=child(tree,current,parts[i]);if(next==null){if(!create)return null;next=DocumentsContract.createDocument(context.getContentResolver(),current,DocumentsContract.Document.MIME_TYPE_DIR,parts[i]);}if(next==null||!directory(next))throw new IOException("目标目录类型冲突");current=next;}
+        StringBuilder prefix=new StringBuilder(tree.toString());
+        for(int i=0;i<parts.length-1;i++){
+            prefix.append('/').append(parts[i]);
+            String key=prefix.toString();
+            Uri next=create?folders.get(key):null;
+            if(next==null){
+                next=child(tree,current,parts[i]);
+                if(next==null){if(!create)return null;next=DocumentsContract.createDocument(context.getContentResolver(),current,DocumentsContract.Document.MIME_TYPE_DIR,parts[i]);}
+                if(next==null||!directory(next))throw new IOException("目标目录类型冲突");
+                if(create){if(folders.size()>2048)folders.clear();folders.put(key,next);}
+            }
+            current=next;
+        }
         return current;
     }
     // Read-only checks use local state; hashing must not hold the publish lock.
@@ -50,11 +62,12 @@ final class StoragePublisher {
             if(!job.folderId.isEmpty()&&child(tree,parent,name)!=null)throw new IOException("目标文件在核对后已存在，原文件已保留");
             temporary=DocumentsContract.createDocument(context.getContentResolver(),parent,"application/octet-stream",".chuan-"+Protocol.random()+".part");if(temporary==null)throw new IOException("无法在接收目录创建文件");
             ParcelFileDescriptor descriptor=context.getContentResolver().openFileDescriptor(temporary,"w");if(descriptor==null)throw new IOException("无法写入接收目录");
+            try{android.system.StructStatVfs fs=android.system.Os.fstatvfs(descriptor.getFileDescriptor());if(fs.f_bavail*fs.f_frsize<job.total+2L*1024*1024){descriptor.close();throw new IOException("所选接收目录所在存储空间不足");}}catch(android.system.ErrnoException|UnsupportedOperationException ignored){}
             try(ParcelFileDescriptor.AutoCloseOutputStream output=new ParcelFileDescriptor.AutoCloseOutputStream(descriptor);InputStream input=new FileInputStream(job.file)){Protocol.copy(input,output,job.total,null,bytes->{if(job.cancelled)throw new IOException("传输已取消");});output.flush();try{output.getFD().sync();}catch(SyncFailedException ignored){}}
             if(job.cancelled)throw new IOException("传输已取消");
             if(!job.folderId.isEmpty()&&child(tree,parent,name)!=null)throw new IOException("目标文件在写入期间已变化，原文件已保留");
             Uri committed=DocumentsContract.renameDocument(context.getContentResolver(),temporary,name);if(committed==null)throw new IOException("目录提供方不支持提交文件");return committed.toString();
-        }catch(Exception error){if(temporary!=null)try{DocumentsContract.deleteDocument(context.getContentResolver(),temporary);}catch(Exception ignored){}throw new IOException("保存到所选目录失败："+error.getMessage(),error);}
+        }catch(Exception error){folders.clear();if(temporary!=null)try{DocumentsContract.deleteDocument(context.getContentResolver(),temporary);}catch(Exception ignored){}throw new IOException("保存到所选目录失败："+error.getMessage(),error);}
     }
     void delete(Engine.Job job)throws IOException {if(job.directory||job.skipped||job.publicUri.isEmpty()||job.publicUri.startsWith("content://local.chuan.files/"))return;try{if(!DocumentsContract.deleteDocument(context.getContentResolver(),Uri.parse(job.publicUri)))throw new IOException("目录提供方拒绝删除");}catch(Exception error){throw new IOException(error.getMessage(),error);}}
 }

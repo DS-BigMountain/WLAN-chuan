@@ -119,7 +119,7 @@ async function command(path,extra={},body=null,signal=undefined) {
   const started=performance.now();let status=0;
   try{
   const response=await fetch(path,{method:'POST',headers:{...serverSession.headers(),'X-Chuan-Token':token,'X-Chuan-Client':client,'X-Chuan-Tab':tab,...extra},body,signal});
-  status=response.status;const message=await response.text();if(!response.ok){const error=new Error(message||`请求失败 (${response.status})`);error.receiverCancelled=response.status===410;throw error;}
+  status=response.status;const message=await response.text();if(!response.ok){const error=new Error(message||`请求失败 (${response.status})`);error.status=response.status;error.receiverCancelled=response.status===410;throw error;}
   return message;
   }finally{trace.write('request',{path,status,elapsed_ms:performance.now()-started});}
 }
@@ -248,7 +248,7 @@ function renderJobs() {
     const progress=document.createElement('progress'),metrics=text('div','','job-progress'),percentLabel=text('small','','progress-metrics');
     progress.max=100;progress.setAttribute('aria-label','文件夹传输进度');metrics.append(progress,percentLabel);d.append(metrics);
     const currentLine=text('div','','current-operation');d.append(currentLine);
-    if(group.state<3){const toggle=button(group.paused?'继续':'暂停',async()=>{try{const active=group.items.filter(item=>item.state<3);for(const item of active.filter(item=>item.op))await pauseOperation(item.op,!group.paused);const server=active.find(item=>!item.op);if(server)await pause(server,!group.paused);await poll();renderJobs();}catch(e){notice(e.message);}});toggle.className='pause';a.append(toggle);a.append(button('取消',async()=>{try{for(const item of group.items)if(item.state<3)await stop(item);await poll();renderJobs();}catch(e){notice(e.message);}}));}
+    if(group.state<3){const toggle=button(group.paused?'继续':'暂停',async()=>{try{const active=group.items.filter(item=>item.state<3);const ops=active.filter(item=>item.op);await Promise.all(ops.map(item=>pauseOperation(item.op,!group.paused)));const server=active.find(item=>!item.op);if(server)await pause(server,!group.paused);await poll();renderJobs();}catch(e){notice(e.message);}});toggle.className='pause';a.append(toggle);a.append(button('取消',async()=>{try{const active=group.items.filter(item=>item.state<3);const ops=active.filter(item=>item.op);await Promise.all(ops.map(item=>stop(item)));const server=active.find(item=>!item.op);if(server)await stop(server);await poll();renderJobs();}catch(e){notice(e.message);}}));}
     else {if(!group.receiving&&group.state>=4){const retry=button('重试',()=>retrySending(group.items,true));retry.className='retry';a.append(retry);}a.append(button('删除',async()=>{
       if(!await ask('删除文件夹批次','删除此批次的记录及可删除的服务端副本。浏览器电脑上的原文件不受影响。\n\n'+group.name))return;
       try{for(const item of group.items)await remove(item);await poll();renderJobs();}catch(e){notice(e.message);}
@@ -535,9 +535,13 @@ async function processOperation(op,stage='all'){
             op.fileId=lastResult.id;trace.write('archive_stream_end',{path:op.path,wire_bytes:sent,forwarded:op.streamForwarded});
           }catch(error){if(String(error.message).includes('续传内容不一致'))op.resumeReset=true;if(stream)await command('/web/api/archive/abort/'+stream,{'X-Chuan-Abort-Failed':op.cancelled&&!op.paused?'0':'1','X-Chuan-Error':encode(String(error.message||'ZIP 流中断').slice(0,512)),'X-Chuan-Paused':op.paused?'1':'0'},null).catch(()=>{});throw error;}
           finally{op.packController=null;op.xhr=null;}
-        }else if(webParallelUpload&&!op.directory&&!op.digest&&size-resumeOffset>=32*1024*1024){
-          await parallelUpload(op,resumeFields,resumeOffset);
         }else{
+        let handled=false;
+        if(webParallelUpload&&!op.directory&&!op.digest&&size-resumeOffset>=32*1024*1024){
+          try{await parallelUpload(op,resumeFields,resumeOffset);handled=true;}
+          catch(error){if(!error.parallelOpenBusy)throw error;}
+        }
+        if(!handled){
         await new Promise((resolve,reject)=>{
           const xhr=new XMLHttpRequest();op.xhr=xhr;xhr.open('POST','/web/api/upload');
           xhr.setRequestHeader('X-Chuan-Hash-Ms',String(op.hashMs));
@@ -559,6 +563,7 @@ async function processOperation(op,stage='all'){
           xhr.onerror=async()=>{try{await op.file.slice(0,Math.min(1,size)).arrayBuffer();const error=new Error('网络连接中断，未收到接收端保存确认');error.transportError=true;reject(error);}catch{const error=new Error('无法读取源文件，文件可能已移动、被占用或已变更');error.sourceError=true;reject(error);}};xhr.ontimeout=()=>reject(new Error('请求超时'));xhr.onabort=()=>reject(new Error('已取消'));
           xhr.send(hash||op.digest?new Blob([op.file.slice(resumeOffset),op.digest||hash.digest()],{type:'application/octet-stream'}):op.file.slice(resumeOffset));
         });
+        }
         }
         if(op.cancelled||op.retryExpired)continue;
         await deliverUpload(op);
@@ -714,7 +719,9 @@ async function parallelUpload(op,resumeFields,start){
   if(op.batch)Object.assign(headers,{'X-Chuan-Copy':'1','X-Chuan-Folder':op.batch.id,'X-Chuan-Folder-Name':encode(op.batch.name),'X-Chuan-Folder-Count':String(op.batch.count),'X-Chuan-Folder-Size':op.batch.totalExact});
   const tasks=[];let control;
   try{
-    ({ticket}=JSON.parse(await command('/web/api/parallel/open',{'X-Chuan-Upload':op.key,'X-Chuan-Batch':op.plan.id,'X-Chuan-Size':String(op.file.size),'X-Chuan-Offset':String(start)},null,controller.signal)));
+    try{
+      ({ticket}=JSON.parse(await command('/web/api/parallel/open',{'X-Chuan-Upload':op.key,'X-Chuan-Batch':op.plan.id,'X-Chuan-Size':String(op.file.size),'X-Chuan-Offset':String(start)},null,controller.signal)));
+    }catch(openError){if(openError.status===503)openError.parallelOpenBusy=true;throw openError;}
     control=command('/web/api/upload',{...headers,'X-Chuan-Parallel-Upload':ticket},null,controller.signal);control.catch(()=>controller.abort());
     let next=start,done=start;const started=performance.now();
     const lane=async()=>{
@@ -783,6 +790,7 @@ async function parallelDownload(job){
     const wasAborted=controller.signal.aborted;
     controller.abort();await Promise.allSettled(pending.values());
     if(writable)await writable.abort().catch(()=>{});
+    parts.length=0;
     parallelDownloads.delete(id);
     if(!complete&&!wasAborted&&!serverSession.blocked)command('/web/api/file-failed/'+id).catch(()=>{});
   }
@@ -808,13 +816,13 @@ function incomingMarkerTag(record){
 }
 async function writeIncomingMarker(directory,name,record){const handle=await directory.getFileHandle(name,{create:true}),stream=await handle.createWritable();try{await stream.write(JSON.stringify({...record,tag:incomingMarkerTag(record)}));await stream.close();}catch(error){await stream.abort().catch(()=>{});throw error;}}
 async function failIncoming(job,error){
-  const context=incomingContexts.get(String(job.id));downloaded.delete(job.id);
-  if(context?.pauseRequested||incomingPaused.has(String(job.id))){finishIncoming(job);return;}
-  if(error.sourceMismatch&&context){await context.directory.removeEntry(context.filename).catch(()=>{});await context.directory.removeEntry(incomingMarker(context.filename,job.total)).catch(()=>{});folderSaveErrors.delete(job.batchId);incomingRetry.set(String(job.id),{job,at:Date.now()+500});notice('源文件内容已变化，正在重新接收该文件');}
-  else if(error.name==='QuotaExceededError'||error.name==='NotAllowedError'){incomingPaused.add(String(job.id));await command('/web/api/pause/'+job.id).catch(()=>{});notice('接收目录无法继续写入，已暂停并保留进度：'+error.message);}
-  else if(error.name==='AbortError'){acceptedBatches.delete(job.batchId);folderDestinations.delete(job.batchId);notice('目录保存已取消，已接收部分已保留');}
-  else if(/原文件已保留|同名文件|续传记录/.test(error.message)){downloaded.add(job.id);incomingRetry.delete(String(job.id));folderSaveErrors.set(job.batchId,error.message);await command('/web/api/file-failed/'+job.id).catch(()=>{});notice(error.message);}
-  else{folderSaveErrors.set(job.batchId,error.message);notice(error.message+'；已接收部分已保留');if(acceptedBatches.has(job.batchId))incomingRetry.set(String(job.id),{job,at:Date.now()+1500});}
+  const key=String(job.id),context=incomingContexts.get(key),attempts=(incomingRetry.get(key)?.attempts||0)+1;downloaded.delete(job.id);
+  if(context?.pauseRequested||incomingPaused.has(key)){finishIncoming(job);return;}
+  if(error.sourceMismatch&&context&&attempts<=3){await context.directory.removeEntry(context.filename).catch(()=>{});await context.directory.removeEntry(incomingMarker(context.filename,job.total)).catch(()=>{});folderSaveErrors.delete(job.batchId);incomingRetry.set(key,{job,at:Date.now()+500,attempts});notice('源文件内容已变化，正在重新接收该文件');}
+  else if(error.name==='QuotaExceededError'||error.name==='NotAllowedError'){incomingPaused.add(key);incomingRetry.delete(key);await command('/web/api/pause/'+job.id).catch(()=>{});notice('接收目录无法继续写入，已暂停并保留进度：'+error.message);}
+  else if(error.name==='AbortError'){incomingRetry.delete(key);acceptedBatches.delete(job.batchId);folderDestinations.delete(job.batchId);notice('目录保存已取消，已接收部分已保留');}
+  else if(/原文件已保留|同名文件|续传记录/.test(error.message)||attempts>15||!acceptedBatches.has(job.batchId)){downloaded.add(job.id);incomingRetry.delete(key);folderSaveErrors.set(job.batchId,error.message);await command('/web/api/file-failed/'+job.id).catch(()=>{});notice(error.message);}
+  else{folderSaveErrors.set(job.batchId,error.message);notice(error.message+'；已接收部分已保留');incomingRetry.set(key,{job,at:Date.now()+1500,attempts});}
   finishIncoming(job);
 }
 const receivePipeline=createFilePipeline(async job=>{
@@ -890,7 +898,7 @@ const receivePipeline=createFilePipeline(async job=>{
   }catch(error){await failIncoming(job,error);return false;}
 });
 async function receiveApproved(){
-  for(const [id,pending] of incomingRetry)if(online&&Date.now()>=pending.at&&!incomingPaused.has(id)){pending.at=Date.now()+2000;try{await command('/web/api/resume-job/'+id);folderSaveErrors.delete(pending.job.batchId);incomingRetry.delete(id);}catch{}}
+  for(const [id,pending] of incomingRetry)if(online&&Date.now()>=pending.at&&!incomingPaused.has(id)){pending.attempts=(pending.attempts||0)+1;if(pending.attempts>15){downloaded.add(pending.job.id);incomingRetry.delete(id);command('/web/api/file-failed/'+id).catch(()=>{});continue;}pending.at=Date.now()+2000;try{await command('/web/api/resume-job/'+id);folderSaveErrors.delete(pending.job.batchId);incomingRetry.delete(id);}catch{}}
   for(const job of latestJobs){
     if(job.paused||incomingPaused.has(String(job.id))||writingFiles.has(String(job.id))||!job.receiving||!job.folderId||job.state>=4||!acceptedBatches.has(job.batchId)||downloaded.has(job.id)||!inbox.some(file=>String(file.id)===String(job.id)))continue;
     downloaded.add(job.id);receivePipeline.push(job);
@@ -945,7 +953,7 @@ function updateTarget(){
 
 $('ping').onclick=async()=>{const target=chosen;$('ping').disabled=true;try{await command('/web/api/ping',{'X-Chuan-Peer':encode(target)});notice('Ping 已送达',3000);}catch(e){notice(e.message,5000);}finally{updateTarget();}};
 $('note').onclick=async()=>{const peer=peers.find(p=>p.id===chosen);if(!peer)return;const note=await ask('IP 临时备注','IP '+peer.ip+'\n备注仅在当前客户端可见。',peer.note||'');if(note===null)return;try{await command('/web/api/note',{'X-Chuan-Address':peer.ip,'X-Chuan-Note':encode(note.trim())});await poll();}catch(e){notice(e.message);}};
-$('clear').onclick=async()=>{try{await command('/web/api/clear');const busy=new Set(operations.filter(outgoingActive).map(op=>op.plan));for(const op of operations)if(!outgoingActive(op)&&!busy.has(op.plan))op.hidden=true;await poll();}catch(e){notice(e.message);}};
+$('clear').onclick=async()=>{try{await command('/web/api/clear');const busy=new Set(operations.filter(outgoingActive).map(op=>op.plan));operations=operations.filter(op=>{if(outgoingActive(op)||busy.has(op.plan))return true;op.hidden=true;op.file=null;op.digest=null;op.archive=null;return false;});await poll();}catch(e){notice(e.message);}};
 $('refresh').onclick=async()=>{try{await command('/web/api/refresh');await poll();}catch(error){notice(error.message);}};
 $('drop').onclick=event=>{if(event.target.closest('button'))return;if(!$('picker').disabled)$('picker').click();};
 $('drop').onkeydown=e=>{if(e.target!==$('drop'))return;if((e.key==='Enter'||e.key===' ')&&!$('picker').disabled){e.preventDefault();$('picker').click();}};

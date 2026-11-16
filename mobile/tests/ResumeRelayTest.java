@@ -42,7 +42,9 @@ public final class ResumeRelayTest {
         try(Engine engine=host(root)){
             engine.config.autoReceive=false;
             String client="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",batch="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",upload="cccccccccccccccccccccccccccccccc",key=String.join("",Collections.nCopies(64,"d"));
-            require(request(engine,"GET","/web/api/state","X-Chuan-Client: "+client+"\r\n","").startsWith("200 "),"register browser");
+            String clientState=request(engine,"GET","/web/api/state","X-Chuan-Client: "+client+"\r\n","");
+            require(clientState.startsWith("200 "),"register browser");
+            String clientToken=Json.string(Json.object(clientState.substring(4)),"token","");
             String recipient;synchronized(engine.lock){recipient=engine.sessions.get(client).id;}
             String sender="X-Chuan-Id: "+hex("regression-sender")+"\r\nX-Chuan-Sender: "+hex("review")+"\r\n",route="X-Chuan-Recipient: "+hex(recipient)+"\r\n";
             String fields=sender+route+"X-Chuan-Batch: "+batch+"\r\nX-Chuan-Offer-Async: 1\r\n";
@@ -65,7 +67,7 @@ public final class ResumeRelayTest {
                 connection.send("POST /api/upload"+host(engine)+fields+"X-Chuan-Offset: 3\r\nX-Chuan-Prefix: "+hex(sha().digest("abc".getBytes(StandardCharsets.US_ASCII)))+"\r\nExpect: 100-continue\r\nContent-Length: 39\r\n\r\n");
                 require(header(connection.input).status()==100,"accept resumed suffix");connection.send("defghij");connection.output.write(sha().digest("abcdefghij".getBytes(StandardCharsets.US_ASCII)));connection.output.flush();
                 long[] id={0};until(()->{synchronized(engine.lock){for(Engine.Job job:engine.jobs.values())if(!job.requestOnly&&job.name.equals("partial.bin")&&job.state==1&&job.source!=null){id[0]=job.id;return true;}return false;}});
-                require(request(engine,"GET","/web/files/"+id[0]+"?client="+client,"","").equals("200 abcdefghij"),"browser receives exact resumed contents");
+                require(request(engine,"GET","/web/files/"+id[0]+"?client="+client+"&ticket="+clientToken,"","").equals("200 abcdefghij"),"browser receives exact resumed contents");
                 Header response;do{response=header(connection.input);}while(response.status()==102);require(response.status()==201,"sender receives saved confirmation");
             }
             System.out.println("PASS Android relay: retained offset; route-bound consent; exact resumed contents and sender confirmation");
