@@ -66,5 +66,38 @@ int main(){try{
         Require(failed&&error!=0,"receiver reset fails pending sends");
         std::cout<<"PASS peer reset terminates pending sends with a socket error\n";
     }
+    {
+        SocketPair sockets;int error=0;size_t completed=0;
+        SocketSendQueue::TcpSample sample{};
+        sample.valid=true;sample.minRttUs=2000;sample.rttUs=4000;
+        sample.idealBacklogBytes=3*1024*1024;sample.cwndBytes=3*1024*1024;sample.bytesInFlight=256*1024;
+        const size_t size=2*SocketSendQueue::ChunkBytes;
+        SocketSendQueue queue(sockets.sender,size,[]{return true;},[&](size_t bytes){completed+=bytes;},error);
+        queue.EnableAdaptive([&]{return sample;});
+        Require(queue.TargetDepth()==4&&queue.ChunkSize()>=512*1024&&queue.TargetBacklogBytes()>=2*1024*1024,
+                "high-speed low-latency link expands backlog and chunk size for peak throughput");
+        sample.rttUs=90000;sample.idealBacklogBytes=512*1024;sample.cwndBytes=512*1024;sample.bytesInFlight=384*1024;
+        auto reader=std::async(std::launch::async,[&]{
+            std::array<char,65536> bytes{};size_t received=0;
+            while(received<size){const int count=recv(sockets.receiver,bytes.data(),static_cast<int>(std::min(bytes.size(),size-received)),0);if(count<=0)return false;received+=count;}
+            return true;
+        });
+        size_t sent=0;
+        while(sent<size){
+            const size_t step=std::min(queue.ChunkSize(),size-sent);
+            Fill(queue,sent,step);sent+=step;
+        }
+        queue.Finish();
+        Require(completed==size&&reader.get(),"adaptive send completes exact payload");
+        Require(queue.QueueDelayUs()>=80000&&queue.TargetDepth()<=2&&queue.ChunkSize()<=256*1024&&queue.TargetBacklogBytes()<=512*1024,
+                "bufferbloat RTT inflation shrinks in-flight backlog and chunk size");
+        SocketPair secondSockets;int secondError=0;
+        sample.rttUs=4000;sample.idealBacklogBytes=4*1024*1024;sample.cwndBytes=4*1024*1024;sample.bytesInFlight=64*1024;
+        SocketSendQueue secondQueue(secondSockets.sender,size,[]{return true;},[](size_t){},secondError);
+        secondQueue.EnableAdaptive([&]{return sample;});
+        Require(secondQueue.TargetBacklogBytes()<=SocketSendQueue::MaxTotalBacklogBytes/2,
+                "concurrent active queues share total in-flight backlog budget");
+        std::cout<<"PASS adaptive BDP/RTT guard preserves high-throughput window and shrinks bufferbloat backlog\n";
+    }
     WSACleanup();return 0;
 }catch(const std::exception &error){std::cerr<<error.what()<<'\n';return 1;}}

@@ -34,7 +34,7 @@ void Engine::ServeSegment(SOCKET s,const WebFile &source,uint64_t offset,uint64_
         sends.SetObserver([&](size_t pending,uint64_t bytes,uint64_t oldest){trace.Gauge("send_pending_operations",pending);trace.Gauge("send_pending_bytes",bytes);trace.Gauge("send_oldest_operation_ms",oldest);});
         while(loaded<length){
             auto &buffer=sends.Buffer();DWORD count=0;
-            {auto time=trace.Stage("disk_io",trace.diskMs);if(!ReadFile(file.value,buffer.data(),static_cast<DWORD>(std::min<uint64_t>(buffer.size(),length-loaded)),&count,nullptr)||!count)throw std::runtime_error("read");}
+            {auto time=trace.Stage("disk_io",trace.diskMs);if(!ReadFile(file.value,buffer.data(),static_cast<DWORD>(std::min<uint64_t>(sends.ChunkSize(),length-loaded)),&count,nullptr)||!count)throw std::runtime_error("read");}
             {auto time=trace.Stage("checksum",trace.hashMs);hash.Add(buffer.data(),count);}
             {auto time=trace.Stage("network_or_queue_wait",trace.networkMs);sends.Submit(count);}loaded+=count;
         }

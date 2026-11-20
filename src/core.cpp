@@ -2147,7 +2147,7 @@ void Engine::WebDownload(SOCKET s, const std::string &ip, uint64_t id, const std
             Hash hash;if(offset&&!prefix.empty()){struct PrefixDone{};uint64_t checked=0;try{archive::Emit(*job->archivePlan,[&](const void *data,size_t count){const auto take=static_cast<size_t>(std::min<uint64_t>(count,offset-checked));hash.Add(data,take);checked+=take;if(checked==offset)throw PrefixDone{};},[](uint64_t,const std::wstring &){},[&]{return job->paused||job->cancel||!running_;});}catch(const PrefixDone&){}if(hash.Snapshot()!=prefix){SetState(job,State::Failed,L"续传内容不一致");Reply(s,409,"Conflict","续传内容不一致");return;}}
             if(!SendAll(s,std::string(responseStatus)+contentRange+"Accept-Ranges: bytes\r\nConnection: close\r\nContent-Type: application/zip\r\nCache-Control: no-store\r\nContent-Disposition: attachment; filename=\"download.zip\"; filename*=UTF-8''"+PercentEncode(Utf8(job->view.name))+"\r\nContent-Length: "+std::to_string(entry.size-offset+(checksum?32:0))+"\r\n\r\n"))throw std::runtime_error("send");
             uint64_t done=offset,generated=0;job->progressBase=offset;
-            archive::Emit(*job->archivePlan,[&](const void *data,size_t count){const auto skip=static_cast<size_t>(std::min<uint64_t>(count,offset>generated?offset-generated:0));generated+=count;if(checksum&&prefix.empty()&&skip)hash.Add(data,skip);data=static_cast<const char*>(data)+skip;count-=skip;if(!count)return;if(checksum)hash.Add(data,count);if(!SendAll(s,data,count))throw std::runtime_error("send:"+std::to_string(WSAGetLastError()));done+=count;Progress(job,done);},[](uint64_t,const std::wstring &){},[&]{return job->paused||job->cancel||!running_;});
+            archive::Emit(*job->archivePlan,[&](const void *data,size_t count){const auto skip=static_cast<size_t>(std::min<uint64_t>(count,offset>generated?offset-generated:0));generated+=count;if(checksum&&prefix.empty()&&skip)hash.Add(data,skip);data=static_cast<const char*>(data)+skip;count-=skip;if(!count)return;if(checksum)hash.Add(data,count);if(!SendAll(s,data,count))throw std::runtime_error("send:"+std::to_string(WSAGetLastError()));SocketSendQueue::PaceBlockingSocket(s,[&]{return running_&&!job->paused&&!job->cancel;});done+=count;Progress(job,done);},[](uint64_t,const std::wstring &){},[&]{return job->paused||job->cancel||!running_;});
             if(checksum){const auto digest=hash.Finish();if(!SendAll(s,digest.data(),digest.size()))throw std::runtime_error("send");}SetState(job,State::Completed);
         }catch(const std::exception &error){SetState(job,job->cancel?State::Cancelled:State::Failed,Wide(error.what()));}return;
     }
@@ -2218,7 +2218,7 @@ void Engine::WebDownload(SOCKET s, const std::string &ip, uint64_t id, const std
             { auto time=trace.Stage("send_queue_wait",trace.networkMs); buffer=&sends.Buffer(); }
             DWORD read = 0;
             { auto time=trace.Stage("disk_io",trace.diskMs);
-              ok=ReadFile(file.value,buffer->data(),static_cast<DWORD>(std::min<uint64_t>(buffer->size(),endLimit-loaded)),&read,nullptr)&&read;
+              ok=ReadFile(file.value,buffer->data(),static_cast<DWORD>(std::min<uint64_t>(sends.ChunkSize(),endLimit-loaded)),&read,nullptr)&&read;
               if(!ok){trace.fileError=GetLastError();trace.failureStage="read";} }
             if(!ok)break;
             if(hash){auto time=trace.Stage("checksum",trace.hashMs);hash->Add(buffer->data(),read);}
@@ -2977,7 +2977,7 @@ void Engine::SendOne(const Peer &peer, const fs::path &path, const std::wstring 
                 if(j->cancel||j->paused||j->retryExpired||!running_)throw std::runtime_error("cancel");
                 const auto skip=static_cast<size_t>(std::min<uint64_t>(count,resumeOffset>generated?resumeOffset-generated:0));generated+=count;data=static_cast<const char*>(data)+skip;count-=skip;if(!count)return;
                 if(hash){auto time=trace->Stage("checksum",trace->hashMs);hash->Add(data,count);}
-                {auto time=trace->Stage("network_or_queue_wait",trace->networkMs);if(!SendAll(s,data,count))throw std::runtime_error("send");}
+                {auto time=trace->Stage("network_or_queue_wait",trace->networkMs);if(!SendAll(s,data,count))throw std::runtime_error("send");SocketSendQueue::PaceBlockingSocket(s,[&]{return running_&&!j->cancel&&!j->paused&&!j->retryExpired;});}
                 done+=count;Progress(j,done);trace->done=done;trace->Sample();
             },[](uint64_t,const std::wstring &){},[&]{return j->cancel||j->retryExpired||!running_;});
         }else if(!parallelToken.empty()){
@@ -2999,7 +2999,7 @@ void Engine::SendOne(const Peer &peer, const fs::path &path, const std::wstring 
             DWORD count = 0;
             {auto time=trace->Stage("disk_io",trace->diskMs);
             if (!ReadFile(file.value, buffer->data(),
-                          static_cast<DWORD>(std::min<uint64_t>(buffer->size(), total - loaded)), &count,
+                          static_cast<DWORD>(std::min<uint64_t>(sends.ChunkSize(), total - loaded)), &count,
                           nullptr) ||
                 !count)
                 {trace->fileError=GetLastError();throw std::runtime_error("file");}}

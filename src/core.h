@@ -23,7 +23,7 @@ namespace chuan {
 class SegmentConnections;
 namespace diagnostic { class Log; }
 namespace archive { struct Artifact; struct Plan; }
-inline constexpr wchar_t Version[] = L"2.4.0";
+inline constexpr wchar_t Version[] = L"2.4.1";
 inline constexpr unsigned short DefaultPort = 45871;
 inline constexpr unsigned short DefaultDiscoveryPort = 45872;
 namespace fs = std::filesystem;
