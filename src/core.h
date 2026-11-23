@@ -23,7 +23,7 @@ namespace chuan {
 class SegmentConnections;
 namespace diagnostic { class Log; }
 namespace archive { struct Artifact; struct Plan; }
-inline constexpr wchar_t Version[] = L"2.4.1";
+inline constexpr wchar_t Version[] = L"2.5.0";
 inline constexpr unsigned short DefaultPort = 45871;
 inline constexpr unsigned short DefaultDiscoveryPort = 45872;
 namespace fs = std::filesystem;
@@ -181,6 +181,23 @@ class Engine {
         std::atomic<bool> retryExpired{false};
         std::wstring targetId;
         std::wstring senderName;
+        bool direct = false;
+        bool directParallel = false;
+        std::string directOrigin, directSenderIp, directSenderInstance, directToken;
+        unsigned short directSenderPort = 0;
+        std::wstring directSenderId;
+        uint64_t directRemoteId = 0;
+        bool directOutgoing = false;
+        std::string directGatewayIp, directAllowedOrigin;
+        unsigned short directGatewayPort = 0;
+        std::wstring directGatewayId;
+        uint64_t directProxyId = 0;
+        uint64_t lastDirectPushMs = 0;
+        uint64_t directOfflineAt = 0;
+        std::atomic<bool> directPushInFlight{false};
+        std::atomic<bool> directPushDirty{false};
+        std::string directUploadBase, directUploadToken, directUploadInstance;
+        std::wstring directUploadServer;
         std::atomic<unsigned> segmentActive{0};
         std::atomic<uint64_t> segmentDone{0};
         std::atomic<bool> parallelDisabled{false};
@@ -195,6 +212,7 @@ class Engine {
         BY_HANDLE_FILE_INFORMATION identity{};
         bool hasIdentity = false;
         std::wstring relative;
+        std::string directToken, allowedOrigin;
     };
     struct Worker {
         std::thread thread;
@@ -215,6 +233,7 @@ class Engine {
     std::vector<Peer> peers_;
     std::vector<std::shared_ptr<Job>> jobs_;
     std::map<uint64_t, WebFile> webFiles_;
+    std::map<uint64_t, WebFile> directFiles_;
     std::map<std::string, std::pair<WebFile,std::string>> nativeSegments_;
     std::map<std::string,std::shared_ptr<ParallelUpload>> parallelUploads_;
     struct FolderApproval {
@@ -233,6 +252,7 @@ class Engine {
         bool announced = false;
         std::set<size_t> cancelledItems;
         std::set<size_t> announcedItems;
+        std::string directUploadToken, directOrigin, gwIp, owner;
     };
     std::map<std::string, BatchApproval> batchApprovals_;
     struct WebArchiveStream {
@@ -262,12 +282,14 @@ class Engine {
                    std::string &selection, std::wstring &error, const std::shared_ptr<Job> &control = {},
                    SOCKET waitingSocket = INVALID_SOCKET,
                    const std::function<void(const std::string &)> &progress = {},
-                   const std::function<std::string()> &cancelled = {});
+                   const std::function<std::string()> &cancelled = {},
+                   const std::string &browserOrigin = {},
+                   const std::function<void(const std::string &, const std::string &)> &directUploadInfo = {});
     std::string webToken_;
     struct BrowserSession {
-        std::wstring id, name;
+        std::wstring id, name, deviceModel;
         bool directoryReceive=false;
-        std::string platform;
+        std::string platform, userAgent, origin, hostIp;
         std::string token, ip;
         std::map<std::string, uint64_t> tabs;
         std::set<std::string> openTabs;
@@ -276,20 +298,32 @@ class Engine {
         std::map<std::string, std::wstring> notes;
     };
     std::map<std::string, BrowserSession> browsers_;
-    std::map<std::string, uint64_t> aliases_;
-    uint64_t nextAlias_ = 1, ping_ = 0;
+    std::map<std::string, std::pair<std::wstring, bool>> hostNames_;
+    uint64_t ping_ = 0;
     Snapshot::WebInvite webInvite_;
     uint64_t lastWebInviteAt_ = 0, lastWebInviteSentAt_ = 0;
     std::map<std::string, std::wstring> notes_;
     std::set<std::wstring> probing_;
     std::map<std::string, uint64_t> pingTimes_;
-    std::wstring AutoNameLocked(const std::string &key);
+    std::wstring HostNameLocked() const;
+    std::wstring BrowserNameLocked(const BrowserSession &session);
+    bool IsSelfIpLocked(const std::string &ip) const;
+    void ResolveHostNameAsync(const std::string &ip);
     void ExpireLocked();
     void CleanRelay();
+    void RemoveRelayFile(const std::shared_ptr<Job> &job);
     void SyncMesh(const Peer &peer);
     std::string Mesh(const std::string &ledger);
     bool RequestPeer(const Peer &peer, const std::string &path, const std::string &extra, std::string &body);
     bool PingNow(const Peer &peer, std::wstring &error);
+    bool HandleDirect(SOCKET socket, const std::string &ip, const std::string &method, const std::string &path,
+                      const std::map<std::string, std::string> &headers);
+    void HandleDirectReady(SOCKET socket, const std::map<std::string, std::string> &headers, const std::string &ip);
+    void HandleDirectStatus(SOCKET socket, const std::map<std::string, std::string> &headers, const std::string &ip);
+    void HandleDirectControl(SOCKET socket, const std::map<std::string, std::string> &headers, const std::string &ip);
+    void PushDirectStatus(const std::shared_ptr<Job> &job);
+    void SendDirectControl(const std::shared_ptr<Job> &job, const std::string &action);
+    int QueueDirectBrowser(const Peer &peer, const fs::path &path, const std::wstring &relative, const std::shared_ptr<Job> &job);
     std::vector<Worker> workers_;
     std::counting_semaphore<FileProbeLimit> preparationSlots_{FileProbeLimit};
     std::counting_semaphore<FileVerificationLimit> verificationSlots_{FileVerificationLimit};
@@ -313,8 +347,8 @@ class Engine {
     void HandleClient(SOCKET socket, const std::string &ip);
     bool HandleWeb(SOCKET socket, const std::string &ip, const std::string &method, const std::string &path,
                    const std::map<std::string, std::string> &headers);
-    void WebDownload(SOCKET socket, const std::string &ip, uint64_t id, const std::string &client = {},bool checksum=false,uint64_t offset=0,const std::string &prefix={},bool range=false,uint64_t sliceEnd=UINT64_MAX);
-    void ServeSegment(SOCKET socket,const WebFile &file,uint64_t offset,uint64_t length,bool web);
+    void WebDownload(SOCKET socket, const std::string &ip, uint64_t id, const std::string &client = {},bool checksum=false,uint64_t offset=0,const std::string &prefix={},bool range=false,uint64_t sliceEnd=UINT64_MAX,bool direct=false);
+    void ServeSegment(SOCKET socket,const WebFile &file,uint64_t offset,uint64_t length,bool web,bool direct=false);
     std::vector<char> FetchSegment(const std::string &ip,unsigned short port,const std::string &token,uint64_t offset,uint64_t length,const std::shared_ptr<Job> &job,const std::shared_ptr<SegmentConnections> &connections);
     void WebParallelUpload(SOCKET socket,const std::string &path,const std::map<std::string,std::string> &headers);
     void QueueBrowser(const Peer &peer, const fs::path &path, const std::shared_ptr<Job> &job,

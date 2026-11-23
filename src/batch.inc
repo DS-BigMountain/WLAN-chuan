@@ -5,10 +5,10 @@ void Engine::ReceivePhase(SOCKET socket,const std::map<std::string,std::string> 
     std::string phase(static_cast<size_t>(length),'\0');if(!ReadExact(socket,phase.data(),phase.size()))return;
     const std::map<std::string,std::wstring> labels={{"pack",L"发送端正在打包文件"},{"hash",L"等待发送端核对同名文件"}};
     const auto label=labels.find(phase);if(label==labels.end()){Reply(socket,400,"Bad Request");return;}
-    std::lock_guard lock(mutex_);const auto owner=Get(h,browser?"x-chuan-client":"x-chuan-id");
-    const auto batch=batchApprovals_.find(std::string(browser?"web:":"native:")+ip+":"+owner+":"+Get(h,"x-chuan-batch"));
+    std::lock_guard lock(mutex_);const auto owner=directUploadMode?directBatchOwner:Get(h,browser?"x-chuan-client":"x-chuan-id");
+    const auto batch=batchApprovals_.find(directUploadMode?directBatchKey:std::string(browser?"web:":"native:")+ip+":"+owner+":"+Get(h,"x-chuan-batch"));
     if(batch==batchApprovals_.end()){Reply(socket,404,"Not Found");return;}
-    for(const auto &job:jobs_)if(job->announced&&job->webUpload==upload&&job->batchId==Get(h,"x-chuan-batch")&&(browser?job->webClient:job->nativeOwner)==owner){
+    for(const auto &job:jobs_)if(job->announced&&job->webUpload==upload&&job->batchId==Get(h,"x-chuan-batch")&&((browser&&!directUploadMode)?job->webClient:job->nativeOwner)==owner){
         if(job->cancel||batch->second.cancelledItems.contains(job->batchItem)){Reply(socket,410,"Gone");return;}
         job->view.activity=label->second;batch->second.touched=Now();Reply(socket,200,"OK");return;
     }
@@ -16,10 +16,10 @@ void Engine::ReceivePhase(SOCKET socket,const std::map<std::string,std::string> 
 }
 void Engine::RetryUpload(SOCKET socket,const std::map<std::string,std::string> &h,const std::string &ip,const std::string &upload,bool browser){
     std::lock_guard lock(mutex_);
-    const auto owner=Get(h,browser?"x-chuan-client":"x-chuan-id"),batchId=Get(h,"x-chuan-batch");
-    auto batch=batchApprovals_.find(std::string(browser?"web:":"native:")+ip+":"+owner+":"+batchId);
+    const auto owner=directUploadMode?directBatchOwner:Get(h,browser?"x-chuan-client":"x-chuan-id"),batchId=Get(h,"x-chuan-batch");
+    auto batch=batchApprovals_.find(directUploadMode?directBatchKey:std::string(browser?"web:":"native:")+ip+":"+owner+":"+batchId);
     if(batch==batchApprovals_.end()){Reply(socket,404,"Not Found");return;}
-    for(auto &job:jobs_)if(job->batchId==batchId&&job->webUpload==upload&&(browser?job->webClient:job->nativeOwner)==owner&&job->view.receiving){
+    for(auto &job:jobs_)if(job->batchId==batchId&&job->webUpload==upload&&((browser&&!directUploadMode)?job->webClient:job->nativeOwner)==owner&&job->view.receiving){
         auto &approval=batch->second;const auto index=job->batchItem;
         if(job->cancel||approval.cancelledItems.contains(index)||job->view.state==State::Rejected){Reply(socket,410,"Gone");return;}
         if(job->paused){approval.touched=Now();Reply(socket,200,"OK","7");return;}
@@ -37,7 +37,7 @@ void Engine::RetryUpload(SOCKET socket,const std::map<std::string,std::string> &
     Reply(socket,200,"OK","0");
 }
 void Engine::ReceiveBatchFiles(SOCKET socket, const std::map<std::string, std::string> &headers, const std::string &ip, bool status, bool browserRequest) {
-    const auto owner = Get(headers, browserRequest?"x-chuan-client":"x-chuan-id"), batchId = Get(headers, "x-chuan-batch");
+    const auto owner = directUploadMode ? directBatchOwner : Get(headers, browserRequest?"x-chuan-client":"x-chuan-id"), batchId = Get(headers, "x-chuan-batch");
     uint64_t length = 0;
     if (!WebKey(batchId) || !Number(Get(headers, "content-length"), length) || !length || length > 16 * 1024 * 1024 || !Get(headers, "transfer-encoding").empty()) {
         Reply(socket, 400, "Bad Request"); return;
@@ -67,13 +67,13 @@ void Engine::ReceiveBatchFiles(SOCKET socket, const std::map<std::string, std::s
     }
     if (entries.empty()) { Reply(socket, 400, "Bad Request"); return; }
     std::lock_guard lock(mutex_);
-    const auto found = batchApprovals_.find(std::string(browserRequest?"web:":"native:") + ip + ":" + owner + ":" + batchId);
+    const auto found = batchApprovals_.find(directUploadMode ? directBatchKey : std::string(browserRequest?"web:":"native:") + ip + ":" + owner + ":" + batchId);
     if (found == batchApprovals_.end() || found->second.selection.size() != found->second.items.size() ||
         (!found->second.target.empty() && Wide(Unhex(found->second.target)) != config_.id)) { Reply(socket, 409, "Conflict"); return; }
     auto &batch = found->second;
     if (status) {
         std::map<std::string,std::shared_ptr<Job>> owned;
-        for (const auto &job:jobs_) if(job->batchId==batchId&&(browserRequest?job->webClient:job->nativeOwner)==owner)owned[job->webUpload]=job;
+        for (const auto &job:jobs_) if(job->batchId==batchId&&((browserRequest&&!directUploadMode)?job->webClient:job->nativeOwner)==owner)owned[job->webUpload]=job;
         for (const auto &entry:entries) if(!owned.contains(entry.upload)){Reply(socket,404,"Not Found");return;}
         for (const auto &entry : entries) {
             const auto &job=owned.at(entry.upload);if(job->view.state==State::Completed||job->cancel)continue;
@@ -96,15 +96,16 @@ void Engine::ReceiveBatchFiles(SOCKET socket, const std::map<std::string, std::s
         ++counts[entry.item]; sizes[entry.item] += entry.size;
     }
     for (size_t i = 0; i < batch.items.size(); ++i) if (counts[i] && (counts[i] != batch.items[i].count || sizes[i] != batch.items[i].total)) { Reply(socket, 400, "Bad Request"); return; }
+    const bool localBrowserReq = browserRequest && !directUploadMode;
     const auto browser = browsers_.find(owner);
-    if (browserRequest && browser == browsers_.end()) { Reply(socket, 403, "Forbidden"); return; }
-    const auto sender = browserRequest?(browser->second.name.empty() ? AutoNameLocked(Utf8(browser->second.id)) : browser->second.name):Wide(Unhex(Get(headers,"x-chuan-sender")));
+    if (localBrowserReq && browser == browsers_.end()) { Reply(socket, 403, "Forbidden"); return; }
+    const auto sender = localBrowserReq ? BrowserNameLocked(browser->second) : Wide(Unhex(Get(headers,"x-chuan-sender")));
     if(sender.empty()||sender.size()>64){Reply(socket,400,"Bad Request");return;}
     for (const auto &entry : entries) {
         const auto &item = batch.items[entry.item]; auto job = std::make_shared<Job>();
         job->view.id = nextJob_++; job->view.name = entry.name; job->view.peer = sender + L" (" + Wide(ip) + L")";
         job->view.total = entry.size; job->view.receiving = true; job->view.state = State::Queued; job->view.started = Now();
-        if(browserRequest){job->webClient=owner;job->webTab=Get(headers,"x-chuan-tab");}else job->nativeOwner=owner;
+        if(localBrowserReq){job->webClient=owner;job->webTab=Get(headers,"x-chuan-tab");}else job->nativeOwner=owner;
         job->webUpload = entry.upload; job->batchId = batchId; job->batchItem = static_cast<size_t>(entry.item);
         job->view.directory=entry.directory;
         job->senderName = sender; job->targetId = config_.id; job->announced = true;
@@ -116,8 +117,8 @@ void Engine::ReceiveBatchFiles(SOCKET socket, const std::map<std::string, std::s
 }
 int Engine::BatchCommand(const Peer &peer,const std::string &path,const std::string &batch,const std::string &body,std::string &response,const std::shared_ptr<Job> &job){
     SOCKET socket=Connect(peer.gateway.empty()?peer.ip:peer.gateway,peer.port);if(socket==INVALID_SOCKET)return 0;
-    TrackSocket(socket,job);SetTimeout(socket,5000,5000);Config cfg;{std::lock_guard lock(mutex_);cfg=config_;}
-    const auto request="POST "+path+" HTTP/1.1\r\nHost: "+peer.ip+":"+std::to_string(peer.port)+"\r\nX-Chuan-Id: "+Hex(Utf8(cfg.id))+"\r\nX-Chuan-Server: "+Utf8(peer.owner.empty()?peer.id:peer.owner)+"\r\nX-Chuan-Platform: windows\r\nX-Chuan-Port: "+std::to_string(boundPort_)+"\r\nX-Chuan-Sender: "+Hex(Utf8(cfg.name))+"\r\nX-Chuan-Batch: "+batch+"\r\nConnection: close\r\nContent-Length: "+std::to_string(body.size())+"\r\n\r\n";
+    TrackSocket(socket,job);SetTimeout(socket,5000,5000);Config cfg;std::wstring hostName;{std::lock_guard lock(mutex_);cfg=config_;hostName=HostNameLocked();}
+    const auto request="POST "+path+" HTTP/1.1\r\nHost: "+peer.ip+":"+std::to_string(peer.port)+"\r\nX-Chuan-Id: "+Hex(Utf8(cfg.id))+"\r\nX-Chuan-Server: "+Utf8(peer.owner.empty()?peer.id:peer.owner)+"\r\nX-Chuan-Platform: windows\r\nX-Chuan-Port: "+std::to_string(boundPort_)+"\r\nX-Chuan-Sender: "+Hex(Utf8(hostName))+"\r\nX-Chuan-Batch: "+batch+"\r\nConnection: close\r\nContent-Length: "+std::to_string(body.size())+"\r\n\r\n";
     std::string first;std::map<std::string,std::string> headers;uint64_t length=0;int status=0;
     if(SendAll(socket,request)&&SendAll(socket,body)&&ReadHeader(socket,first,headers)&&first.size()>=12){status=std::atoi(first.substr(9,3).c_str());if(Number(Get(headers,"content-length"),length)&&length<=131072){response.assign(static_cast<size_t>(length),'\0');if(length&&!ReadExact(socket,response.data(),response.size()))status=0;}}
     ReleaseSocket(socket);return status;
@@ -184,7 +185,8 @@ void Engine::DecideItems(uint64_t id, const std::string &selection) {
 bool Engine::SendOffer(const Peer &peer, const std::string &batch, const std::vector<OfferItem> &items,
                        std::string &selection, std::wstring &error, const std::shared_ptr<Job> &control,
                        SOCKET waitingSocket, const std::function<void(const std::string &)> &progress,
-                       const std::function<std::string()> &cancelled) {
+                       const std::function<std::string()> &cancelled, const std::string &browserOrigin,
+                       const std::function<void(const std::string &, const std::string &)> &directUploadInfo) {
     std::string manifest;
     for (auto &item : items) manifest += Hex(Utf8(item.name)) + "\t" + (item.folder ? "D" : "F") + "\t" +
         std::to_string(item.count) + "\t" + std::to_string(item.total) + "\n";
@@ -192,13 +194,14 @@ bool Engine::SendOffer(const Peer &peer, const std::string &batch, const std::ve
     SOCKET socket = Connect(local ? "127.0.0.1" : peer.gateway.empty() ? peer.ip : peer.gateway, local ? boundPort_ : peer.port);
     if (socket == INVALID_SOCKET) { error = L"无法连接目标设备"; return false; }
     TrackSocket(socket, control); SetTimeout(socket, 150000, 30000);
-    Config cfg; { std::lock_guard lock(mutex_); cfg = config_; }
+    Config cfg; std::wstring hostName; { std::lock_guard lock(mutex_); cfg = config_; hostName = HostNameLocked(); }
     const auto request = "POST /api/offer HTTP/1.1\r\nHost: " + (local ? "127.0.0.1" : peer.ip) + ":" + std::to_string(local ? boundPort_ : peer.port) +
         "\r\nX-Chuan-Id: " + Hex(Utf8(cfg.id)) + "\r\nX-Chuan-Platform: windows\r\nX-Chuan-Port: " + std::to_string(boundPort_) +
         "\r\nX-Chuan-Server: " + Utf8(local ? cfg.id : peer.owner.empty() ? peer.id : peer.owner) +
-        "\r\nX-Chuan-Sender: " + Hex(Utf8(cfg.name.empty() ? L"发送方" : cfg.name)) + "\r\nX-Chuan-Batch: " + batch +
+        "\r\nX-Chuan-Sender: " + Hex(Utf8(hostName)) + "\r\nX-Chuan-Batch: " + batch +
         "\r\nX-Chuan-Display-Sender: " + Hex(Utf8(control ? control->senderName : L"")) +
         "\r\nX-Chuan-Recipient: " + (peer.browser ? Hex(Utf8(peer.id)) : "") +
+        (browserOrigin.empty() ? "" : "\r\nX-Chuan-Browser-Origin: " + browserOrigin) +
         "\r\nX-Chuan-Offer-Wait: 1\r\nX-Chuan-Offer-Async: 1" +
         "\r\nConnection: close\r\nContent-Length: " + std::to_string(manifest.size()) + "\r\n\r\n";
     std::string first; std::map<std::string, std::string> headers; uint64_t length = 0;
@@ -212,6 +215,21 @@ bool Engine::SendOffer(const Peer &peer, const std::string &batch, const std::ve
         headers.clear(); ok = ReadHeader(socket, first, headers);
     }
     if (ok && first.starts_with("HTTP/1.1 202 ")) {
+        std::string acceptedBody;
+        if (Number(Get(headers, "content-length"), length) && length && length <= 65536) {
+            acceptedBody.resize(static_cast<size_t>(length));
+            if (!ReadExact(socket, acceptedBody.data(), acceptedBody.size())) acceptedBody.clear();
+        }
+        if (directUploadInfo && !acceptedBody.empty()) {
+            auto field = [&](const std::string &name) {
+                const auto pos = acceptedBody.find("\"" + name + "\":\"");
+                if (pos == std::string::npos) return std::string{};
+                const auto start = pos + name.size() + 4, end = acceptedBody.find('"', start);
+                return end == std::string::npos ? std::string{} : acceptedBody.substr(start, end - start);
+            };
+            const auto dToken = field("directUploadToken"), dInstance = field("directInstance");
+            if (WebKey(dToken) && !dInstance.empty()) directUploadInfo(dToken, dInstance);
+        }
         ReleaseSocket(socket);
         Peer route = peer; if (local) { route.ip = "127.0.0.1"; route.gateway.clear(); route.port = boundPort_; route.owner = cfg.id; }
         selection.assign(items.size(), '-'); std::string last, sentCancel;
@@ -330,6 +348,31 @@ void Engine::ReceiveOffer(SOCKET socket, const std::map<std::string, std::string
       // Reserve this identifier before exposing the prompt, preventing parallel replay.
       batchApprovals_[key].touched = Now();
     }
+    std::string directUploadToken;
+    const auto browserOriginHeader = Get(headers, "x-chuan-browser-origin");
+    auto validLocalOrigin = [&](const std::string &origin) {
+        if (!origin.starts_with("http://")) return false;
+        const auto host = origin.substr(7);
+        if (host.find('/') != std::string::npos || host.find_first_of("\r\n ") != std::string::npos) return false;
+        const auto colon = host.rfind(':');
+        unsigned short p = 0;
+        const std::string ipPart = colon == std::string::npos ? host : host.substr(0, colon);
+        if (colon != std::string::npos && !ValidPort(Wide(host.substr(colon + 1)), p)) return false;
+        return ipPart == "localhost" || IsLocal(ipPart);
+    };
+    if (asynchronous && !browser && recipientKey.empty() && validLocalOrigin(browserOriginHeader)) {
+        GUID g{}; CoCreateGuid(&g);
+        directUploadToken = Hex(std::string(reinterpret_cast<char *>(&g), sizeof(g)));
+    }
+    std::string senderOrigin, senderHostIp, senderClientIp;
+    if (browser) {
+        std::lock_guard lock(mutex_);
+        if (const auto found = browsers_.find(owner); found != browsers_.end()) {
+            senderOrigin = found->second.origin;
+            senderHostIp = found->second.hostIp;
+            senderClientIp = found->second.ip;
+        }
+    }
     auto job = NewJob(items.size() == 1 ? items[0].name : std::to_wstring(totalCount) + L" 个文件", sender + L" (" + Wide(ip) + L")", totalBytes, true);
     { std::lock_guard lock(mutex_);
       job->view.requestOnly = true; job->view.offerItems = items; job->batchId = batchId; job->recipient = recipientKey;
@@ -341,24 +384,42 @@ void Engine::ReceiveOffer(SOCKET socket, const std::map<std::string, std::string
           auto &approval = batchApprovals_.at(key); approval.items = items;
           approval.selection = job->selection; approval.counts.resize(items.size()); approval.bytes.resize(items.size());
           approval.target = Get(headers, "x-chuan-target"); approval.recipient = Get(headers, "x-chuan-recipient");
+          approval.gwIp = ip; approval.owner = owner;
+          if (!directUploadToken.empty()) {
+              approval.directUploadToken = directUploadToken;
+              approval.directOrigin = browserOriginHeader;
+          }
       }
       if (items.size() == 1 && items[0].folder) { job->view.folderName = items[0].name; job->view.folderCount = totalCount; job->view.folderTotal = totalBytes; }
       job->view.awaitingApproval = !forwarding && (!cfg.autoReceive || !recipientKey.empty());
     }
     if (asynchronous) {
         if (forwarding) {
-            if (!Launch([this, relay, batchId, items, job] {
+            const std::string passOrigin = !relay.browser ? senderOrigin : std::string{};
+            const std::string directHost = relay.ip.starts_with("127.") && !senderClientIp.starts_with("127.") && !senderHostIp.empty() ? senderHostIp : relay.ip;
+            if (!Launch([this, relay, batchId, items, job, passOrigin, directHost] {
                 std::string selection; std::wstring error;
                 if (SendOffer(relay, batchId, items, selection, error, job, INVALID_SOCKET,
                     [this, job](const std::string &mask) { std::lock_guard lock(mutex_); CompleteOfferLocked(job, mask); },
-                    [this, job] { std::lock_guard lock(mutex_); std::string mask(job->selection.size(), '-'); for (size_t i=0;i<mask.size();++i) if (job->selection[i]=='0') mask[i]='0'; return mask; })) {
+                    [this, job] { std::lock_guard lock(mutex_); std::string mask(job->selection.size(), '-'); for (size_t i=0;i<mask.size();++i) if (job->selection[i]=='0') mask[i]='0'; return mask; },
+                    passOrigin,
+                    [this, job, relay, directHost](const std::string &dToken, const std::string &dInstance) {
+                        std::lock_guard lock(mutex_);
+                        job->directUploadBase = "http://" + directHost + ":" + std::to_string(relay.port) + "/direct";
+                        job->directUploadToken = dToken;
+                        job->directUploadServer = relay.id;
+                        job->directUploadInstance = dInstance;
+                    })) {
                     std::lock_guard lock(mutex_); CompleteOfferLocked(job, selection);
                 } else SetState(job, job->cancel ? State::Cancelled : State::Failed, error);
             })) SetState(job, State::Failed, L"服务繁忙，请稍后重试");
         } else if (cfg.autoReceive && recipientKey.empty()) {
             std::lock_guard lock(mutex_); CompleteOfferLocked(job, std::string(items.size(), '1'));
         }
-        Reply(socket, 202, "Accepted", "{\"id\":" + Json(std::to_string(job->view.id)) + "}", "application/json; charset=utf-8");
+        std::string body = "{\"id\":" + Json(std::to_string(job->view.id));
+        if (!directUploadToken.empty()) body += ",\"directUploadToken\":" + Json(directUploadToken) + ",\"directInstance\":" + Json(webToken_);
+        body += "}";
+        Reply(socket, 202, "Accepted", body, "application/json; charset=utf-8");
         return;
     }
     TrackSocket(socket, job);

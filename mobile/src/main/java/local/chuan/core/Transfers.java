@@ -13,29 +13,39 @@ final class Transfers {
     final Engine e;
     Transfers(Engine engine){e=engine;}
     void phase(InputStream input,OutputStream output,Header h,String ip,String upload,boolean browser)throws IOException {
+        phase(input,output,h,ip,upload,browser,null,"");
+    }
+    void phase(InputStream input,OutputStream output,Header h,String ip,String upload,boolean browser,Batch directBatch,String cors)throws IOException {
         String phase=new String(read(input,h.length(),16),StandardCharsets.UTF_8);
         if(!key(upload)||!(phase.equals("pack")||phase.equals("hash")))throw new IOException("处理阶段无效");
-        synchronized(e.lock){Batch batch=e.batches.get(batchKey(h,ip,browser));if(batch==null)throw new IOException("批次不存在");
-            for(Job job:e.jobs.values())if(job.announced&&job.upload.equals(upload)&&job.batchId.equals(h.get("x-chuan-batch"))&&(browser?job.owner:job.nativeOwner).equals(h.get(browser?"x-chuan-client":"x-chuan-id"))){
-                if(job.cancelled||batch.cancelledItems.contains(job.item)){response(output,410,"Gone","","text/plain");return;}
-                job.activity=phase.equals("pack")?"发送端正在打包文件":"等待发送端核对同名文件";e.trace(job);batch.touched=now();response(output,200,"OK","","text/plain");return;
+        boolean direct=directBatch!=null;String owner=direct?directBatch.owner:h.get(browser?"x-chuan-client":"x-chuan-id");
+        synchronized(e.lock){Batch batch=direct?directBatch:e.batches.get(batchKey(h,ip,browser));if(batch==null)throw new IOException("批次不存在");
+            for(Job job:e.jobs.values())if(job.announced&&job.upload.equals(upload)&&job.batchId.equals(h.get("x-chuan-batch"))&&((browser&&!direct)?job.owner:job.nativeOwner).equals(owner)){
+                if(job.cancelled||batch.cancelledItems.contains(job.item)){response(output,410,"Gone","","text/plain",cors);return;}
+                job.activity=phase.equals("pack")?"发送端正在打包文件":"等待发送端核对同名文件";e.trace(job);batch.touched=now();response(output,200,"OK","","text/plain",cors);return;
             }
-        }response(output,404,"Not Found","","text/plain");
+        }response(output,404,"Not Found","","text/plain",cors);
     }
     void retryUpload(OutputStream output,Header h,String ip,String upload,boolean browser)throws IOException {
-        synchronized(e.lock){Batch batch=e.batches.get(batchKey(h,ip,browser));if(batch==null){response(output,404,"Not Found","", "text/plain");return;}
-            String owner=h.get(browser?"x-chuan-client":"x-chuan-id");
-            for(Job job:e.jobs.values())if(job.receiving&&job.batchId.equals(batch.id)&&job.upload.equals(upload)&&(browser?job.owner:job.nativeOwner).equals(owner)){
-                if(job.cancelled||batch.cancelledItems.contains(job.item)||job.state==6){response(output,410,"Gone","", "text/plain");return;}
-                if(job.paused){batch.touched=now();response(output,200,"OK","7","text/plain");return;}if(job.state==3){response(output,200,"OK","3", "text/plain");return;}
-                if(!job.recipient.isEmpty()&&job.source!=null&&job.state!=5){batch.touched=now();response(output,200,"OK","8","text/plain");return;}
+        retryUpload(output,h,ip,upload,browser,null,"");
+    }
+    void retryUpload(OutputStream output,Header h,String ip,String upload,boolean browser,Batch directBatch,String cors)throws IOException {
+        boolean direct=directBatch!=null;String owner=direct?directBatch.owner:h.get(browser?"x-chuan-client":"x-chuan-id");
+        synchronized(e.lock){Batch batch=direct?directBatch:e.batches.get(batchKey(h,ip,browser));if(batch==null){response(output,404,"Not Found","","text/plain",cors);return;}
+            for(Job job:e.jobs.values())if(job.receiving&&job.batchId.equals(batch.id)&&job.upload.equals(upload)&&((browser&&!direct)?job.owner:job.nativeOwner).equals(owner)){
+                if(job.cancelled||batch.cancelledItems.contains(job.item)||job.state==6){response(output,410,"Gone","","text/plain",cors);return;}
+                if(job.paused){batch.touched=now();response(output,200,"OK","7","text/plain",cors);return;}if(job.state==3){response(output,200,"OK","3","text/plain",cors);return;}
+                if(!job.recipient.isEmpty()&&job.source!=null&&job.state!=5){batch.touched=now();response(output,200,"OK","8","text/plain",cors);return;}
                 if(job.state==5){if(batch.paths.remove(job.item+":"+job.name.toLowerCase(Locale.ROOT))){batch.counts[job.item]--;batch.bytes[job.item]-=job.total;}job.state=0;job.done=0;job.error="";job.activity="等待重试数据";e.trace(job);job.announced=true;job.nativeHidden=false;job.hiddenClients.clear();batch.touched=now();}
-                response(output,job.state==0?200:409,job.state==0?"OK":"Conflict","0", "text/plain");return;
-            }response(output,200,"OK","0", "text/plain");
+                response(output,job.state==0?200:409,job.state==0?"OK":"Conflict","0","text/plain",cors);return;
+            }response(output,200,"OK","0","text/plain",cors);
         }
     }
     static boolean permanent(String message){return message!=null&&(message.contains("同名文件")||message.contains("类型冲突")||message.contains("原文件已保留")||message.contains("源文件")||message.contains("文件长度发生变化")||message.contains("文件路径已变更"));}
-    void queueRetry(Peer peer,Job job){if(peer.browser&&peer.owner.isEmpty()){synchronized(e.lock){if(job.cancelled||!e.running)return;job.retryDeadline=0;job.retryExpired=false;job.retryPending=false;job.error="";}try{job.recipient=recipient(peer.id);e.state(job,1,"");synchronized(e.lock){job.activity="等待浏览器接收";e.trace(job);}}catch(IOException error){e.state(job,5,error.getMessage());}return;}if(permanent(job.error)){try{e.request(peer,"POST","/api/batch-status",Collections.singletonMap("X-Chuan-Batch",job.batchId),job.upload+"\t5\t"+hex(job.error)+"\n",4000);}catch(IOException ignored){}return;}synchronized(e.lock){if(job.cancelled||job.retryDeadline!=0||!e.running)return;job.retryDeadline=now()+30000;job.retryExpired=false;job.retryPending=true;job.state=1;job.error="";job.activity="独立通道自动重试中";e.trace(job);}
+    void queueRetry(Peer peer,Job job){
+        if(peer.browser&&peer.owner.isEmpty()){synchronized(e.lock){if(job.cancelled||!e.running)return;job.retryDeadline=0;job.retryExpired=false;job.retryPending=false;job.error="";}try{job.recipient=recipient(peer.id);e.state(job,1,"");synchronized(e.lock){job.activity="等待浏览器接收";e.trace(job);}}catch(IOException error){e.state(job,5,error.getMessage());}return;}
+        if(peer.browser&&!peer.owner.isEmpty()&&job.directOutgoing){synchronized(e.lock){if(job.cancelled||!e.running)return;job.retryDeadline=0;job.retryExpired=false;job.retryPending=false;job.error="";}e.sends.execute(()->queueDirectBrowser(peer,job));return;}
+        if(permanent(job.error)){try{e.request(peer,"POST","/api/batch-status",Collections.singletonMap("X-Chuan-Batch",job.batchId),job.upload+"\t5\t"+hex(job.error)+"\n",4000);}catch(IOException ignored){}return;}synchronized(e.lock){if(job.cancelled||job.retryDeadline!=0||!e.running)return;job.retryDeadline=now()+30000;job.retryExpired=false;job.retryPending=true;job.state=1;job.error="";job.activity="独立通道自动重试中";e.trace(job);}
         e.scheduler.schedule(()->{synchronized(e.lock){if(job.retryDeadline!=0&&now()>=job.retryDeadline&&job.state!=3&&!job.cancelled&&!job.paused){job.retryExpired=true;for(Socket socket:job.sockets)try{socket.close();}catch(IOException ignored){}e.state(job,5,"传输失败超时（自动重试已达 30 秒）");}}},30,java.util.concurrent.TimeUnit.SECONDS);
         e.retries.execute(()->retryAttempt(peer,job));
     }
@@ -49,14 +59,19 @@ final class Transfers {
         if(job.retryExpired||permanent(job.error))try{e.request(peer,"POST","/api/batch-status",Collections.singletonMap("X-Chuan-Batch",job.batchId),job.upload+"\t5\t"+hex(job.error)+"\n",4000);}catch(IOException ignored){}
     }
     void batchFiles(InputStream input,OutputStream output,Header h,String ip,Session session,boolean status)throws IOException {
-        boolean browser=session!=null;String owner=browser?session.client:h.get("x-chuan-id"),display=browser?session.name:sender(h);
+        batchFiles(input,output,h,ip,session,status,null,"");
+    }
+    void batchFiles(InputStream input,OutputStream output,Header h,String ip,Session session,boolean status,Batch directBatch,String cors)throws IOException {
+        boolean direct=directBatch!=null,browser=session!=null&&!direct;
+        String owner=direct?directBatch.owner:browser?session.client:h.get("x-chuan-id");
+        String display=browser?e.browserDefaultName(session):sender(h);
         String batchId=h.get("x-chuan-batch");if(!key(batchId))throw new IOException("批次标识无效");
         String text=new String(read(input,h.length(),16*1024*1024),StandardCharsets.UTF_8);List<String[]> entries=new ArrayList<>();
         for(String line:text.split("\n")){String[] fields=line.split("\t",-1);if(status?fields.length!=3:fields.length!=5&&fields.length!=6)throw new IOException("批次清单格式无效");if(!status&&fields.length==6&&!(fields[5].equals("A")&&unhex(fields[3]).endsWith(".zip")||fields[5].equals("D")&&number(fields[4])==0))throw new IOException("ZIP 清单格式无效");entries.add(fields);}if(entries.isEmpty()||entries.size()>50000)throw new IOException("批次清单数量无效");
-        synchronized(e.lock){Batch batch=e.batches.get((browser?"web:":"native:")+ip+":"+owner+":"+batchId);if(batch==null||batch.selection.length()!=batch.items.size()||!batch.target.isEmpty()&&!unhex(batch.target).equals(e.config.id))throw new IOException("没有对应的本机批次授权");
+        synchronized(e.lock){Batch batch=direct?directBatch:e.batches.get((browser?"web:":"native:")+ip+":"+owner+":"+batchId);if(batch==null||batch.selection.length()!=batch.items.size()||!batch.target.isEmpty()&&!unhex(batch.target).equals(e.config.id))throw new IOException("没有对应的本机批次授权");
             if(status){Map<String,Job> owned=new HashMap<>();for(Job job:e.jobs.values())if((browser?job.owner:job.nativeOwner).equals(owner)&&job.batchId.equals(batchId))owned.put(job.upload,job);
                 for(String[] fields:entries){long state=number(fields[1]);String error=unhex(fields[2]);if(!owned.containsKey(fields[0])||(state!=4&&state!=5)||error.isEmpty()||error.length()>1024||error.indexOf('\r')>=0||error.indexOf('\n')>=0)throw new IOException("批次状态或任务归属无效");}
-                for(String[] fields:entries){Job job=owned.get(fields[0]);if(job.state!=3&&!job.cancelled){job.announced=false;if(number(fields[1])==4){job.cancelled=true;batch.cancelledItems.add(job.item);}e.state(job,(int)number(fields[1]),unhex(fields[2]));}}response(output,200,"OK","{}","application/json; charset=utf-8");return;
+                for(String[] fields:entries){Job job=owned.get(fields[0]);if(job.state!=3&&!job.cancelled){job.announced=false;if(number(fields[1])==4){job.cancelled=true;batch.cancelledItems.add(job.item);}e.state(job,(int)number(fields[1]),unhex(fields[2]));}}response(output,200,"OK","{}","application/json; charset=utf-8",cors);return;
             }
             if(e.jobs.size()+entries.size()>100000)throw new IOException("清单已登记或任务数量超过上限");
             long[] counts=new long[batch.items.size()],sizes=new long[batch.items.size()];Set<String> paths=new HashSet<>(),uploads=new HashSet<>();Map<Integer,String> folders=new HashMap<>();
@@ -66,10 +81,10 @@ final class Transfers {
                 if(fields.length==6&&(fields[5].equals("A")&&item.folder||fields[5].equals("D")&&!item.folder))throw new IOException("ZIP 必须作为单文件传输");
             }
             for(int i=0;i<batch.items.size();i++)if(counts[i]>0&&(counts[i]!=batch.items.get(i).count||sizes[i]!=batch.items.get(i).total))throw new IOException("清单总数量或总大小不匹配");
-            for(String[] fields:entries){int index=(int)number(fields[0]);Item item=batch.items.get(index);Job job=e.job(safePath(unhex(fields[3])),display,number(fields[4]),true);job.owner=browser?owner:"";job.webTab=h.get("x-chuan-tab").isEmpty()?owner:h.get("x-chuan-tab");job.nativeOwner=browser?"":owner;job.upload=fields[1];job.batchId=batchId;job.item=index;job.target=e.config.id;job.displaySender=display;job.announced=true;job.stage=browser?"upload":"";job.storageKey=batch.key+":";if(fields.length==6){job.directory=fields[5].equals("D");}
+            for(String[] fields:entries){int index=(int)number(fields[0]);Item item=batch.items.get(index);Job job=e.job(safePath(unhex(fields[3])),display,number(fields[4]),true);job.owner=browser?owner:"";job.webTab=browser?(h.get("x-chuan-tab").isEmpty()?owner:h.get("x-chuan-tab")):"";job.nativeOwner=browser?"":owner;job.upload=fields[1];job.batchId=batchId;job.item=index;job.target=e.config.id;job.displaySender=display;job.announced=true;job.stage=browser?"upload":"";job.storageKey=batch.key+":";if(fields.length==6){job.directory=fields[5].equals("D");}
                 if(item.folder){job.folderId=fields[2];job.folderName=item.name;job.folderCount=item.count;job.folderTotal=item.total;}}
             for(String[] fields:entries)batch.announcedItems.add((int)number(fields[0]));
-            batch.announced=true;response(output,200,"OK","{}","application/json; charset=utf-8");
+            batch.announced=true;batch.touched=now();response(output,200,"OK","{}","application/json; charset=utf-8",cors);
         }
     }
     String manifest(List<Item> items){StringBuilder out=new StringBuilder();for(Item item:items)out.append(hex(item.name)).append('\t').append(item.folder?'D':'F').append('\t').append(item.count).append('\t').append(item.total).append('\n');return out.toString();}
@@ -83,13 +98,24 @@ final class Transfers {
     static final class LimitException extends IOException {LimitException(){super("超过单批文件数量或总大小上限");}}
     interface SelectionHandler {void changed(String mask)throws IOException;}
     interface Cancellation {String mask();}
-    String sendOffer(Peer peer,String batch,List<Item> items,String display,Job control)throws IOException {return sendOffer(peer,batch,items,display,control,null,null,null);}
-    String sendOffer(Peer peer,String batch,List<Item> items,String display,Job control,OutputStream waitingOutput)throws IOException {return sendOffer(peer,batch,items,display,control,waitingOutput,null,null);}
-    String sendOffer(Peer peer,String batch,List<Item> items,String display,Job control,OutputStream waitingOutput,SelectionHandler progress,Cancellation cancelled)throws IOException {
+    static boolean validLocalOrigin(String origin){
+        if(origin==null||!origin.startsWith("http://"))return false;
+        String host=origin.substring(7);
+        if(host.indexOf('/')>=0||host.indexOf(' ')>=0||Engine.badText(host))return false;
+        int colon=host.lastIndexOf(':');
+        String ipPart=colon<0?host:host.substring(0,colon);
+        if(colon>=0){try{long port=number(host.substring(colon+1));if(port<1024||port>65535)return false;}catch(Exception ignored){return false;}}
+        return ipPart.equals("localhost")||Engine.local(ipPart);
+    }
+    String sendOffer(Peer peer,String batch,List<Item> items,String display,Job control)throws IOException {return sendOffer(peer,batch,items,display,control,null,null,null,"",null);}
+    String sendOffer(Peer peer,String batch,List<Item> items,String display,Job control,OutputStream waitingOutput)throws IOException {return sendOffer(peer,batch,items,display,control,waitingOutput,null,null,"",null);}
+    String sendOffer(Peer peer,String batch,List<Item> items,String display,Job control,OutputStream waitingOutput,SelectionHandler progress,Cancellation cancelled)throws IOException {return sendOffer(peer,batch,items,display,control,waitingOutput,progress,cancelled,"",null);}
+    String sendOffer(Peer peer,String batch,List<Item> items,String display,Job control,OutputStream waitingOutput,SelectionHandler progress,Cancellation cancelled,String browserOrigin,java.util.function.BiConsumer<String,String> directUploadInfo)throws IOException {
         Peer route=peer.copy();if(peer.browser&&peer.owner.isEmpty()){route.ip="127.0.0.1";route.port=e.config.port;route.gateway="";route.owner=e.config.id;}
-        Map<String,String> headers=new LinkedHashMap<>();headers.put("X-Chuan-Batch",batch);headers.put("X-Chuan-Recipient",peer.browser?hex(peer.id):"");headers.put("X-Chuan-Display-Sender",hex(display));headers.put("X-Chuan-Offer-Wait","1");headers.put("X-Chuan-Offer-Async","1");
+        Map<String,String> headers=new LinkedHashMap<>();headers.put("X-Chuan-Batch",batch);headers.put("X-Chuan-Recipient",peer.browser?hex(peer.id):"");headers.put("X-Chuan-Display-Sender",hex(display));if(browserOrigin!=null&&!browserOrigin.isEmpty())headers.put("X-Chuan-Browser-Origin",browserOrigin);headers.put("X-Chuan-Offer-Wait","1");headers.put("X-Chuan-Offer-Async","1");
         String selected=e.request(route,"POST","/api/offer",headers,manifest(items),130000,control,waitingOutput);
         if(!selected.startsWith("{")){if(selected.length()!=items.size()||!selected.matches("[01]+"))throw new IOException("接收方的批次审批响应无效");if(progress!=null)progress.changed(selected);return selected;}
+        if(directUploadInfo!=null){try{Map<String,Object> info=Json.object(selected);String dToken=Json.string(info,"directUploadToken",""),dInstance=Json.string(info,"directInstance","");if(key(dToken)&&!dInstance.isEmpty())directUploadInfo.accept(dToken,dInstance);}catch(Exception ignored){}}
         String last="",sentCancel="";long failedAt=0,keepalive=now();
         while(e.running){
             String mask=control!=null&&control.cancelled?repeat('0',items.size()):cancelled==null?"":cancelled.mask();
@@ -122,7 +148,7 @@ final class Transfers {
         String previous=batch.selection.length()==batch.items.size()?batch.selection:repeat('-',batch.items.size());StringBuilder merged=new StringBuilder(previous);
         for(int i=0;i<previous.length();i++)if(previous.charAt(i)=='-'&&(job.cancelled||selected.charAt(i)!='-'))merged.setCharAt(i,job.cancelled?'0':selected.charAt(i));
         batch.selection=merged.toString();batch.touched=now();job.selection=batch.selection;
-        if(job.cancelled||job.selection.indexOf('-')<0)e.state(job,job.cancelled?4:job.selection.indexOf('1')>=0?3:6,"");e.lock.notifyAll();
+        if(job.cancelled||job.selection.indexOf('-')<0){job.nativeHidden=true;e.state(job,job.cancelled?4:job.selection.indexOf('1')>=0?3:6,"");}e.lock.notifyAll();
     }}
     void offer(Socket socket,InputStream input,OutputStream output,Header h,String ip,boolean browser)throws IOException {
         String batchId=h.get("x-chuan-batch"),owner=h.get(browser?"x-chuan-client":"x-chuan-id"),sender=sender(h);
@@ -134,14 +160,26 @@ final class Transfers {
         boolean localBrowser=asynchronous&&route!=null&&route.browser&&route.owner.isEmpty();
         String recipient=recipient(localBrowser?route.id:recipientId);final Peer relay=localBrowser?null:route;
         if(!recipient.isEmpty()){synchronized(e.lock){Session session=e.sessions.get(recipient);long count=0,total=0;for(Item item:items){count=Math.addExact(count,item.count);total=Math.addExact(total,item.total);}limits(count,total,session.maxFiles,session.maxBytes);}}
-        Batch batch=new Batch();batch.key=batchKey(h,ip,browser);batch.id=batchId;batch.owner=owner;batch.target=h.get("x-chuan-target");batch.recipient=h.get("x-chuan-recipient");batch.items=items;batch.selection=repeat('-',items.size());batch.counts=new long[items.size()];batch.bytes=new long[items.size()];
+        String browserOriginHeader=h.get("x-chuan-browser-origin");
+        String directUploadToken="";
+        if(asynchronous&&!browser&&recipient.isEmpty()&&validLocalOrigin(browserOriginHeader))directUploadToken=random();
+        String senderOrigin="",senderHostIp="",senderClientIp="";
+        if(browser)synchronized(e.lock){Session s=e.sessions.get(owner);if(s!=null){senderOrigin=s.origin;senderHostIp=s.hostIp;senderClientIp=s.ip;}}
+        Batch batch=new Batch();batch.key=batchKey(h,ip,browser);batch.id=batchId;batch.owner=owner;batch.target=h.get("x-chuan-target");batch.recipient=h.get("x-chuan-recipient");batch.items=items;batch.selection=repeat('-',items.size());batch.counts=new long[items.size()];batch.bytes=new long[items.size()];batch.gwIp=ip;
+        if(!directUploadToken.isEmpty()){batch.directUploadToken=directUploadToken;batch.directOrigin=browserOriginHeader;}
         synchronized(e.lock){if(e.batches.size()>=4096||e.batches.containsKey(batch.key)){response(output,409,"Conflict","批次标识已使用","text/plain; charset=utf-8");return;}e.batches.put(batch.key,batch);}
         long total=0;for(Item item:items)total=Math.addExact(total,item.total);Job job=e.job(items.size()==1?items.get(0).name:items.size()+" 个项目",sender,total,true);
         synchronized(e.lock){job.requestOnly=true;job.offerItems=items;job.nativeOwner=browser?"":owner;job.selection=repeat('-',items.size());job.batchId=batchId;job.recipient=recipient;job.owner=browser?owner:"";job.webTab=h.get("x-chuan-tab").isEmpty()?owner:h.get("x-chuan-tab");job.displaySender=sender;job.state=1;job.asyncOfferKey=asynchronous?batch.key:"";job.awaitingApproval=relay==null&&(!e.config.autoReceive||!recipient.isEmpty());}
         if(asynchronous){
-            if(relay!=null)try{e.approvals.execute(()->{try{completeOffer(job,sendOffer(relay,batchId,items,sender,job,null,mask->completeOffer(job,mask),()->{synchronized(e.lock){return job.selection.replace('1','-');}}));}catch(IOException error){e.state(job,job.cancelled?4:5,error.getMessage());}});}catch(java.util.concurrent.RejectedExecutionException busy){e.state(job,5,"服务繁忙，请稍后重试");}
+            if(relay!=null){
+                final String passOrigin=!relay.browser?senderOrigin:"";
+                final String directHost=relay.ip.startsWith("127.")&&!senderClientIp.startsWith("127.")&&!senderHostIp.isEmpty()&&!senderHostIp.equals("localhost")?senderHostIp:relay.ip;
+                try{e.approvals.execute(()->{try{completeOffer(job,sendOffer(relay,batchId,items,sender,job,null,mask->completeOffer(job,mask),()->{synchronized(e.lock){return job.selection.replace('1','-');}},passOrigin,(dToken,dInstance)->{synchronized(e.lock){job.directUploadBase="http://"+directHost+":"+relay.port+"/direct";job.directUploadToken=dToken;job.directUploadServer=relay.id;job.directUploadInstance=dInstance;}}));}catch(IOException error){e.state(job,job.cancelled?4:5,error.getMessage());}});}catch(java.util.concurrent.RejectedExecutionException busy){e.state(job,5,"服务繁忙，请稍后重试");}
+            }
             else if(e.config.autoReceive&&recipient.isEmpty())completeOffer(job,repeat('1',items.size()));
-            response(output,202,"Accepted",Json.stringify(Json.map("id",String.valueOf(job.id))),"application/json; charset=utf-8");return;
+            Map<String,Object> accepted=Json.map("id",String.valueOf(job.id));
+            if(!directUploadToken.isEmpty()){accepted.put("directUploadToken",directUploadToken);accepted.put("directInstance",e.instance);}
+            response(output,202,"Accepted",Json.stringify(accepted),"application/json; charset=utf-8");return;
         }
         job.sockets.add(socket);
         String selected=repeat('1',items.size());
@@ -161,9 +199,14 @@ final class Transfers {
         }finally{if(!socket.isClosed())socket.setSoTimeout(timeout);}
     }
     void upload(Socket socket,InputStream input,OutputStream output,Header h,String ip,boolean browser)throws IOException {
-        upload(socket,input,output,h,ip,browser,false);
+        upload(socket,input,output,h,ip,browser,false,null,"");
     }
     void upload(Socket socket,InputStream input,OutputStream output,Header h,String ip,boolean browser,boolean probe)throws IOException {
+        upload(socket,input,output,h,ip,browser,probe,null,"");
+    }
+    void upload(Socket socket,InputStream input,OutputStream output,Header h,String ip,boolean browser,boolean probe,Batch directBatch,String cors)throws IOException {
+        boolean direct=directBatch!=null,useNativeOwner=direct||!browser;
+        String effectiveOwner=direct?directBatch.owner:h.get(browser?"x-chuan-client":"x-chuan-id");
         boolean directory=h.get("x-chuan-directory").equals("1"),copying=h.get("x-chuan-copy").equals("1");
         String name=safePath(unhex(h.get("x-chuan-path"))),sender=sender(h);long total=number(h.get("x-chuan-size"));
         boolean checksum=!(browser&&h.get("x-chuan-checksum").equals("none"));
@@ -171,15 +214,15 @@ final class Transfers {
         if((!resumeKey.isEmpty()&&!Resume.keyValid(resumeKey))||resumeOffset>total||resumeOffset>0&&resumeKey.isEmpty())throw new IOException("续传参数无效");
         if(sender.isEmpty()||sender.length()>64||Engine.badText(sender)||total>Long.MAX_VALUE-32||h.length()!=(probe?0:total-resumeOffset+(checksum?32:0))||(!browser&&!probe&&!h.get("expect").equals("100-continue"))||(browser&&(!key(h.get("x-chuan-upload"))||!h.get("expect").isEmpty()))||(!h.get("x-chuan-checksum").isEmpty()&&!h.get("x-chuan-checksum").equals(checksum?"sha256":"none")))throw new IOException("文件请求参数无效");
         String target=unhex(h.get("x-chuan-target")),recipientId=unhex(h.get("x-chuan-recipient")),recipient=recipient(recipientId);if(browser&&!recipientId.isEmpty())throw new IOException("接收身份无效");
-        boolean staging=browser&&!target.isEmpty()&&!target.equals(e.config.id);if(staging)e.peer(target);
+        boolean staging=!direct&&browser&&!target.isEmpty()&&!target.equals(e.config.id);if(staging)e.peer(target);
         String folder=h.get("x-chuan-folder"),folderName=unhex(h.get("x-chuan-folder-name"));long folderCount=folder.isEmpty()?0:number(h.get("x-chuan-folder-count")),folderTotal=folder.isEmpty()?0:number(h.get("x-chuan-folder-size"));
         if(!folder.isEmpty()&&(!key(folder)||!(name.startsWith(safePath(folderName)+"/")||directory&&name.equals(folderName))||folderName.contains("/")||folderCount<1||folderTotal<total))throw new IOException("文件夹批次无效");
         limits(folder.isEmpty()?1:folderCount,folder.isEmpty()?total:folderTotal,e.config.maxFiles,e.config.maxBytes);
         File base=staging||!recipient.isEmpty()||(!directory&&e.platform.externalStorage())?e.config.relayDirectory:e.config.receiveDirectory;base.mkdirs();
         boolean matched=false;String existingUri=null,copyError="";
         if(copying||probe||directory){
-            synchronized(e.lock){Batch approved=e.batches.get(batchKey(h,ip,browser));int index=(int)number(h.get("x-chuan-item"));
-                if(approved!=null&&approved.cancelledItems.contains(index)){response(output,410,"Gone","接收端已取消本次传输","text/plain; charset=utf-8");return;}
+            synchronized(e.lock){Batch approved=direct?directBatch:e.batches.get(batchKey(h,ip,browser));int index=(int)number(h.get("x-chuan-item"));
+                if(approved!=null&&approved.cancelledItems.contains(index)){response(output,410,"Gone","接收端已取消本次传输","text/plain; charset=utf-8",cors);return;}
                 if(!copying||approved==null||index<0||index>=approved.items.size()||approved.selection.length()!=approved.items.size()||approved.selection.charAt(index)!='1'||approved.cancelledItems.contains(index)||!approved.target.equals(h.get("x-chuan-target"))||!approved.recipient.equals(h.get("x-chuan-recipient")))throw new IOException("目录复制没有有效授权");
                 Item item=approved.items.get(index);if(!item.folder||!(name.startsWith(item.name+"/")||directory&&name.equals(item.name))||total>item.total||directory&&(!probe||total!=0))throw new IOException("目录复制范围无效");approved.touched=now();
             }
@@ -191,34 +234,34 @@ final class Transfers {
                 if(metadata){
                     boolean exists=!staging&&recipient.isEmpty()&&(existingUri!=null?!existingUri.isEmpty():targetFile.exists());
                     if(existingUri==null&&exists&&(!targetFile.isFile()||targetFile.length()!=total))throw new IOException("同名文件类型或大小不同，原文件已保留");
-                    synchronized(e.lock){for(Job candidate:e.jobs.values())if(candidate.announced&&!candidate.cancelled&&candidate.state<3&&candidate.upload.equals(h.get("x-chuan-upload"))&&candidate.batchId.equals(h.get("x-chuan-batch"))&&(browser?candidate.owner:candidate.nativeOwner).equals(h.get(browser?"x-chuan-client":"x-chuan-id"))){candidate.activity=exists?"等待发送端核对同名文件":"准备接收文件";e.trace(candidate);break;}}
-                    response(output,200,"OK",exists?"{\"verify\":true}":"{\"upload\":true}","application/json");return;
+                    synchronized(e.lock){for(Job candidate:e.jobs.values())if(candidate.announced&&!candidate.cancelled&&candidate.state<3&&candidate.upload.equals(h.get("x-chuan-upload"))&&candidate.batchId.equals(h.get("x-chuan-batch"))&&((browser&&!direct)?candidate.owner:candidate.nativeOwner).equals(effectiveOwner)){candidate.activity=exists?"等待发送端核对同名文件":"准备接收文件";e.trace(candidate);break;}}
+                    response(output,200,"OK",exists?"{\"verify\":true}":"{\"upload\":true}","application/json",cors);return;
                 }
                 if(existingUri!=null)matched=!existingUri.isEmpty();
                 else if(directory){if(targetFile.exists()&&!targetFile.isDirectory())throw new IOException("目标路径类型冲突，原文件已保留");matched=true;}
                 else if(!staging&&recipient.isEmpty()&&targetFile.exists()){
                     if(!targetFile.isFile()||targetFile.length()!=total)throw new IOException("同名文件内容不同，原文件已保留");
-                    Job checking=null;synchronized(e.lock){for(Job candidate:e.jobs.values())if(candidate.announced&&!candidate.cancelled&&candidate.upload.equals(h.get("x-chuan-upload"))&&candidate.batchId.equals(h.get("x-chuan-batch"))&&(browser?candidate.owner:candidate.nativeOwner).equals(h.get(browser?"x-chuan-client":"x-chuan-id"))){checking=candidate;checking.activity="核对同名文件";e.trace(checking);break;}}
+                    Job checking=null;synchronized(e.lock){for(Job candidate:e.jobs.values())if(candidate.announced&&!candidate.cancelled&&candidate.upload.equals(h.get("x-chuan-upload"))&&candidate.batchId.equals(h.get("x-chuan-batch"))&&((browser&&!direct)?candidate.owner:candidate.nativeOwner).equals(effectiveOwner)){checking=candidate;checking.activity="核对同名文件";e.trace(checking);break;}}
                     try(InputStream file=new FileInputStream(targetFile)){matched=digest(file,check::run).equals(h.get("x-chuan-sha256"));}
                     finally{if(checking!=null)synchronized(e.lock){checking.activity="";e.trace(checking);}}
                     if(!matched)throw new IOException("同名文件内容不同，原文件已保留");
                 }
                 if(directory)matched=true;
-                if(!matched){response(output,200,"OK","{\"upload\":true}","application/json");return;}
+                if(!matched){response(output,200,"OK","{\"upload\":true}","application/json",cors);return;}
             }
             }catch(IOException error){copyError=error.getMessage()==null?"无法核对目标文件":error.getMessage();}
         }
         if(!copyError.isEmpty()){
             Job failed=null;
-            if(!h.get("x-chuan-batch").isEmpty())synchronized(e.lock){for(Job candidate:e.jobs.values())if(candidate.announced&&candidate.state==0&&(browser?candidate.owner:candidate.nativeOwner).equals(h.get(browser?"x-chuan-client":"x-chuan-id"))&&candidate.batchId.equals(h.get("x-chuan-batch"))&&candidate.upload.equals(h.get("x-chuan-upload"))&&candidate.name.equals(name)&&candidate.total==total){failed=candidate;candidate.announced=false;break;}}
+            if(!h.get("x-chuan-batch").isEmpty())synchronized(e.lock){for(Job candidate:e.jobs.values())if(candidate.announced&&candidate.state==0&&((browser&&!direct)?candidate.owner:candidate.nativeOwner).equals(effectiveOwner)&&candidate.batchId.equals(h.get("x-chuan-batch"))&&candidate.upload.equals(h.get("x-chuan-upload"))&&candidate.name.equals(name)&&candidate.total==total){failed=candidate;candidate.announced=false;break;}}
             if(failed==null)failed=e.job(name,sender,total,true);
-            e.state(failed,5,copyError);response(output,409,"Conflict",copyError,"text/plain; charset=utf-8");return;
+            e.state(failed,5,copyError);response(output,409,"Conflict",copyError,"text/plain; charset=utf-8",cors);return;
         }
         Batch batch=null;int item=0;File folderRoot=null;
         if(!h.get("x-chuan-batch").isEmpty()){
-            synchronized(e.lock){batch=e.batches.get(batchKey(h,ip,browser));item=(int)number(h.get("x-chuan-item"));
+            synchronized(e.lock){batch=direct?directBatch:e.batches.get(batchKey(h,ip,browser));item=(int)number(h.get("x-chuan-item"));
                 if(batch==null||item<0||item>=batch.items.size()||batch.selection.length()!=batch.items.size()||batch.selection.charAt(item)!='1'||!batch.target.equals(h.get("x-chuan-target"))||!batch.recipient.equals(h.get("x-chuan-recipient")))throw new IOException("文件没有对应的批次授权");
-                if(batch.cancelledItems.contains(item)){response(output,410,"Gone","接收端已取消本次传输","text/plain; charset=utf-8");return;}
+                if(batch.cancelledItems.contains(item)){response(output,410,"Gone","接收端已取消本次传输","text/plain; charset=utf-8",cors);return;}
                 Item authorized=batch.items.get(item);String pathKey=item+":"+name.toLowerCase(Locale.ROOT);long nextCount=batch.counts[item]+1,nextBytes=Math.addExact(batch.bytes[item],total);
                 if((authorized.folder?!(name.startsWith(authorized.name+"/")||directory&&name.equals(authorized.name)):!name.equals(authorized.name))||nextCount>authorized.count||nextBytes>authorized.total||(nextCount==authorized.count&&nextBytes!=authorized.total)||batch.paths.contains(pathKey)||authorized.folder!=!folder.isEmpty()||(authorized.folder&&(!authorized.name.equals(folderName)||authorized.count!=folderCount||authorized.total!=folderTotal)))throw new IOException("文件超出已批准项目的范围");
                 batch.counts[item]=nextCount;batch.bytes[item]=nextBytes;batch.paths.add(pathKey);batch.touched=now();
@@ -226,9 +269,9 @@ final class Transfers {
             }
         }
         if(!recipient.isEmpty()&&batch==null)throw new IOException("浏览器接收文件需要批次审批");
-        Job announced=null;synchronized(e.lock){Batch declared=e.batches.get(batchKey(h,ip,browser));if(declared!=null){for(Job candidate:e.jobs.values())if(candidate.announced&&candidate.state==0&&(browser?candidate.owner:candidate.nativeOwner).equals(h.get(browser?"x-chuan-client":"x-chuan-id"))&&candidate.batchId.equals(h.get("x-chuan-batch"))&&candidate.upload.equals(h.get("x-chuan-upload"))&&candidate.name.equals(name)&&candidate.total==total){announced=candidate;candidate.announced=false;candidate.activity="";e.trace(candidate);candidate.browserPaused=false;candidate.resumeActivity="";break;}if(announced==null&&declared.announcedItems.contains(item))throw new IOException("文件与已登记清单不一致");}}
-        Job job=announced!=null?announced:e.job(name,sender,total,true);job.directory=directory;job.nativeOwner=browser?"":h.get("x-chuan-id");job.owner=browser?h.get("x-chuan-client"):"";job.webTab=h.get("x-chuan-tab").isEmpty()?job.owner:h.get("x-chuan-tab");job.upload=h.get("x-chuan-upload");job.recipient=recipient;job.target=target;job.displaySender=sender;job.staging=staging||!recipient.isEmpty();job.stage=browser?(staging?"staging":"upload"):"";job.batchId=h.get("x-chuan-batch");job.storageKey=batchKey(h,ip,browser)+":"+recipient;job.item=item;job.folderId=folder;job.folderName=folderName;job.folderCount=folderCount;job.folderTotal=folderTotal;job.sockets.add(socket);
-        if(batch==null&&!e.config.autoReceive&&!job.staging){job.state=1;job.awaitingApproval=true;job.offerItems=Collections.singletonList(new Item(name,false,1,total));awaitSelection(socket,input,job,null);if(!"1".equals(job.selection)||job.cancelled){e.state(job,job.cancelled?4:6,"");response(output,417,"Expectation Failed","接收请求已拒绝","text/plain; charset=utf-8");job.sockets.remove(socket);return;}}
+        Job announced=null;synchronized(e.lock){Batch declared=direct?directBatch:e.batches.get(batchKey(h,ip,browser));if(declared!=null){for(Job candidate:e.jobs.values())if(candidate.announced&&candidate.state==0&&((browser&&!direct)?candidate.owner:candidate.nativeOwner).equals(effectiveOwner)&&candidate.batchId.equals(h.get("x-chuan-batch"))&&candidate.upload.equals(h.get("x-chuan-upload"))&&candidate.name.equals(name)&&candidate.total==total){announced=candidate;candidate.announced=false;candidate.activity="";e.trace(candidate);candidate.browserPaused=false;candidate.resumeActivity="";break;}if(announced==null&&declared.announcedItems.contains(item))throw new IOException("文件与已登记清单不一致");}}
+        Job job=announced!=null?announced:e.job(name,sender,total,true);job.directory=directory;job.nativeOwner=useNativeOwner?effectiveOwner:"";job.owner=(browser&&!direct)?h.get("x-chuan-client"):"";job.webTab=(browser&&!direct)?(h.get("x-chuan-tab").isEmpty()?job.owner:h.get("x-chuan-tab")):"";job.upload=h.get("x-chuan-upload");job.recipient=recipient;job.target=target;job.displaySender=sender;job.staging=staging||!recipient.isEmpty();job.stage=(browser&&!direct)?(staging?"staging":"upload"):"";job.batchId=h.get("x-chuan-batch");job.storageKey=(direct?directBatch.key:batchKey(h,ip,browser))+":"+recipient;job.item=item;job.folderId=folder;job.folderName=folderName;job.folderCount=folderCount;job.folderTotal=folderTotal;job.sockets.add(socket);
+        if(batch==null&&!e.config.autoReceive&&!job.staging){job.state=1;job.awaitingApproval=true;job.offerItems=Collections.singletonList(new Item(name,false,1,total));awaitSelection(socket,input,job,null);if(!"1".equals(job.selection)||job.cancelled){e.state(job,job.cancelled?4:6,"");response(output,417,"Expectation Failed","接收请求已拒绝","text/plain; charset=utf-8",cors);job.sockets.remove(socket);return;}}
         if(probe&&matched){
             File destination=new File(base,name);
             if(directory&&!destination.isDirectory()&&!destination.mkdirs())throw new IOException("无法创建目录");
@@ -236,10 +279,10 @@ final class Transfers {
             job.publicUri=existingUri==null?"":existingUri;job.skipped=!directory;job.done=total;
             if(directory&&!job.staging)job.publicUri=e.publish(job);
             if(!recipient.isEmpty()){job.state=1;waitBrowser(job,output,208);job.sockets.remove(socket);return;}
-            e.state(job,3,"");job.sockets.remove(socket);response(output,208,"Already Reported",Json.stringify(Json.map("id",String.valueOf(job.id),"skipped",true)),"application/json");return;
+            e.state(job,3,"");job.sockets.remove(socket);response(output,208,"Already Reported",Json.stringify(Json.map("id",String.valueOf(job.id),"skipped",true)),"application/json",cors);return;
         }
-        long available=base.getUsableSpace();if(total-resumeOffset>available||available-(total-resumeOffset)<2L*1024*1024){e.state(job,5,"接收空间不足");response(output,507,"Insufficient Storage","接收空间不足","text/plain");return;}
-        File temporary=resumeKey.isEmpty()?File.createTempFile(".chuan-",".part",base):Resume.file(base,h.get(browser?"x-chuan-client":"x-chuan-id"),name,total,resumeKey),destination;
+        long available=base.getUsableSpace();if(total-resumeOffset>available||available-(total-resumeOffset)<2L*1024*1024){e.state(job,5,"接收空间不足");response(output,507,"Insufficient Storage","接收空间不足","text/plain",cors);return;}
+        File temporary=resumeKey.isEmpty()?File.createTempFile(".chuan-",".part",base):Resume.file(base,effectiveOwner,name,total,resumeKey),destination;
         try{
             File parent;if(folderRoot!=null){String suffix=name.substring(name.indexOf('/')+1);parent=new File(folderRoot,suffix).getParentFile();}else parent=new File(base,name).getParentFile();
             if(!parent.isDirectory()&&!parent.mkdirs())throw new IOException("无法创建接收目录");if(!parent.getCanonicalPath().startsWith(base.getCanonicalPath()+File.separator)&&!parent.getCanonicalFile().equals(base.getCanonicalFile()))throw new IOException("文件路径越界");
@@ -256,8 +299,8 @@ final class Transfers {
             synchronized(e.lock){destination=exact?new File(parent,name.substring(name.lastIndexOf('/')+1)):unique(parent,name.substring(name.lastIndexOf('/')+1),false);if(exact&&destination.exists())throw new IOException("目标文件在核对后已变化，原文件已保留");if(job.cancelled||job.retryExpired||!e.running)throw new IOException("传输已取消");if(!temporary.renameTo(destination))throw new IOException("无法提交接收文件");job.file=destination;job.source=Source.file(destination,name);}
             if(!job.staging){job.publicUri=e.publish(job);if(e.platform.externalStorage()&&!job.publicUri.isEmpty()){Source published=e.platform.publishedSource(job,job.publicUri,name);if(published!=null)job.source=published;if(destination.delete())job.file=null;}}
             if(!recipient.isEmpty()){job.state=1;waitBrowser(job,output);return;}
-            e.state(job,3,"");response(output,201,"Created",browser?Json.stringify(Json.map("id",String.valueOf(job.id))):destination.getName(),browser?"application/json; charset=utf-8":"text/plain; charset=utf-8");
-        }catch(Exception error){if(resumeKey.isEmpty()||String.valueOf(error.getMessage()).contains("SHA-256"))temporary.delete();e.state(job,job.paused?5:job.cancelled?4:5,job.cancelled?"接收端已取消本次传输":error.getMessage()==null?"传输中断":error.getMessage());response(output,422,"Unprocessable Content",job.error,"text/plain; charset=utf-8");}finally{job.sockets.remove(socket);}
+            e.state(job,3,"");response(output,201,"Created",browser?Json.stringify(Json.map("id",String.valueOf(job.id))):destination.getName(),browser?"application/json; charset=utf-8":"text/plain; charset=utf-8",cors);
+        }catch(Exception error){if(resumeKey.isEmpty()||String.valueOf(error.getMessage()).contains("SHA-256"))temporary.delete();e.state(job,job.paused?5:job.cancelled?4:5,job.cancelled?"接收端已取消本次传输":error.getMessage()==null?"传输中断":error.getMessage());response(output,422,"Unprocessable Content",job.error,"text/plain; charset=utf-8",cors);}finally{job.sockets.remove(socket);}
     }
     void waitBrowser(Job job,OutputStream output)throws IOException {waitBrowser(job,output,201);}
     void waitBrowser(Job job,OutputStream output,int success)throws IOException {long alive=0;while(e.running&&!job.cancelled&&job.state<3){synchronized(e.lock){try{e.lock.wait(250);}catch(InterruptedException error){Thread.currentThread().interrupt();break;}}if(now()-alive>2000){ascii(output,"HTTP/1.1 102 Processing\r\n\r\n");alive=now();}}if(job.state<3)e.state(job,4,"浏览器未完成接收");response(output,job.state==3?success:409,job.state==3?"Created":"Conflict",job.error,"text/plain; charset=utf-8");}
@@ -274,7 +317,7 @@ final class Transfers {
             boolean folder=!zipFolders&&(source.directory||source.path.contains("/"));
             if(folder){String root=source.path.split("/",2)[0];Integer index=roots.get(root);if(index==null){index=items.size();roots.put(root,index);folderIds.put(root,random());items.add(new Item(root,true,0,0));}job.item=index;Item item=items.get(index);item.count++;item.total=Math.addExact(item.total,source.size);job.folderId=folderIds.get(root);job.folderName=root;}
             else{job.item=items.size();items.add(new Item(source.path,false,1,source.size));}
-            ZipStore.Plan plan=plans.get(job.name);if(plan!=null){job.archiveSources=plan.sources;job.source=ZipStore.source(plan,()->{if(!e.running)throw new IOException("服务已停止");});}prepared.add(job);e.state(job,1,"");
+            ZipStore.Plan plan=plans.get(job.name);if(plan!=null){job.archivePlan=plan;job.archiveSources=plan.sources;job.source=ZipStore.source(plan,()->{if(!e.running||job.cancelled||job.paused)throw new IOException("传输已暂停或取消");});}prepared.add(job);e.state(job,1,"");
         }
         for(Job job:prepared)if(!job.folderId.isEmpty()){Item item=items.get(job.item);job.folderCount=item.count;job.folderTotal=item.total;}}
         Set<Integer> declaredItems=new HashSet<>();
@@ -292,7 +335,7 @@ final class Transfers {
         java.util.function.Consumer<Job> finish=job->{
             boolean registered=registeredJobs.contains(job.id);
             if(registered&&job.state>=4&&!job.cancelled)try{String state=e.request(peer,"POST","/api/upload-status/"+job.upload,Collections.singletonMap("X-Chuan-Batch",batch),"",5000);if(state.equals("4")){job.cancelled=true;e.state(job,4,"接收端已取消本次传输");}else if(state.equals("3")){job.done=job.total;e.state(job,3,"");}}catch(IOException ignored){}
-            File artifact=artifacts.remove(job.id);if(artifact!=null&&job.state!=5&&!(peer.browser&&peer.owner.isEmpty()))artifact.delete();
+            File artifact=artifacts.remove(job.id);if(artifact!=null&&job.state!=5&&!(peer.browser&&peer.owner.isEmpty())&&!job.directOutgoing)artifact.delete();
             if(job.state==5&&!job.cancelled){queueRetry(peer,job);return;}
             if(registered&&job.state>=4)try{String error=job.error.isEmpty()?"发送未完成":job.error;e.request(peer,"POST","/api/batch-status",Collections.singletonMap("X-Chuan-Batch",batch),job.upload+"\t"+(job.state==4?4:5)+"\t"+hex(error.replace('\n',' ').replace('\r',' '))+"\n",5000);}catch(IOException ignored){}
         };
@@ -319,7 +362,7 @@ final class Transfers {
     boolean prepareOne(Peer peer,Job job,boolean metadataOnly){
         boolean verifying=job.verificationPending&&!metadataOnly;job.verificationPending=false;
         if(job.cancelled||!e.running){e.state(job,4,"发送已取消");return false;}
-        if(peer.browser&&peer.owner.isEmpty())return true;
+        if(peer.browser)return true;
         try {
             if(!job.folderId.isEmpty()){
                 synchronized(e.lock){job.activity="检查接收位置";e.trace(job);}
@@ -343,6 +386,10 @@ final class Transfers {
         if(job.paused){e.state(job,5,"");return;}
         if(job.cancelled||!e.running){e.state(job,4,"发送已取消");return;}
         if(peer.browser&&peer.owner.isEmpty()){try{job.recipient=recipient(peer.id);e.state(job,1,"");synchronized(e.lock){job.activity="等待浏览器接收";e.trace(job);}}catch(IOException error){e.state(job,5,error.getMessage());}return;}
+        if(peer.browser&&!peer.owner.isEmpty()){
+            int directResult=queueDirectBrowser(peer,job);
+            if(directResult<=0)return;
+        }
         Socket connection=null;
         try{
             Map<String,String> headers=e.identity(peer);headers.put("X-Chuan-Path",hex(job.name));headers.put("X-Chuan-Size",String.valueOf(job.total));headers.put("X-Chuan-Recipient",peer.browser?hex(peer.id):"");headers.put("X-Chuan-Display-Sender",hex(job.displaySender));headers.put("X-Chuan-Upload",job.upload);headers.put("X-Chuan-Batch",job.batchId);headers.put("X-Chuan-Item",String.valueOf(job.item));headers.put("X-Chuan-Folder",job.folderId);headers.put("X-Chuan-Folder-Name",hex(job.folderName));headers.put("X-Chuan-Folder-Count",String.valueOf(job.folderCount));headers.put("X-Chuan-Folder-Size",String.valueOf(job.folderTotal));if(!job.folderId.isEmpty())headers.put("X-Chuan-Copy","1");
@@ -357,8 +404,9 @@ final class Transfers {
                 e.state(job,2,"");job.progressBytes=start;job.progressAt=now();e.progress(job,start);synchronized(e.lock){job.activity=job.archiveSources.isEmpty()?"正在发送文件":"边打包边发送 ZIP";e.trace(job);}
                 e.diagnostics.copy(job,"disk_to_network",file,output,job.total-start,hash,bytes->{if(job.paused)throw new IOException("传输已暂停");e.progress(job,start+bytes);});if(file.read()!=-1)throw new IOException("发送期间文件长度发生变化");output.write(hash.digest());output.flush();synchronized(e.lock){job.activity="等待接收端保存确认";e.trace(job);}
                 do{reply=header(input);}while(reply.status()==102&&!job.cancelled);if(reply.status()!=201){String reason=new String(read(input,reply.length(),131072),StandardCharsets.UTF_8);throw new IOException("接收端未确认保存：HTTP "+reply.status()+" "+reason);}e.state(job,3,"");
+                if(job.staging&&!job.direct)e.removeRelayFile(job);
             }
-        }catch(Exception error){e.state(job,job.cancelled?4:5,job.cancelled?"接收端已取消本次传输":error.getMessage()==null?"传输中断":error.getMessage());}
+        }catch(Exception error){e.state(job,job.cancelled?4:5,job.cancelled?"接收端已取消本次传输":error.getMessage()==null?"传输中断":error.getMessage());if(job.staging&&!job.direct&&job.cancelled)e.removeRelayFile(job);}
         finally{if(connection!=null){job.sockets.remove(connection);e.sockets.remove(connection);try{connection.close();}catch(IOException ignored){}}}
     }
     Job forward(Session session,long id,String target,String upload)throws IOException {
@@ -370,17 +418,256 @@ final class Transfers {
             if(job.verificationPending)e.fileVerification.execute(()->{if(prepareOne(peer,job))ready.run();else if(job.state==5)queueRetry(peer,job);});else ready.run();
         });return job;
     }
-    void download(Session session,Job job,OutputStream output,boolean checksum,long offset,String prefix,boolean range,long sliceEnd,boolean[] committed)throws IOException {
-        if(job==null||job.removed||job.source==null||(!job.owner.equals(session.client)&&!job.recipient.equals(session.client)))throw new FileNotFoundException("文件不属于当前浏览器会话");
-        boolean delivery=job.recipient.equals(session.client);if(job.paused||delivery&&job.state==4)throw new IOException("传输已暂停或取消");if(offset<0||offset>job.total||range&&(checksum||job.total==0||offset>=job.total||(sliceEnd>=0&&sliceEnd<offset))||!prefix.isEmpty()&&!Resume.keyValid(prefix))throw new IOException("续传范围无效");
+    void download(Socket socket,Session session,Job job,OutputStream output,boolean checksum,long offset,String prefix,boolean range,long sliceEnd,boolean[] committed,String cors,boolean direct)throws IOException {
+        if(job==null||job.removed||(job.source==null&&job.archivePlan==null)||(!direct&&(session==null||(!job.owner.equals(session.client)&&!job.recipient.equals(session.client)))))throw new FileNotFoundException("文件不属于当前浏览器会话");
+        boolean delivery=direct||job.recipient.equals(session.client);
+        if(offset<0||offset>job.total||range&&(checksum||job.total==0||offset>=job.total||(sliceEnd>=0&&sliceEnd<offset))||!prefix.isEmpty()&&!Resume.keyValid(prefix))throw new IOException("续传范围无效");
         long endLimit=(range&&sliceEnd>=0)?Math.min(job.total,sliceEnd+1):job.total;
-        try(InputStream input=job.source.opener.open()){
-            MessageDigest hash=sha();if(offset>0){if(checksum||!prefix.isEmpty()){String actual=Resume.prefix(input,offset,hash,()->{if(job.paused||job.cancelled||!e.running)throw new IOException("传输已暂停或取消");});if(!prefix.isEmpty()&&!actual.equals(prefix))throw new IOException("续传内容不一致");}else Resume.skip(input,offset);}
-            if(delivery){e.state(job,2,"");job.progressBytes=offset;job.progressAt=now();e.progress(job,offset);synchronized(e.lock){job.activity=job.archiveSources.isEmpty()?"正在发送文件":"边打包边发送 ZIP";e.trace(job);}}
-            committed[0]=true;
-            ascii(output,(range?"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes "+offset+"-"+(endLimit-1)+"/"+job.total+"\r\n":"HTTP/1.1 200 OK\r\n")+"Connection: close\r\nCache-Control: no-store\r\nAccept-Ranges: bytes\r\nX-Content-Type-Options: nosniff\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"download\"; filename*=UTF-8''"+encodeName(job.name.substring(job.name.lastIndexOf('/')+1))+"\r\nContent-Length: "+Math.addExact(endLimit-offset,checksum?32:0)+"\r\n\r\n");
-            e.diagnostics.copy(job,"disk_to_browser",input,output,endLimit-offset,checksum?hash:null,bytes->{if(job.paused)throw new IOException("传输已暂停");if(delivery)e.progress(job,offset+bytes);});if(checksum)output.write(hash.digest());output.flush();if(delivery){if(endLimit<job.total)synchronized(e.lock){job.state=1;job.activity="";e.trace(job);}else if(job.folderId.isEmpty())e.state(job,3,"");else synchronized(e.lock){job.state=1;job.activity="等待浏览器保存确认";e.trace(job);}}
-        }catch(IOException error){if(delivery)e.state(job,job.cancelled?4:5,error.getMessage());throw error;}
+        if(delivery){
+            synchronized(e.lock){
+                if(job.paused||job.cancelled||job.state==2||job.state==4){
+                    committed[0]=true;response(output,409,"Conflict","传输正在进行、已暂停或已取消","text/plain; charset=utf-8",cors);return;
+                }
+                job.state=2;job.started=now();job.progressAt=job.started;job.progressBytes=offset;job.done=offset;
+                job.activity=(job.archivePlan!=null||!job.archiveSources.isEmpty())?"边打包边发送 ZIP":"正在发送文件";
+                e.trace(job);
+            }
+            if(job.directOutgoing)pushDirectStatus(job);
+        }else if(job.paused||job.cancelled){
+            committed[0]=true;response(output,409,"Conflict","传输已暂停或取消","text/plain; charset=utf-8",cors);return;
+        }
+        if(socket!=null)job.sockets.add(socket);
+        try{
+            boolean directZipStream=job.archivePlan!=null&&offset==0&&endLimit==job.total&&!checksum;
+            if(directZipStream){
+                committed[0]=true;
+                String contentType="application/zip";
+                ascii(output,(range?"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes "+offset+"-"+(endLimit-1)+"/"+job.total+"\r\n":"HTTP/1.1 200 OK\r\n")+"Connection: close\r\nCache-Control: no-store\r\nAccept-Ranges: bytes\r\nX-Content-Type-Options: nosniff\r\nContent-Type: "+contentType+"\r\nContent-Disposition: attachment; filename=\"download.zip\"; filename*=UTF-8''"+encodeName(job.name.substring(job.name.lastIndexOf('/')+1))+"\r\nContent-Length: "+job.total+"\r\n"+(cors==null?"":cors)+"\r\n");
+                ZipStore.write(job.archivePlan,output,bytes->{if(job.paused)throw new IOException("传输已暂停");if(delivery)e.progress(job,bytes);},()->{if(!e.running||job.cancelled||job.paused)throw new IOException("传输已暂停或取消");});
+                output.flush();
+            }else{
+                try(InputStream input=job.source.opener.open()){
+                    MessageDigest hash=sha();
+                    if(offset>0){
+                        if(checksum||!prefix.isEmpty()){
+                            String actual=Resume.prefix(input,offset,hash,()->{if(job.paused||job.cancelled||!e.running)throw new IOException("传输已暂停或取消");});
+                            if(!prefix.isEmpty()&&!actual.equals(prefix))throw new IOException("续传内容不一致");
+                        }else Resume.skip(input,offset);
+                    }
+                    committed[0]=true;
+                    String contentType=job.archivePlan!=null?"application/zip":"application/octet-stream";
+                    ascii(output,(range?"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes "+offset+"-"+(endLimit-1)+"/"+job.total+"\r\n":"HTTP/1.1 200 OK\r\n")+"Connection: close\r\nCache-Control: no-store\r\nAccept-Ranges: bytes\r\nX-Content-Type-Options: nosniff\r\nContent-Type: "+contentType+"\r\nContent-Disposition: attachment; filename=\"download\"; filename*=UTF-8''"+encodeName(job.name.substring(job.name.lastIndexOf('/')+1))+"\r\nContent-Length: "+Math.addExact(endLimit-offset,checksum?32:0)+"\r\n"+(cors==null?"":cors)+"\r\n");
+                    e.diagnostics.copy(job,direct?"direct_disk_to_browser":"disk_to_browser",input,output,endLimit-offset,checksum?hash:null,bytes->{if(job.paused)throw new IOException("传输已暂停");if(delivery)e.progress(job,offset+bytes);});
+                    if(checksum)output.write(hash.digest());
+                    output.flush();
+                }
+            }
+            if(delivery){
+                if(endLimit<job.total){
+                    synchronized(e.lock){job.state=1;job.activity="";e.trace(job);}
+                    if(job.directOutgoing)pushDirectStatus(job);
+                }else if(job.folderId.isEmpty()){
+                    e.state(job,3,"");
+                    if(!direct&&job.staging)e.removeRelayFile(job);
+                }else{
+                    synchronized(e.lock){job.state=1;job.activity="等待浏览器保存确认";e.trace(job);}
+                    if(job.directOutgoing)pushDirectStatus(job);
+                }
+            }
+        }catch(IOException error){
+            if(delivery){
+                if(job.paused){
+                    synchronized(e.lock){job.state=1;job.speed=0;job.activity="已暂停，已接收数据已保留";e.trace(job);e.lock.notifyAll();}
+                    if(job.directOutgoing)pushDirectStatus(job);
+                }else e.state(job,job.cancelled?4:5,error.getMessage());
+            }
+            throw error;
+        }finally{if(socket!=null)job.sockets.remove(socket);}
+    }
+    int queueDirectBrowser(Peer peer,Job job){
+        String token=random(),gwIp=peer.gateway.isEmpty()?peer.ip:peer.gateway;
+        synchronized(e.lock){
+            if(job.cancelled||!e.running){e.state(job,4,"发送已取消");return -1;}
+            job.directToken=token;job.directOutgoing=true;job.directGatewayIp=gwIp;job.directGatewayPort=peer.port;job.directGatewayId=peer.owner;
+            job.state=1;job.activity="等待浏览器直连接收";e.trace(job);
+        }
+        Map<String,String> headers=new LinkedHashMap<>();
+        headers.put("X-Chuan-Path",hex(job.name));
+        headers.put("X-Chuan-Size",String.valueOf(job.total));
+        headers.put("X-Chuan-Directory",job.directory?"1":"0");
+        headers.put("X-Chuan-Recipient",hex(peer.id));
+        headers.put("X-Chuan-Display-Sender",hex(job.displaySender));
+        headers.put("X-Chuan-Batch",job.batchId);
+        headers.put("X-Chuan-Item",String.valueOf(job.item));
+        headers.put("X-Chuan-Upload",job.upload);
+        headers.put("X-Chuan-Folder",job.folderId);
+        headers.put("X-Chuan-Folder-Name",hex(job.folderName));
+        headers.put("X-Chuan-Folder-Count",String.valueOf(job.folderCount));
+        headers.put("X-Chuan-Folder-Size",String.valueOf(job.folderTotal));
+        headers.put("X-Chuan-Direct-Token",token);
+        headers.put("X-Chuan-Direct-Id",String.valueOf(job.id));
+        headers.put("X-Chuan-Direct-Instance",e.instance);
+        headers.put("X-Chuan-Direct-Parallel","0");
+        try{
+            String answer=e.request(peer,"POST","/api/direct-ready",headers,"",15000,job);
+            Map<String,Object> info=Json.object(answer);
+            long proxyId=number(Json.string(info,"id","0"));
+            String origin=Json.string(info,"origin","");
+            if(proxyId<=0)throw new IOException("直连登记响应无效");
+            synchronized(e.lock){
+                job.directProxyId=proxyId;job.directAllowedOrigin=origin;
+                job.state=1;job.done=0;job.speed=0;job.activity="等待浏览器接收";e.trace(job);
+            }
+            return 0;
+        }catch(IOException error){
+            synchronized(e.lock){job.directOutgoing=false;job.directToken="";job.directProxyId=0;job.directAllowedOrigin="";}
+            String message=error.getMessage()==null?"":error.getMessage();
+            if(message.startsWith("HTTP 404")||message.startsWith("HTTP 405"))return 404;
+            if(message.startsWith("HTTP 410")||job.cancelled)e.state(job,4,"接收端已取消本次传输");
+            else if(message.startsWith("HTTP 417")||message.startsWith("HTTP 413"))e.state(job,6,message);
+            else e.state(job,5,message.isEmpty()?"无法登记浏览器直连下载":message);
+            return -1;
+        }
+    }
+    void directReady(OutputStream output,Header h,String ip)throws IOException {
+        if(!h.get("content-length").isEmpty()&&!h.get("content-length").equals("0"))throw new IOException("直连请求体必须为空");
+        String rawId=h.get("x-chuan-id"),senderId=unhex(rawId);
+        String recipientId=unhex(h.get("x-chuan-recipient"));
+        String batchId=h.get("x-chuan-batch"),upload=h.get("x-chuan-upload");
+        String directToken=h.get("x-chuan-direct-token"),directInstance=h.get("x-chuan-direct-instance");
+        String name=safePath(unhex(h.get("x-chuan-path"))),sender=sender(h);
+        boolean directory=h.get("x-chuan-directory").equals("1"),parallel=h.get("x-chuan-direct-parallel").equals("1");
+        long total=number(h.get("x-chuan-size")),index=number(h.get("x-chuan-item")),remoteId=number(h.get("x-chuan-direct-id"));
+        int senderPort=(int)number(h.get("x-chuan-port"));
+        if(rawId.isEmpty()||senderId.isEmpty()||recipientId.isEmpty()||!key(batchId)||!key(upload)||!key(directToken)||directInstance.isEmpty()||directInstance.length()>128||sender.isEmpty()||sender.length()>64||Engine.badText(sender)||remoteId<=0||senderPort<1024||senderPort>65535)throw new IOException("直连参数无效");
+        String folder=h.get("x-chuan-folder"),folderName=unhex(h.get("x-chuan-folder-name"));
+        long folderCount=folder.isEmpty()?0:number(h.get("x-chuan-folder-count")),folderTotal=folder.isEmpty()?0:number(h.get("x-chuan-folder-size"));
+        if(!folder.isEmpty()&&(!key(folder)||!(name.startsWith(safePath(folderName)+"/")||(directory&&name.equals(folderName)))||folderName.contains("/")||folderCount<1||folderTotal<total))throw new IOException("直连文件夹参数无效");
+        Map<String,Object> reply;
+        synchronized(e.lock){
+            if(!e.config.shareSoftware){response(output,403,"Forbidden","Web 服务已关闭","text/plain; charset=utf-8");return;}
+            Session targetSession=null;
+            for(Session s:e.sessions.values())if(s.id.equals(recipientId)&&!s.openTabs.isEmpty()){targetSession=s;break;}
+            if(targetSession==null){response(output,409,"Conflict","浏览器设备已离线","text/plain; charset=utf-8");return;}
+            limits(folder.isEmpty()?1:folderCount,folder.isEmpty()?total:folderTotal,targetSession.maxFiles,targetSession.maxBytes);
+            Batch batch=e.batches.get("native:"+ip+":"+rawId+":"+batchId);
+            if(batch==null||index<0||index>=batch.items.size()){response(output,417,"Expectation Failed","文件不在已批准的批次范围内","text/plain; charset=utf-8");return;}
+            if(batch.cancelledItems.contains((int)index)){response(output,410,"Gone","接收端已取消本次传输","text/plain; charset=utf-8");return;}
+            if(index>=batch.selection.length()||batch.selection.charAt((int)index)!='1'||!batch.recipient.equals(h.get("x-chuan-recipient"))){response(output,417,"Expectation Failed","文件不在已批准的批次范围内","text/plain; charset=utf-8");return;}
+            Job existing=null;
+            for(Job candidate:e.jobs.values())if(candidate.direct&&candidate.nativeOwner.equals(rawId)&&candidate.batchId.equals(batchId)&&candidate.upload.equals(upload)){existing=candidate;break;}
+            if(existing!=null){
+                existing.cancelled=false;existing.paused=false;existing.remotePaused=false;existing.state=1;existing.done=0;existing.speed=0;existing.error="";existing.activity="等待浏览器接收";
+                existing.directToken=directToken;existing.directSenderIp=ip;existing.directSenderPort=senderPort;existing.directSenderId=senderId;existing.directSenderInstance=directInstance;existing.directRemoteId=remoteId;existing.directParallel=parallel;existing.directOrigin=targetSession.origin;
+                batch.touched=now();e.trace(existing);
+                reply=Json.map("id",String.valueOf(existing.id),"origin",targetSession.origin,"clientIp",targetSession.ip);
+            }else{
+                Item authorized=batch.items.get((int)index);String pathKey=index+":"+name.toLowerCase(Locale.ROOT);
+                long nextCount=batch.counts[(int)index]+1,nextBytes=Math.addExact(batch.bytes[(int)index],total);
+                if((authorized.folder?!(name.startsWith(authorized.name+"/")||(directory&&name.equals(authorized.name))):!name.equals(authorized.name))||nextCount>authorized.count||nextBytes>authorized.total||(nextCount==authorized.count&&nextBytes!=authorized.total)||batch.paths.contains(pathKey)||authorized.folder!=!folder.isEmpty()||(authorized.folder&&(!authorized.name.equals(folderName)||authorized.count!=folderCount||authorized.total!=folderTotal))){
+                    response(output,417,"Expectation Failed","文件不在已批准的批次范围内","text/plain; charset=utf-8");return;
+                }
+                batch.counts[(int)index]=nextCount;batch.bytes[(int)index]=nextBytes;batch.paths.add(pathKey);batch.touched=now();
+                Job job=e.job(name,sender,total,true);
+                job.directory=directory;job.state=1;job.activity="等待浏览器接收";job.staging=true;job.direct=true;job.directParallel=parallel;
+                job.directToken=directToken;job.directSenderIp=ip;job.directSenderPort=senderPort;job.directSenderId=senderId;job.directSenderInstance=directInstance;job.directRemoteId=remoteId;job.directOrigin=targetSession.origin;
+                job.recipient=targetSession.client;job.nativeOwner=rawId;job.upload=upload;job.batchId=batchId;job.item=(int)index;job.displaySender=sender;
+                job.storageKey=batch.key+":"+targetSession.client;
+                if(!folder.isEmpty()){job.folderId=folder;job.folderName=folderName;job.folderCount=folderCount;job.folderTotal=folderTotal;}
+                e.trace(job);
+                reply=Json.map("id",String.valueOf(job.id),"origin",targetSession.origin,"clientIp",targetSession.ip);
+            }
+        }
+        response(output,200,"OK",Json.stringify(reply),"application/json; charset=utf-8");
+    }
+    void directStatus(OutputStream output,Header h,String ip)throws IOException {
+        String rawId=h.get("x-chuan-id"),token=h.get("x-chuan-direct-token");
+        long proxyId=number(h.get("x-chuan-direct-proxy")),stateVal=number(h.get("x-chuan-state")),done=number(h.get("x-chuan-done")),speed=number(h.get("x-chuan-speed"));
+        if(!key(token)||stateVal<0||stateVal>6){response(output,400,"Bad Request","","text/plain");return;}
+        boolean paused=h.get("x-chuan-paused").equals("1");
+        String activity=unhex(h.get("x-chuan-activity")),error=unhex(h.get("x-chuan-error"));
+        synchronized(e.lock){
+            Job job=e.jobs.get(proxyId);
+            if(job==null||!job.direct||!job.nativeOwner.equals(rawId)||!job.directToken.equals(token)){response(output,404,"Not Found","","text/plain");return;}
+            Batch batch=e.batches.get("native:"+ip+":"+rawId+":"+job.batchId);if(batch!=null)batch.touched=now();
+            if(job.cancelled){response(output,410,"Gone","","text/plain");return;}
+            if(job.state==3&&stateVal<3){response(output,200,"OK","","text/plain");return;}
+            job.done=Math.min(done,job.total);job.speed=speed;job.paused=paused;job.state=(int)stateVal;job.activity=activity;job.error=error;
+            if(job.state>=3){job.finished=now();job.activity="";}
+            e.trace(job,true);e.lock.notifyAll();
+        }
+        response(output,200,"OK","","text/plain");
+    }
+    void directControl(OutputStream output,Header h)throws IOException {
+        long localId=number(h.get("x-chuan-direct-id"));String token=h.get("x-chuan-direct-token"),action=h.get("x-chuan-action");
+        if(!key(token)){response(output,400,"Bad Request","","text/plain");return;}
+        boolean found;
+        synchronized(e.lock){Job job=e.jobs.get(localId);found=job!=null&&job.directOutgoing&&job.directToken.equals(token);}
+        if(!found){response(output,404,"Not Found","","text/plain");return;}
+        if(action.equals("cancel"))e.cancel(localId);
+        else if(action.equals("pause"))e.pause(localId,true);
+        else if(action.equals("resume"))e.pause(localId,false);
+        else{response(output,400,"Bad Request","","text/plain");return;}
+        response(output,200,"OK","","text/plain");
+    }
+    void pushDirectStatus(Job job){
+        if(job==null||!e.running)return;
+        job.directPushDirty.set(true);
+        if(!job.directPushInFlight.compareAndSet(false,true))return;
+        Runnable task=()->{
+            try{
+                while(e.running){
+                    job.directPushDirty.set(false);
+                    String gwIp,gwId,token,activity,error;int gwPort,state;long proxyId,done,speed;boolean paused;
+                    synchronized(e.lock){
+                        gwIp=job.directGatewayIp;gwPort=job.directGatewayPort;gwId=job.directGatewayId;proxyId=job.directProxyId;token=job.directToken;
+                        state=job.state;done=job.done;speed=Math.max(0L,(long)job.speed);paused=job.paused;activity=job.activity;error=job.error;
+                        job.lastDirectPushMs=now();
+                    }
+                    if(proxyId<=0||gwIp.isEmpty()||gwPort<=0||token.isEmpty())break;
+                    try{
+                        Peer gw=new Peer(gwId,"",gwIp,gwPort);
+                        Map<String,String> headers=new LinkedHashMap<>();
+                        headers.put("X-Chuan-Direct-Proxy",String.valueOf(proxyId));
+                        headers.put("X-Chuan-Direct-Token",token);
+                        headers.put("X-Chuan-State",String.valueOf(state));
+                        headers.put("X-Chuan-Done",String.valueOf(done));
+                        headers.put("X-Chuan-Speed",String.valueOf(speed));
+                        headers.put("X-Chuan-Paused",paused?"1":"0");
+                        headers.put("X-Chuan-Activity",hex(activity));
+                        headers.put("X-Chuan-Error",hex(error));
+                        e.request(gw,"POST","/api/direct-status",headers,"",4000);
+                    }catch(IOException failure){
+                        if(failure.getMessage()!=null&&failure.getMessage().startsWith("HTTP 410")){e.cancel(job.id);break;}
+                    }
+                    if(!job.directPushDirty.get())break;
+                }
+            }finally{
+                job.directPushInFlight.set(false);
+                if(job.directPushDirty.get()&&e.running)pushDirectStatus(job);
+            }
+        };
+        try{e.approvals.execute(task);}catch(java.util.concurrent.RejectedExecutionException busy){job.directPushInFlight.set(false);}
+    }
+    void sendDirectControl(Job job,String action){
+        if(job==null||!e.running)return;
+        Runnable task=()->{
+            String senderIp,senderId,token;int senderPort;long remoteId;
+            synchronized(e.lock){
+                if(!job.direct)return;
+                senderIp=job.directSenderIp;senderPort=job.directSenderPort;senderId=job.directSenderId;remoteId=job.directRemoteId;token=job.directToken;
+            }
+            if(senderIp.isEmpty()||senderPort<=0||remoteId<=0||token.isEmpty())return;
+            try{
+                Peer sender=new Peer(senderId,"",senderIp,senderPort);
+                Map<String,String> headers=new LinkedHashMap<>();
+                headers.put("X-Chuan-Direct-Id",String.valueOf(remoteId));
+                headers.put("X-Chuan-Direct-Token",token);
+                headers.put("X-Chuan-Action",action);
+                e.request(sender,"POST","/api/direct-control",headers,"",4000);
+            }catch(IOException ignored){}
+        };
+        try{e.approvals.execute(task);}catch(java.util.concurrent.RejectedExecutionException ignored){}
     }
     static void safeDestination(File base,File path)throws IOException {
         File absolute=path.getAbsoluteFile();if(!absolute.getCanonicalFile().equals(absolute)||!absolute.toPath().normalize().startsWith(base.getAbsoluteFile().toPath().normalize()))throw new IOException("目标路径越界或包含链接");

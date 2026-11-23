@@ -1,17 +1,20 @@
 // Segment access is bound to an existing transfer and the original source identity.
-void Engine::ServeSegment(SOCKET s,const WebFile &source,uint64_t offset,uint64_t length,bool web) {
+void Engine::ServeSegment(SOCKET s,const WebFile &source,uint64_t offset,uint64_t length,bool web,bool direct) {
     const auto job=source.delivery;
     if(!job||!source.hasIdentity||!length||length>8*1024*1024||offset>source.size||length>source.size-offset){Reply(s,416,"Range Not Satisfiable");return;}
     if(job->segmentActive.fetch_add(1)>=8){--job->segmentActive;Reply(s,429,"Too Many Requests");return;}
     const auto release=std::shared_ptr<void>(nullptr,[job](void*){--job->segmentActive;});
+    bool startedRunning=false;
     {
         std::lock_guard lock(mutex_);
-        if(!running_||job->cancel||job->paused||job->view.state>=State::Completed||(web&&!config_.shareSoftware)){Reply(s,409,"Conflict");return;}
+        if(!running_||job->cancel||job->paused||job->view.state>=State::Completed||(web&&!direct&&!config_.shareSoftware)){Reply(s,409,"Conflict");return;}
         if(web&&job->view.state!=State::Running){
             job->segmentDone=0;job->view.done=0;job->progressBase=0;job->view.started=Now();
             job->view.state=State::Running;job->view.activity=L"多连接并行发送";TraceJobLocked(job);
+            startedRunning=true;
         }
     }
+    if(startedRunning&&job->directOutgoing)PushDirectStatus(job);
     WinFile file(CreateFileW(source.path.c_str(),GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,FILE_FLAG_SEQUENTIAL_SCAN,nullptr));
     BY_HANDLE_FILE_INFORMATION actual{};LARGE_INTEGER size{};
     if(file.value==INVALID_HANDLE_VALUE||!GetFileInformationByHandle(file.value,&actual)||!GetFileSizeEx(file.value,&size)||
@@ -24,7 +27,7 @@ void Engine::ServeSegment(SOCKET s,const WebFile &source,uint64_t offset,uint64_
     LARGE_INTEGER position{};position.QuadPart=offset;
     if(!SetFilePointerEx(file.value,position,nullptr,FILE_BEGIN)){Reply(s,409,"Conflict");return;}
     TrackSocket(s,job);
-    if(!SendAll(s,"HTTP/1.1 200 OK\r\nConnection: "+std::string(allowConnectionReuse?"keep-alive":"close")+"\r\nCache-Control: no-store\r\nContent-Type: application/octet-stream\r\nContent-Length: "+std::to_string(length+32)+"\r\n\r\n"))return;
+    if(!SendAll(s,"HTTP/1.1 200 OK\r\nConnection: "+std::string(allowConnectionReuse?"keep-alive":"close")+"\r\nCache-Control: no-store\r\nContent-Type: application/octet-stream\r\nContent-Length: "+std::to_string(length+32)+"\r\n"+responseCors+"\r\n"))return;
     diagnostic::Transfer trace(*diagnostic_,s,job->view.id,length,"parallel_segment",
         ",\"offset\":"+std::to_string(offset)+",\"request_id\":"+Json(requestTraceId)+",\"batch_id\":"+Json(job->batchId)+",\"upload_id\":"+Json(job->webUpload)+",\"client_id\":"+Json(job->webClient)+",\"recipient_id\":"+Json(job->recipient));
     try{
@@ -41,7 +44,7 @@ void Engine::ServeSegment(SOCKET s,const WebFile &source,uint64_t offset,uint64_
         {auto time=trace.Stage("network_or_queue_wait",trace.networkMs);sends.Finish();}
         const auto digest=hash.Finish();if(!SendAll(s,digest.data(),digest.size()))throw std::runtime_error("send");
         const auto sent=job->segmentDone.fetch_add(length)+length;Progress(job,std::min<uint64_t>(source.size,sent));
-        if(web&&sent>=source.size){std::lock_guard lock(mutex_);if(!job->cancel&&!job->paused){job->view.state=State::Waiting;job->view.activity=L"等待浏览器保存确认";TraceJobLocked(job);}}
+        if(web&&sent>=source.size){{std::lock_guard lock(mutex_);if(!job->cancel&&!job->paused){job->view.state=State::Waiting;job->view.activity=L"等待浏览器保存确认";TraceJobLocked(job);}}if(job->directOutgoing)PushDirectStatus(job);}
         trace.result="segment_sent";
         reuseConnection=allowConnectionReuse;
     }catch(const std::exception &error){trace.failureStage=error.what();trace.result="failed";}

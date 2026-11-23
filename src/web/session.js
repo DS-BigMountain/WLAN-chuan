@@ -21,3 +21,46 @@ export class ServerSession {
 }
 export function deviceLabel(peer){if(peer.browser)return peer.platform==='mobile-web'?'手机 Web':peer.platform==='desktop-web'?'电脑 Web':'Web';return peer.platform==='windows'?'Win 客户端':peer.platform==='android'?'Android 客户端':'客户端';}
 export function browserDeviceType(){const nav=globalThis.navigator||{};return nav.userAgentData?.mobile||/Android|iPhone|iPad|iPod|Mobile/i.test(nav.userAgent||'')||/Macintosh/.test(nav.userAgent||'')&&nav.maxTouchPoints>1?'mobile-web':'desktop-web';}
+function parseUserAgentModel(ua,maxTouchPoints=0){
+  if(!ua)return '';
+  if(/iPad/i.test(ua)||(/Macintosh/i.test(ua)&&maxTouchPoints>1))return 'iPad';
+  if(/iPhone/i.test(ua))return 'iPhone';
+  if(/iPod/i.test(ua))return 'iPod';
+  const android=ua.match(/Android\s+[^;)]*;\s*([^;)]+?)(?:\s+Build\/|[;)])/i);
+  if(android){
+    const model=android[1].replace(/[\r\n|]/g,' ').replace(/\s+/g,' ').trim();
+    if(model&&model!=='K'&&!/^(Android|Mobile|Linux|wv|zh-CN|en-US)$/i.test(model))return model.slice(0,48);
+    return 'Android 手机';
+  }
+  if(/HarmonyOS|OpenHarmony/i.test(ua))return 'HarmonyOS 设备';
+  if(/Android/i.test(ua))return 'Android 手机';
+  if(/Windows/i.test(ua))return 'Windows 电脑';
+  if(/Macintosh|Mac OS X/i.test(ua))return 'Mac';
+  if(/CrOS/i.test(ua))return 'Chromebook';
+  if(/Linux/i.test(ua))return 'Linux 电脑';
+  return '';
+}
+export function browserDefaultModel(){
+  const nav=globalThis.navigator||{};
+  const parsed=parseUserAgentModel(nav.userAgent||'',nav.maxTouchPoints||0);
+  if(parsed)return parsed;
+  const platform=nav.userAgentData?.platform||'';
+  if(/Windows/i.test(platform))return 'Windows 电脑';
+  if(/macOS|Mac/i.test(platform))return 'Mac';
+  if(/Android/i.test(platform))return 'Android 手机';
+  if(/iOS/i.test(platform))return 'iPhone';
+  if(/Linux/i.test(platform))return 'Linux 电脑';
+  return '';
+}
+export async function detectBrowserModel(){
+  const fallback=browserDefaultModel();
+  try{
+    const data=globalThis.navigator?.userAgentData;
+    if(data&&typeof data.getHighEntropyValues==='function'){
+      const values=await data.getHighEntropyValues(['model','platform']);
+      const model=(values?.model||'').replace(/[\r\n|]/g,' ').replace(/\s+/g,' ').trim();
+      if(model&&model!=='K')return model.slice(0,48);
+    }
+  }catch{}
+  return fallback;
+}

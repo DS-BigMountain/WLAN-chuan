@@ -1401,7 +1401,7 @@ struct Modal {
             EnableWindow(open, cfg.shareSoftware);
         } else if (settings) {
             Control(L"STATIC", L"设备名称", 0, 24, 20, 130, 22, 0);
-            name = Control(L"EDIT", cfg.automaticName ? L"" : cfg.name.c_str(), WS_TABSTOP | ES_AUTOHSCROLL, 24, 45, 420, 30, 1);
+            name = Control(L"EDIT", cfg.name.c_str(), WS_TABSTOP | ES_AUTOHSCROLL, 24, 45, 420, 30, 1);
             SendMessageW(name, EM_SETLIMITTEXT, 64, 0);
             Control(L"STATIC", L"接收目录", 0, 24, 90, 130, 22, 0);
             path = Control(L"EDIT", cfg.receiveDir.c_str(), WS_TABSTOP | ES_AUTOHSCROLL, 24, 116, 329, 31, 2);

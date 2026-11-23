@@ -11,4 +11,9 @@ __pycache__/
 /mobile/build/
 /mobile/.signing/
 /mobile/local.properties
+/mobile/tests/
+/design/
+/tests/
+/tools/make_icon.py
+/.clang-format
 AGENTS.md

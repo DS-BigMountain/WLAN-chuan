@@ -39,7 +39,10 @@ public final class Protocol {
     }
     public static void ascii(OutputStream output,String data)throws IOException{output.write(data.getBytes(StandardCharsets.ISO_8859_1));output.flush();}
     public static void response(OutputStream output,int status,String message,String body,String type)throws IOException {
-        byte[] bytes=body.getBytes(StandardCharsets.UTF_8);ascii(output,"HTTP/1.1 "+status+" "+message+"\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nContent-Type: "+type+"\r\nContent-Length: "+bytes.length+"\r\n\r\n");output.write(bytes);output.flush();
+        response(output,status,message,body,type,"");
+    }
+    public static void response(OutputStream output,int status,String message,String body,String type,String extraHeaders)throws IOException {
+        byte[] bytes=body.getBytes(StandardCharsets.UTF_8);ascii(output,"HTTP/1.1 "+status+" "+message+"\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nContent-Type: "+type+"\r\nContent-Length: "+bytes.length+"\r\n"+(extraHeaders==null?"":extraHeaders)+"\r\n");output.write(bytes);output.flush();
     }
     public static String encodeName(String name){try{return URLEncoder.encode(name,"UTF-8").replace("+","%20");}catch(UnsupportedEncodingException impossible){throw new AssertionError(impossible);}}
     public static Map<String,String> query(String target){Map<String,String> out=new LinkedHashMap<>();int at=target.indexOf('?');if(at>=0)for(String pair:target.substring(at+1).split("&")){String[] parts=pair.split("=",2);try{out.put(URLDecoder.decode(parts[0],"UTF-8"),parts.length==2?URLDecoder.decode(parts[1],"UTF-8"):"");}catch(Exception ignored){throw new IllegalArgumentException("查询参数无效");}}return out;}

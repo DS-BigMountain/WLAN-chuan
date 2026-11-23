@@ -178,3 +178,10 @@ body{min-height:100vh;min-height:100dvh;display:flex;flex-direction:column}
 .jobs .lifecycle-active{border-left:4px solid #3169c6;background:#f4f8ff}.jobs .lifecycle-ended{border-left:4px solid #c7cdd7;background:#f5f6f8}.lifecycle-active .job-status{font-weight:700;color:#204e97}.lifecycle-ended .job-status{background:#e7ebf0;border-radius:4px;padding:2px 6px}.lifecycle-ended .job-progress{display:none}
 
 .current-operation{margin-top:8px;font-size:13px;line-height:1.6;color:#334155;overflow-wrap:anywhere}.current-operation[hidden]{display:none}
+.button-main{display:inline-flex;align-items:center;justify-content:center;gap:8px}
+.button-note{display:block;font-size:11.5px;line-height:1.45;font-weight:400;color:#636b78;white-space:normal}
+.file-actions.mobile-web-actions{flex-direction:column;width:100%;max-width:360px}
+.file-actions.mobile-web-actions>button{flex:none;width:100%}
+#choose-folder.mobile-folder-disabled{flex-direction:column;gap:4px;height:auto;min-height:58px;padding:10px 14px;white-space:normal;text-align:center;background:#f3f4f6;border-color:#e5e7eb;color:#a0a7b4;cursor:not-allowed;pointer-events:none}
+#choose-folder.mobile-folder-disabled .icon{color:#b0b7c3}
+#choose-folder.mobile-folder-disabled .button-note{color:#5e6775}

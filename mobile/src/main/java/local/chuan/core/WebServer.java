@@ -16,6 +16,7 @@ final class WebServer implements Closeable {
     int port(){return listener.getLocalPort();}
     static boolean hasUnsafeChars(String value){return value.indexOf('\r')>=0||value.indexOf('\n')>=0||value.indexOf('|')>=0;}
     void serve(Socket socket){boolean[] committed={false};try{String ip=socket.getInetAddress().getHostAddress();if(!local(ip))return;InputStream input=new BufferedInputStream(socket.getInputStream());OutputStream output=new BufferedOutputStream(socket.getOutputStream());Header h=header(input);String[] first=h.first.split(" ");if(first.length!=3||(!first[2].equals("HTTP/1.1")&&!first[2].equals("HTTP/1.0")))throw new IOException("HTTP 请求行无效");String method=first[0],target=first[1],path=target.split("\\?",2)[0];
+        if(path.startsWith("/direct/")){directRequest(socket,input,output,h,method,target,path,ip,committed);return;}
         if(!h.get("x-chuan-server").isEmpty()&&!h.get("x-chuan-server").equals(e.config.id)){response(output,409,"Conflict","服务端身份已变化，请重新连接","text/plain; charset=utf-8");return;}
         if(path.startsWith("/api/")){
             String origin=h.get("origin"),referer=h.get("referer"),secSite=h.get("sec-fetch-site");
@@ -38,7 +39,7 @@ final class WebServer implements Closeable {
             if(session==null||supplied.isEmpty()||!supplied.equals(session.token)){response(output,401,"Unauthorized","浏览器下载会话已失效","text/plain; charset=utf-8");return;}
             long id=number(path.substring(11));String start=h.get("x-chuan-offset"),range=h.get("range");boolean ranged=start.isEmpty()&&!range.isEmpty();long sliceEnd=-1;
             if(ranged){if(!range.startsWith("bytes="))throw new IOException("续传范围无效");String span=range.substring(6);int dash=span.indexOf('-');if(dash<=0)throw new IOException("续传范围无效");start=span.substring(0,dash);String tail=span.substring(dash+1);if(!tail.isEmpty()){sliceEnd=number(tail);if(sliceEnd<number(start))throw new IOException("续传范围无效");}}
-            e.transfers.download(session,e.find(id),output,"trailer".equals(query.get("checksum")),start.isEmpty()?0:number(start),h.get("x-chuan-prefix"),ranged,sliceEnd,committed);return;
+            e.transfers.download(socket,session,e.find(id),output,"trailer".equals(query.get("checksum")),start.isEmpty()?0:number(start),h.get("x-chuan-prefix"),ranged,sliceEnd,committed,"",false);return;
         }
         if(path.startsWith("/web/api/")&&method.equals("POST")){Session session=session(h,ip,false);if(!path.equals("/web/api/leave"))synchronized(e.lock){String tab=h.get("x-chuan-tab").isEmpty()?session.client:h.get("x-chuan-tab");session.tabs.put(tab,now());session.openTabs.add(tab);session.lastSeen=now();Peer peer=e.peers.get(session.id);if(peer!=null)peer.seen=now();}webCommand(socket,input,output,h,path,ip,session,committed);return;}
         if(method.equals("GET")){String file=path.equals("/")?"index.html":path.startsWith("/web/")?path.substring(5):"";if(!Arrays.asList("index.html","style.css","app.js","files.js","transfers.js","sha256.js","session.js","zip_store.js","zip_worker.js","approvals.js","hash_file.js","hash_worker.js","zip_stream_worker.js").contains(file)){response(output,404,"Not Found","","text/plain");return;}byte[] bytes=asset(file,2*1024*1024);response(output,200,"OK",new String(bytes,StandardCharsets.UTF_8),mime(file));return;}
@@ -51,7 +52,10 @@ final class WebServer implements Closeable {
     byte[] asset(String name,int limit)throws IOException {try(InputStream input=e.platform.asset(name);ByteArrayOutputStream out=new ByteArrayOutputStream()){byte[] buffer=new byte[16384];int count;while((count=input.read(buffer))>=0){if(out.size()+count>limit)throw new IOException("内置资源过长");out.write(buffer,0,count);}return out.toByteArray();}}
     void json(OutputStream output,Object value)throws IOException{response(output,200,"OK",Json.stringify(value),"application/json; charset=utf-8");}
     void nativeRequest(Socket socket,InputStream input,OutputStream output,Header h,String method,String path,String ip)throws IOException {
-        if(path.equals("/api/info")&&method.equals("GET")){json(output,Json.map("protocol",1,"id",e.config.id,"nameHex",hex(e.config.name),"port",e.config.port,"instance",e.instance,"platform","android"));return;}
+        if(path.equals("/api/info")&&method.equals("GET")){json(output,Json.map("protocol",1,"id",e.config.id,"nameHex",hex(e.config.name),"port",e.config.port,"instance",e.instance,"platform","android","directBrowser",true));return;}
+        if(method.equals("POST")&&path.equals("/api/direct-ready")){e.transfers.directReady(output,h,ip);return;}
+        if(method.equals("POST")&&path.equals("/api/direct-status")){e.transfers.directStatus(output,h,ip);return;}
+        if(method.equals("POST")&&path.equals("/api/direct-control")){e.transfers.directControl(output,h);return;}
         if(method.equals("POST")&&(path.equals("/api/offer-status")||path.equals("/api/offer-cancel"))){e.transfers.offerStatus(input,output,h,ip,false,path.endsWith("cancel"));return;}
         if(path.equals("/api/offer")&&method.equals("POST")){e.transfers.offer(socket,input,output,h,ip,false);return;}
         if(method.equals("POST")&&path.startsWith("/api/retry-upload/")){e.transfers.retryUpload(output,h,ip,path.substring(18),false);return;}
@@ -64,22 +68,54 @@ final class WebServer implements Closeable {
         if(path.equals("/api/resume")&&method.equals("POST")){response(output,200,"OK",Resume.probe(e,h,ip,false),"application/json");return;}
         if(path.equals("/api/upload")&&method.equals("POST")){e.transfers.upload(socket,input,output,h,ip,false);return;}
         if(path.equals("/api/mesh")){String encoded=h.get("x-chuan-ledger");if(!method.equals("POST")&&encoded.length()>2*1024*1024){response(output,413,"Content Too Large","账本数据过长","text/plain; charset=utf-8");return;}String body=method.equals("POST")?new String(read(input,h.length(),1048576),StandardCharsets.UTF_8):unhex(encoded);response(output,200,"OK",e.mesh(body),"text/plain; charset=utf-8");return;}
-        if(path.equals("/api/leave")&&method.equals("POST")){String rawId=h.get("x-chuan-id"),id=unhex(rawId);if(rawId.isEmpty()||id.isEmpty()||id.equals(e.config.id)||id.startsWith("web:")){response(output,400,"Bad Request","节点标识无效","text/plain; charset=utf-8");return;}synchronized(e.lock){boolean sameHost=ip.startsWith("127."),owned=sameHost;if(!owned)for(Peer peer:e.peers.values())if((peer.id.equals(id)||peer.owner.equals(id))&&(peer.ip.equals(ip)||peer.gateway.equals(ip))){owned=true;break;}if(!owned){response(output,403,"Forbidden","节点归属不匹配","text/plain; charset=utf-8");return;}for(Job job:e.jobs.values())if(job.nativeOwner.equals(rawId)&&!job.asyncOfferKey.isEmpty()&&job.state<3){job.cancelled=true;e.transfers.completeOffer(job,Transfers.repeat('0',job.offerItems.size()));job.error="发送端已关闭，接收请求已取消";}e.peers.values().removeIf(peer->(peer.id.equals(id)||peer.owner.equals(id))&&(sameHost||peer.ip.equals(ip)||peer.gateway.equals(ip)));}json(output,Json.map());return;}
+        if(path.equals("/api/leave")&&method.equals("POST")){String rawId=h.get("x-chuan-id"),id=unhex(rawId);if(rawId.isEmpty()||id.isEmpty()||id.equals(e.config.id)||id.startsWith("web:")){response(output,400,"Bad Request","节点标识无效","text/plain; charset=utf-8");return;}synchronized(e.lock){boolean sameHost=ip.startsWith("127."),owned=sameHost;if(!owned)for(Peer peer:e.peers.values())if((peer.id.equals(id)||peer.owner.equals(id))&&(peer.ip.equals(ip)||peer.gateway.equals(ip))){owned=true;break;}if(!owned){response(output,403,"Forbidden","节点归属不匹配","text/plain; charset=utf-8");return;}for(Job job:e.jobs.values())if(job.nativeOwner.equals(rawId)&&!job.asyncOfferKey.isEmpty()&&job.state<3){job.cancelled=true;e.transfers.completeOffer(job,Transfers.repeat('0',job.offerItems.size()));job.error="发送端已关闭，接收请求已取消";}for(Job job:e.jobs.values())if(job.direct&&job.nativeOwner.equals(rawId)&&job.state<3){job.cancelled=true;job.paused=false;job.state=4;job.speed=0;job.error="发送端已离线，传输已取消";job.finished=now();e.trace(job);}for(Job job:e.jobs.values())if(job.directOutgoing&&job.directGatewayId.equals(id)&&job.state==1){job.cancelled=true;job.paused=false;job.state=4;job.speed=0;job.error="Web 服务主机已关闭，传输已取消";job.finished=now();e.trace(job);}e.peers.values().removeIf(peer->(peer.id.equals(id)||peer.owner.equals(id))&&(sameHost||peer.ip.equals(ip)||peer.gateway.equals(ip)));}json(output,Json.map());return;}
         if(path.equals("/api/ping")&&method.equals("POST")){String target=unhex(h.get("x-chuan-target"));if(target.equals(e.config.id)){synchronized(e.lock){e.ping++;e.pingAt=now();}}else e.pingNow(e.peer(target));json(output,Json.map());return;}
         response(output,404,"Not Found","","text/plain");
     }
     String webPlatform(Header h){String kind=h.get("x-chuan-device");if(kind.equals("mobile-web")||kind.equals("desktop-web"))return kind;String agent=h.get("user-agent").toLowerCase(Locale.ROOT);return agent.matches(".*(android|iphone|ipad|ipod|mobile).*")?"mobile-web":agent.isEmpty()?"web":"desktop-web";}
     Session session(Header h,String ip,boolean register)throws IOException {
-        String client=h.get("x-chuan-client");if(!key(client))throw new IOException("浏览器身份无效");synchronized(e.lock){Session session=e.sessions.get(client);if(register){String tab=h.get("x-chuan-tab");if(!tab.isEmpty()&&!key(tab))throw new IOException("页面身份无效");String name=unhex(h.get("x-chuan-name"));if(name.length()>48||hasUnsafeChars(name))throw new IOException("浏览器名称无效");if(session==null){e.expire();if(e.sessions.size()>=128){Session oldest=null;for(Session s:e.sessions.values()){if(!s.tabs.isEmpty())continue;boolean busy=false;for(Job j:e.jobs.values())if(j.owner.equals(s.client)||j.recipient.equals(s.client)){busy=true;break;}if(!busy&&(oldest==null||s.lastSeen<oldest.lastSeen))oldest=s;}if(oldest!=null){e.peers.remove(oldest.id);e.sessions.remove(oldest.client);}}if(e.sessions.size()>=128)throw new IOException("浏览器会话数量达到上限");session=new Session();session.client=client;session.id="web:"+hex(sha().digest((e.config.id+":"+client).getBytes(StandardCharsets.UTF_8))).substring(0,32);session.name=name.isEmpty()?e.config.name.substring(0,Math.min(40,e.config.name.length()))+" · 浏览器-"+client.substring(0,4):name;e.sessions.put(client,session);}else if(!name.isEmpty())session.name=name;session.directoryReceive=h.get("x-chuan-directory-receive").equals("1");session.ip=ip;session.lastSeen=now();String kind=webPlatform(h);if(!kind.equals("web")||session.platform.equals("web"))session.platform=kind;session.tabs.put(tab.isEmpty()?client:tab,now());session.openTabs.add(tab.isEmpty()?client:tab);if(!h.get("x-chuan-ping-ack").isEmpty()){long ack=number(h.get("x-chuan-ping-ack"));if(ack<=session.ping)session.ack=Math.max(session.ack,ack);}Peer peer=new Peer(session.id,session.name,ip,e.config.port);peer.browser=true;peer.directoryReceive=session.directoryReceive;peer.platform=session.platform;e.peers.put(peer.id,peer);}else if(session==null||!session.token.equals(h.get("x-chuan-token")))throw new IOException("浏览器会话已失效，请刷新页面");return session;}}
+        String client=h.get("x-chuan-client");if(!key(client))throw new IOException("浏览器身份无效");
+        Session session;
+        synchronized(e.lock){session=e.sessions.get(client);if(register){String tab=h.get("x-chuan-tab");if(!tab.isEmpty()&&!key(tab))throw new IOException("页面身份无效");String name=unhex(h.get("x-chuan-name"));if(name.length()>48||hasUnsafeChars(name))throw new IOException("浏览器名称无效");if(session==null){e.expire();if(e.sessions.size()>=128){Session oldest=null;for(Session s:e.sessions.values()){if(!s.tabs.isEmpty())continue;boolean busy=false;for(Job j:e.jobs.values())if(j.owner.equals(s.client)||j.recipient.equals(s.client)){busy=true;break;}if(!busy&&(oldest==null||s.lastSeen<oldest.lastSeen))oldest=s;}if(oldest!=null){e.peers.remove(oldest.id);e.sessions.remove(oldest.client);}}if(e.sessions.size()>=128)throw new IOException("浏览器会话数量达到上限");session=new Session();session.client=client;session.id="web:"+hex(sha().digest((e.config.id+":"+client).getBytes(StandardCharsets.UTF_8))).substring(0,32);e.sessions.put(client,session);}
+            session.name=name;session.directoryReceive=h.get("x-chuan-directory-receive").equals("1");session.ip=ip;session.lastSeen=now();
+            String hostHeader=h.get("host");if(!hostHeader.isEmpty()){session.origin="http://"+hostHeader;int colon=hostHeader.lastIndexOf(':');session.hostIp=colon>0?hostHeader.substring(0,colon):hostHeader;}
+            session.userAgent=h.get("user-agent");
+            String rawModel=unhex(h.get("x-chuan-device-model"));if(!rawModel.isEmpty()&&rawModel.length()<=48&&!hasUnsafeChars(rawModel))session.deviceModel=rawModel;
+            String kind=webPlatform(h);if(!kind.equals("web")||session.platform.equals("web"))session.platform=kind;session.tabs.put(tab.isEmpty()?client:tab,now());session.openTabs.add(tab.isEmpty()?client:tab);if(!h.get("x-chuan-ping-ack").isEmpty()){long ack=number(h.get("x-chuan-ping-ack"));if(ack<=session.ping)session.ack=Math.max(session.ack,ack);}
+            String resolvedName=e.browserDefaultName(session);
+            Peer peer=new Peer(session.id,resolvedName,ip,e.config.port);peer.browser=true;peer.directoryReceive=session.directoryReceive;peer.platform=session.platform;e.peers.put(peer.id,peer);}
+            else if(session==null||!session.token.equals(h.get("x-chuan-token")))throw new IOException("浏览器会话已失效，请刷新页面");}
+        if(register)e.resolveHostNameAsync(ip);
+        return session;
+    }
     Map<String,Object> webState(Session session){synchronized(e.lock){e.expire();List<Object> peers=new ArrayList<>(),jobs=new ArrayList<>(),requests=new ArrayList<>(),inbox=new ArrayList<>(),offers=new ArrayList<>();for(Peer peer:e.peers.values())if(!peer.id.equals(session.id))peers.add(Json.map("id",peer.id,"name",peer.name,"ip",peer.ip,"port",peer.port,"browser",peer.browser,"platform",peer.platform,"directoryReceive",peer.directoryReceive,"note",session.notes.getOrDefault(peer.ip,""),"serverId",peer.owner));
         for(Job job:e.jobs.values()){
-            if(job.owner.equals(session.client)&&!job.asyncOfferKey.isEmpty())offers.add(Json.map("id",String.valueOf(job.id),"batch",job.batchId,"state",job.state,"selection",job.selection==null?"":job.selection,"error",job.error));
+            if(job.owner.equals(session.client)&&!job.asyncOfferKey.isEmpty()){
+                Map<String,Object> offerMap=Json.map("id",String.valueOf(job.id),"batch",job.batchId,"state",job.state,"selection",job.selection==null?"":job.selection,"error",job.error);
+                if(!job.directUploadBase.isEmpty())offerMap.put("directUpload",Json.map("base",job.directUploadBase,"token",job.directUploadToken,"server",job.directUploadServer,"instance",job.directUploadInstance));
+                offers.add(offerMap);
+            }
             if(job.hiddenClients.contains(session.client)||job.removed)continue;
             if(job.recipient.equals(session.client)&&job.requestOnly&&job.awaitingApproval){List<Object> items=new ArrayList<>();for(Item item:job.offerItems)items.add(e.itemJson(item));requests.add(Json.map("id",String.valueOf(job.id),"batch",job.batchId,"sender",job.peer,"selection",job.selection==null?"":job.selection,"items",items));}
             if(job.recipient.equals(session.client)){Map<String,Object> accepted=e.handoff(job,session);if(accepted!=null)jobs.add(accepted);}
-            if(!job.requestOnly&&(job.owner.equals(session.client)||job.recipient.equals(session.client))){jobs.add(e.jobJson(job,session));if(job.recipient.equals(session.client)&&job.source!=null&&job.state!=4&&job.state!=5)inbox.add(Json.map("id",String.valueOf(job.id),"name",job.name,"size",job.total,"received",job.state==3));}
+            if(!job.requestOnly&&(job.owner.equals(session.client)||job.recipient.equals(session.client))){
+                jobs.add(e.jobJson(job,session));
+                if(job.recipient.equals(session.client)&&job.state!=4&&job.state!=5){
+                    if(job.direct){
+                        String senderHost=job.directSenderIp.startsWith("127.")&&!session.ip.startsWith("127.")&&!session.hostIp.isEmpty()&&!session.hostIp.equals("localhost")?session.hostIp:job.directSenderIp;
+                        String base="http://"+senderHost+":"+job.directSenderPort+"/direct";
+                        String directUrl=base+"/files/"+job.directRemoteId+"?token="+encodeName(job.directToken)+"&server="+encodeName(job.directSenderId)+"&instance="+encodeName(job.directSenderInstance);
+                        String leaf=job.name.substring(job.name.lastIndexOf('/')+1);
+                        inbox.add(Json.map("id",String.valueOf(job.id),"name",leaf,"size",job.total,"received",job.state==3,"directUrl",directUrl,"directBase",base,"directToken",job.directToken,"directRemoteId",String.valueOf(job.directRemoteId),"directServer",job.directSenderId,"directInstance",job.directSenderInstance));
+                    }else if(job.source!=null||job.archivePlan!=null){
+                        inbox.add(Json.map("id",String.valueOf(job.id),"name",job.name,"size",job.total,"received",job.state==3));
+                    }
+                }
+            }
         }
-        Collections.reverse(jobs);return Json.map("name",e.config.name,"version",VERSION,"platform","android","hostId",e.config.id,"serverInstance",e.instance,"token",session.token,"clientIp",session.ip,"clientName",session.name,"webUploadChecksumOptional",true,"webCopyCheck",true,"webDownloadChecksum",true,"webTransferWait",true,"webBatchFiles",true,"webUploadStatus",true,"webZipArchives",true,"webZipStream",true,"webResume",true,"webOfferAsync",true,"androidAvailable",e.platform.apk()!=null&&e.platform.apk().isFile(),"autoReceive",e.config.autoReceive,"maxTransferFiles",String.valueOf(e.config.maxFiles),"maxTransferBytes",String.valueOf(e.config.maxBytes),"ping",now()-session.pingAt<4000?session.ping:0,"hostNote","","peers",peers,"jobs",jobs,"inbox",inbox,"requests",requests,"offers",offers);
+        List<String> localAddresses=e.addresses();
+        String clientIp=session.ip.startsWith("127.")&&!localAddresses.isEmpty()?localAddresses.get(0):session.ip;
+        Collections.reverse(jobs);return Json.map("name",e.config.name,"version",VERSION,"platform","android","hostId",e.config.id,"serverInstance",e.instance,"token",session.token,"clientIp",clientIp,"clientName",e.browserDefaultName(session),"webUploadChecksumOptional",true,"webCopyCheck",true,"webDownloadChecksum",true,"webTransferWait",true,"webBatchFiles",true,"webUploadStatus",true,"webZipArchives",true,"webZipStream",true,"webResume",true,"webOfferAsync",true,"androidAvailable",e.platform.apk()!=null&&e.platform.apk().isFile(),"autoReceive",e.config.autoReceive,"maxTransferFiles",String.valueOf(e.config.maxFiles),"maxTransferBytes",String.valueOf(e.config.maxBytes),"ping",now()-session.pingAt<4000?session.ping:0,"hostNote",session.notes.getOrDefault(session.hostIp,""),"peers",peers,"jobs",jobs,"inbox",inbox,"requests",requests,"offers",offers);
     }}
     Job owned(Session session,long id)throws IOException {synchronized(e.lock){Job job=e.jobs.get(id);if(job==null||(!job.owner.equals(session.client)&&!job.recipient.equals(session.client)))throw new IOException("任务不属于当前浏览器会话");return job;}}
     void webCommand(Socket socket,InputStream input,OutputStream output,Header h,String path,String ip,Session session,boolean[] committed)throws IOException {
@@ -99,22 +135,133 @@ final class WebServer implements Closeable {
         if(path.startsWith("/web/api/decision/")){Job job=owned(session,number(path.substring(path.lastIndexOf('/')+1)));if(!job.recipient.equals(session.client))throw new IOException("接收审批归属不匹配");String selection=new String(read(input,h.length(),65536),StandardCharsets.US_ASCII);e.decide(job.id,selection);json(output,Json.map());return;}
         if(path.startsWith("/web/api/forward/")){Job job=e.transfers.forward(session,number(path.substring(path.lastIndexOf('/')+1)),unhex(h.get("x-chuan-peer")),h.get("x-chuan-upload"));json(output,Json.map("id",String.valueOf(job.id)));return;}
         if(path.startsWith("/web/api/file-info/")||path.startsWith("/web/api/file-saved/")||path.startsWith("/web/api/file-failed/")){
-            long id=number(path.substring(path.lastIndexOf('/')+1));Job job;synchronized(e.lock){job=e.jobs.get(id);if(job==null||job.source==null||!job.recipient.equals(session.client)||job.cancelled)throw new IOException("文件不属于当前接收会话");}
-            if(path.startsWith("/web/api/file-failed/")){e.state(job,5,"浏览器保存失败或存在内容冲突，原文件已保留");json(output,Json.map());return;}
-            if(path.startsWith("/web/api/file-saved/")){job.done=job.total;e.state(job,3,"");response(output,200,"OK","","text/plain");return;}
+            long id=number(path.substring(path.lastIndexOf('/')+1));Job job;synchronized(e.lock){job=e.jobs.get(id);if(job==null||!job.recipient.equals(session.client)||job.cancelled||(path.startsWith("/web/api/file-info/")&&job.source==null)||(!job.direct&&job.source==null&&job.archivePlan==null))throw new IOException("文件不属于当前接收会话");}
+            if(path.startsWith("/web/api/file-failed/")){e.state(job,5,"浏览器保存失败或存在内容冲突，原文件已保留");if(job.staging&&!job.direct)e.removeRelayFile(job);json(output,Json.map());return;}
+            if(path.startsWith("/web/api/file-saved/")){job.done=job.total;e.state(job,3,"");if(job.staging&&!job.direct)e.removeRelayFile(job);response(output,200,"OK","","text/plain");return;}
             long[] tick={now()};String digest=job.directory?"":Transfers.digest(job.source.opener.open(),()->{if(job.cancelled)throw new IOException("传输已取消");if(now()-tick[0]>2000){ascii(output,"HTTP/1.1 102 Processing\r\n\r\n");tick[0]=now();}});json(output,Json.map("directory",job.directory,"sha256",digest));return;
         }
         if(path.startsWith("/web/api/upload-status/")){String upload=path.substring(23);synchronized(e.lock){for(Job job:e.jobs.values())if(job.owner.equals(session.client)&&job.upload.equals(upload)){json(output,Json.map("id",String.valueOf(job.id),"state",job.state,"paused",job.paused,"done",job.done,"error",job.error));return;}}response(output,404,"Not Found","","text/plain");return;}
         if(path.startsWith("/web/api/wait/")){Job job=owned(session,number(path.substring(path.lastIndexOf('/')+1)));long deadline=now()+2000;synchronized(e.lock){while(job.state<3&&now()<deadline&&e.running)try{e.lock.wait(200);}catch(InterruptedException error){Thread.currentThread().interrupt();break;}json(output,Json.map("id",String.valueOf(job.id),"state",job.state,"stateText",stateText(job.state),"error",job.error));}return;}
-        if(path.startsWith("/web/api/cancel/")){Job job=owned(session,number(path.substring(path.lastIndexOf('/')+1)));e.cancel(job.id);json(output,Json.map());return;}
+        if(path.startsWith("/web/api/cancel/")){
+            String keyValue=path.substring(16);long foundId=0;
+            synchronized(e.lock){for(Job job:e.jobs.values())if((job.owner.equals(session.client)||job.recipient.equals(session.client))&&(String.valueOf(job.id).equals(keyValue)||(key(keyValue)&&job.upload.equals(keyValue)))&&job.state<3){foundId=job.id;break;}}
+            if(foundId==0){response(output,404,"Not Found","任务已结束或不存在","text/plain; charset=utf-8");return;}
+            e.cancel(foundId);json(output,Json.map());return;
+        }
         if(path.startsWith("/web/api/delete/")){Job job=owned(session,number(path.substring(path.lastIndexOf('/')+1)));if(job.state<3)throw new IOException("请先取消活动任务");synchronized(e.lock){job.hiddenClients.add(session.client);}json(output,Json.map());return;}
-        if(path.equals("/web/api/clear")){synchronized(e.lock){Set<String> active=e.busyBatches();for(Job job:e.jobs.values())if(job.state>=3&&!active.contains(job.batchId)&&job.asyncOfferKey.isEmpty()&&(job.owner.equals(session.client)||job.recipient.equals(session.client)))job.hiddenClients.add(session.client);}json(output,Json.map());return;}
+        if(path.equals("/web/api/clear")){synchronized(e.lock){Set<String> active=e.busyBatches();for(Job job:e.jobs.values())if(job.state>=3&&!active.contains(job.batchId)&&(job.asyncOfferKey.isEmpty()||job.requestOnly)&&(job.owner.equals(session.client)||job.recipient.equals(session.client)))job.hiddenClients.add(session.client);}json(output,Json.map());return;}
         if(path.equals("/web/api/preferences")){synchronized(e.lock){session.maxFiles=number(h.get("x-chuan-max-files"));session.maxBytes=number(h.get("x-chuan-max-bytes"));}json(output,Json.map());return;}
         if(path.equals("/web/api/note")){String address=h.get("x-chuan-address"),note=unhex(h.get("x-chuan-note"));if(address.equals("localhost"))address="127.0.0.1";if(!local(address)||note.length()>48||hasUnsafeChars(note))throw new IOException("备注无效");synchronized(e.lock){session.notes.put(address,note);}json(output,Json.map());return;}
         if(path.equals("/web/api/leave")){synchronized(e.lock){String tab=h.get("x-chuan-tab").isEmpty()?session.client:h.get("x-chuan-tab");session.tabs.remove(tab);session.openTabs.remove(tab);if(session.tabs.isEmpty())e.peers.remove(session.id);e.expire();}json(output,Json.map());return;}
         if(path.equals("/web/api/ping")){String target=unhex(h.get("x-chuan-peer"));if(target.equals(e.config.id)){synchronized(e.lock){e.ping++;e.pingAt=now();}}else e.pingNow(e.peer(target));json(output,Json.map());return;}
         if(path.equals("/web/api/refresh")){e.announce();json(output,Json.map());return;}
         response(output,404,"Not Found","","text/plain");
+    }
+    void directRequest(Socket socket,InputStream input,OutputStream output,Header h,String method,String target,String path,String ip,boolean[] committed)throws IOException {
+        String origin=h.get("origin");
+        boolean pna="true".equals(h.get("access-control-request-private-network"));
+        if(method.equals("OPTIONS")){
+            if(!Transfers.validLocalOrigin(origin)){response(output,403,"Forbidden","","text/plain");return;}
+            StringBuilder preflight=new StringBuilder("HTTP/1.1 204 No Content\r\nConnection: close\r\n")
+                .append("Access-Control-Allow-Origin: ").append(origin).append("\r\n")
+                .append("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n")
+                .append("Access-Control-Allow-Headers: Content-Type, Range, X-Chuan-Direct-Token, X-Chuan-Server, X-Chuan-Instance, X-Chuan-Client, X-Chuan-Tab, X-Chuan-Target, X-Chuan-Upload, X-Chuan-Path, X-Chuan-Sender, X-Chuan-Batch, X-Chuan-Item, X-Chuan-Size, X-Chuan-Copy, X-Chuan-Directory, X-Chuan-Sha256, X-Chuan-Checksum, X-Chuan-Hash-Ms, X-Chuan-Folder, X-Chuan-Folder-Name, X-Chuan-Folder-Count, X-Chuan-Folder-Size, X-Chuan-Resume-Key, X-Chuan-Resume-Reset, X-Chuan-Resume-Direct, X-Chuan-Offset, X-Chuan-Prefix, X-Chuan-Length, X-Chuan-Trace\r\n")
+                .append("Access-Control-Max-Age: 600\r\nVary: Origin\r\n");
+            if(pna)preflight.append("Access-Control-Allow-Private-Network: true\r\n");
+            preflight.append("Content-Length: 0\r\n\r\n");
+            committed[0]=true;ascii(output,preflight.toString());return;
+        }
+        if(!origin.isEmpty()&&!Transfers.validLocalOrigin(origin)){response(output,403,"Forbidden","","text/plain");return;}
+        String cors=origin.isEmpty()?"":"Access-Control-Allow-Origin: "+origin+"\r\nVary: Origin\r\n"+(pna?"Access-Control-Allow-Private-Network: true\r\n":"");
+        String downloadCors=origin.isEmpty()?"":"Access-Control-Allow-Origin: "+origin+"\r\nAccess-Control-Expose-Headers: Content-Length, Content-Range, Content-Disposition\r\nVary: Origin\r\n"+(pna?"Access-Control-Allow-Private-Network: true\r\n":"");
+        try{
+            if(method.equals("GET")&&path.startsWith("/direct/files/")){
+                Map<String,String> query=query(target);
+                String serverParam=query.getOrDefault("server",h.get("x-chuan-server"));
+                String instanceParam=query.getOrDefault("instance",h.get("x-chuan-instance"));
+                if((!serverParam.isEmpty()&&!serverParam.equals(e.config.id))||(!instanceParam.isEmpty()&&!instanceParam.equals(e.instance))){
+                    committed[0]=true;response(output,409,"Conflict","下载链接不属于当前服务端运行会话","text/plain; charset=utf-8",cors);return;
+                }
+                String token=query.getOrDefault("token",h.get("x-chuan-direct-token"));
+                long id=number(path.substring(14));
+                Job job;
+                synchronized(e.lock){job=e.jobs.get(id);}
+                if(job==null||!job.directOutgoing||!key(token)||!job.directToken.equals(token)){
+                    committed[0]=true;response(output,404,"Not Found","下载任务不存在或令牌无效","text/plain; charset=utf-8",cors);return;
+                }
+                if(!origin.isEmpty()&&!job.directAllowedOrigin.isEmpty()&&!job.directAllowedOrigin.equals(origin)){
+                    committed[0]=true;response(output,403,"Forbidden","","text/plain");return;
+                }
+                String start=h.get("x-chuan-offset"),range=h.get("range");boolean ranged=start.isEmpty()&&!range.isEmpty();long sliceEnd=-1;
+                if(ranged){if(!range.startsWith("bytes="))throw new IOException("续传范围无效");String span=range.substring(6);int dash=span.indexOf('-');if(dash<=0)throw new IOException("续传范围无效");start=span.substring(0,dash);String tail=span.substring(dash+1);if(!tail.isEmpty()){sliceEnd=number(tail);if(sliceEnd<number(start))throw new IOException("续传范围无效");}}
+                e.transfers.download(socket,null,job,output,"trailer".equals(query.get("checksum")),start.isEmpty()?0:number(start),h.get("x-chuan-prefix"),ranged,sliceEnd,committed,downloadCors,true);return;
+            }
+            if(!method.equals("POST")){committed[0]=true;response(output,405,"Method Not Allowed","","text/plain",cors);return;}
+            if(!h.get("x-chuan-server").equals(e.config.id)||!h.get("x-chuan-instance").equals(e.instance)){
+                committed[0]=true;response(output,409,"Conflict","服务端运行会话已变化，请重新发送","text/plain; charset=utf-8",cors);return;
+            }
+            String token=h.get("x-chuan-direct-token");
+            if(!key(token)){committed[0]=true;response(output,401,"Unauthorized","","text/plain",cors);return;}
+            if(path.startsWith("/direct/file-info/")||path.startsWith("/direct/file-saved/")||path.startsWith("/direct/file-failed/")){
+                if(!h.get("content-length").isEmpty()&&!h.get("content-length").equals("0"))throw new IOException("请求体必须为空");
+                long id=number(path.substring(path.lastIndexOf('/')+1));
+                Job job;
+                synchronized(e.lock){job=e.jobs.get(id);}
+                if(job==null||!job.directOutgoing||!job.directToken.equals(token)){committed[0]=true;response(output,404,"Not Found","","text/plain",cors);return;}
+                if(!origin.isEmpty()&&!job.directAllowedOrigin.isEmpty()&&!job.directAllowedOrigin.equals(origin)){committed[0]=true;response(output,403,"Forbidden","","text/plain");return;}
+                if(job.cancelled){committed[0]=true;response(output,410,"Gone","","text/plain",cors);return;}
+                if(path.startsWith("/direct/file-failed/")){e.state(job,5,"浏览器保存失败或存在内容冲突，原文件已保留");committed[0]=true;response(output,200,"OK","{}","application/json; charset=utf-8",cors);return;}
+                if(path.startsWith("/direct/file-saved/")){job.done=job.total;e.state(job,3,"");committed[0]=true;response(output,200,"OK","","text/plain",cors);return;}
+                if(job.source==null&&!job.directory)throw new IOException("无法核对发送文件");
+                long[] tick={now()};String digest=job.directory?"":Transfers.digest(job.source.opener.open(),()->{if(job.cancelled)throw new IOException("传输已取消");if(now()-tick[0]>2000){ascii(output,"HTTP/1.1 102 Processing\r\n\r\n");tick[0]=now();}});
+                committed[0]=true;response(output,200,"OK",Json.stringify(Json.map("directory",job.directory,"sha256",digest)),"application/json; charset=utf-8",cors);return;
+            }
+            String targetHeader=unhex(h.get("x-chuan-target"));
+            if((!targetHeader.isEmpty()&&!targetHeader.equals(e.config.id))||!h.get("x-chuan-recipient").isEmpty()){
+                committed[0]=true;response(output,403,"Forbidden","","text/plain",cors);return;
+            }
+            String batchHeader=h.get("x-chuan-batch");
+            Batch matched=null;
+            synchronized(e.lock){
+                for(Batch b:e.batches.values()){
+                    if(!token.equals(b.directUploadToken))continue;
+                    if(!batchHeader.isEmpty()&&!b.id.equals(batchHeader))continue;
+                    matched=b;b.touched=now();break;
+                }
+            }
+            if(matched==null){committed[0]=true;response(output,403,"Forbidden","直连传输令牌无效或已过期","text/plain; charset=utf-8",cors);return;}
+            if(!origin.isEmpty()&&!matched.directOrigin.isEmpty()&&!matched.directOrigin.equals(origin)){committed[0]=true;response(output,403,"Forbidden","","text/plain");return;}
+            Header dh=new Header();dh.first=h.first;dh.fields.putAll(h.fields);
+            dh.fields.remove("x-chuan-target");dh.fields.remove("x-chuan-recipient");
+            if(dh.get("x-chuan-batch").isEmpty())dh.fields.put("x-chuan-batch",matched.id);
+            if(path.equals("/direct/upload")){e.transfers.upload(socket,input,output,dh,ip,true,false,matched,cors);return;}
+            if(path.equals("/direct/copy-check")){dh.fields.put("x-chuan-metadata","1");e.transfers.upload(socket,input,output,dh,ip,true,true,matched,cors);return;}
+            if(path.equals("/direct/copy-probe")){e.transfers.upload(socket,input,output,dh,ip,true,true,matched,cors);return;}
+            if(path.equals("/direct/resume")){committed[0]=true;response(output,200,"OK",Resume.probe(e,dh,ip,true,matched),"application/json",cors);return;}
+            if(path.equals("/direct/batch-files")||path.equals("/direct/batch-status")){e.transfers.batchFiles(input,output,dh,ip,null,path.endsWith("batch-status"),matched,cors);return;}
+            if(path.startsWith("/direct/file-phase/")){e.transfers.phase(input,output,dh,ip,path.substring(19),true,matched,cors);return;}
+            if(path.startsWith("/direct/retry-upload/")){e.transfers.retryUpload(output,dh,ip,path.substring(21),true,matched,cors);return;}
+            if(path.startsWith("/direct/upload-status/")){
+                String upload=path.substring(22);
+                synchronized(e.lock){for(Job job:e.jobs.values())if(job.nativeOwner.equals(matched.owner)&&job.batchId.equals(matched.id)&&job.upload.equals(upload)){committed[0]=true;response(output,200,"OK",Json.stringify(Json.map("id",String.valueOf(job.id),"state",job.state,"paused",job.paused,"done",job.done,"error",job.error)),"application/json; charset=utf-8",cors);return;}}
+                committed[0]=true;response(output,404,"Not Found","","text/plain",cors);return;
+            }
+            if(path.startsWith("/direct/pause/")||path.startsWith("/direct/resume-job/")){
+                boolean paused=path.startsWith("/direct/pause/");String keyValue=path.substring(paused?14:19);Job selected=null;
+                synchronized(e.lock){for(Job job:e.jobs.values())if(job.nativeOwner.equals(matched.owner)&&job.batchId.equals(matched.id)&&(String.valueOf(job.id).equals(keyValue)||job.upload.equals(keyValue))){selected=job;break;}}
+                if(selected==null){committed[0]=true;response(output,404,"Not Found","","text/plain",cors);return;}
+                e.pause(selected.id,paused);committed[0]=true;response(output,200,"OK","{}","application/json; charset=utf-8",cors);return;
+            }
+            if(path.startsWith("/direct/cancel/")){
+                String keyValue=path.substring(15);long foundId=0;
+                synchronized(e.lock){for(Job job:e.jobs.values())if(job.nativeOwner.equals(matched.owner)&&job.batchId.equals(matched.id)&&(String.valueOf(job.id).equals(keyValue)||(key(keyValue)&&job.upload.equals(keyValue)))&&job.state<3){foundId=job.id;break;}}
+                if(foundId==0){committed[0]=true;response(output,404,"Not Found","任务已结束或不存在","text/plain; charset=utf-8",cors);return;}
+                e.cancel(foundId);committed[0]=true;response(output,200,"OK","{}","application/json; charset=utf-8",cors);return;
+            }
+            committed[0]=true;response(output,404,"Not Found","","text/plain",cors);
+        }catch(Transfers.LimitException limit){if(!committed[0]){committed[0]=true;response(output,413,"Content Too Large",limit.getMessage(),"text/plain; charset=utf-8",cors);}
+        }catch(FileNotFoundException missing){if(!committed[0]){committed[0]=true;response(output,404,"Not Found",missing.getMessage()==null?"":missing.getMessage(),"text/plain; charset=utf-8",cors);}
+        }catch(Exception error){if(!committed[0]){committed[0]=true;response(output,400,"Bad Request",error.getMessage()==null?"请求无效":error.getMessage(),"text/plain; charset=utf-8",cors);}}
     }
     void download(OutputStream output,InputStream input,long size,String name,String mime)throws IOException {ascii(output,"HTTP/1.1 200 OK\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nContent-Type: "+mime+"\r\nContent-Disposition: attachment; filename=\""+name+"\"\r\nContent-Length: "+size+"\r\n\r\n");copy(input,output,size,null,null);output.flush();}
     @Override public void close(){if(listener!=null)try{listener.close();}catch(IOException ignored){}workers.shutdownNow();}
